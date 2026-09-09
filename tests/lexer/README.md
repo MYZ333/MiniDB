@@ -1,4 +1,5 @@
-# A：词法测试预留位置
+# A：词法测试
 
-后续覆盖大小写、注释、字符串转义、整数原始词素、EOF、行列定位及非法输入。
-直接调用 lex，不依赖 Parser、Catalog 或执行层。新增测试后显式注册到 CMake。
+lexer_tests.cpp 由团队 A 版本合入，共 6 组测试：原有关键字/字符串/位置/操作符/错误检查，
+另补 EOF 处闭合块注释和 CRLF/词素所有权回归。直接调用 lex，不依赖 B。
+已注册到 CMake/CTest 以及 scripts/check.sh。

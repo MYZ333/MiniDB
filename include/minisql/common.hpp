@@ -63,7 +63,9 @@ enum class ErrorCode {
     UnsupportedType, EmptyColumnList, ValueCountMismatch, MissingInsertColumn,
     TypeMismatch, InvalidOperandType, WhereNotBoolean, DuplicateAssignment,
     InvalidBoundStatement, CatalogVersionMismatch, DivisionByZero, IntegerOverflow,
-    NotImplemented // 骨架入口专用：模块未实现，不表示用户的 SQL 有错。
+    NotImplemented, // 骨架入口专用：模块未实现，不表示用户的 SQL 有错。
+    InvalidAst, ExpressionTooDeep, // 防御手工/外部 AST 的空子节点和过深嵌套。
+    InvalidPlan // 优化入口发现缺失子节点或不满足基本结构约定的计划。
 };
 
 struct Diagnostic {

@@ -1,0 +1,115 @@
+// A 原有词法测试；合并时补充文件末尾注释和 CRLF/所有权回归。
+#include "minisql/lexer.hpp"
+
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+using namespace minisql;
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+TokenStream lexOk(const std::string& sql) {
+    auto result = lex(sql);
+    if (const auto* error = std::get_if<Diagnostic>(&result)) {
+        throw std::runtime_error("unexpected lexer error: " + error->message);
+    }
+    return std::get<TokenStream>(std::move(result));
+}
+
+void expectError(const std::string& sql, ErrorCode code) {
+    auto result = lex(sql);
+    const auto* error = std::get_if<Diagnostic>(&result);
+    require(error != nullptr, "expected lexer error");
+    require(error->stage == DiagnosticStage::Lexical, "expected lexical error stage");
+    require(error->code == code, "unexpected lexer error code");
+    require(error->span.has_value(), "lexer error should include source span");
+}
+
+void testBasicTokens() {
+    const auto tokens = lexOk("SeLeCt name FROM student WHERE age >= 18 AND name != 'Tom''s book';");
+    const std::vector<TokenKind> expected{
+        TokenKind::Select, TokenKind::Identifier, TokenKind::From, TokenKind::Identifier,
+        TokenKind::Where, TokenKind::Identifier, TokenKind::GreaterEqual, TokenKind::Integer,
+        TokenKind::And, TokenKind::Identifier, TokenKind::NotEqual, TokenKind::String,
+        TokenKind::Semicolon, TokenKind::EndOfInput};
+    require(tokens.size() == expected.size(), "unexpected token count");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        require(tokens[i].kind == expected[i], "unexpected token kind");
+    }
+    require(tokens[0].lexeme == "SeLeCt", "keyword lexeme should keep original spelling");
+    require(tokens[11].lexeme == "'Tom''s book'", "string lexeme should keep quotes");
+}
+
+void testTriviaAndPositions() {
+    const auto tokens = lexOk("-- query\nSELECT\tname\n/* skip */FROM student;");
+    require(tokens[0].kind == TokenKind::Select, "expected SELECT after line comment");
+    require(tokens[0].span.begin.line == 2 && tokens[0].span.begin.column == 1,
+            "SELECT should start on line 2 column 1");
+    require(tokens[1].kind == TokenKind::Identifier && tokens[1].lexeme == "name",
+            "expected identifier after tab");
+    require(tokens[1].span.begin.line == 2 && tokens[1].span.begin.column == 8,
+            "tab should count as one column");
+    require(tokens[2].kind == TokenKind::From, "block comment should be skipped");
+}
+
+void testSingleCharacterTokens() {
+    const auto tokens = lexOk("()+-*/,;= < > <= >= !=");
+    const std::vector<TokenKind> expected{
+        TokenKind::LeftParen, TokenKind::RightParen, TokenKind::Plus, TokenKind::Minus,
+        TokenKind::Star, TokenKind::Slash, TokenKind::Comma, TokenKind::Semicolon,
+        TokenKind::Equal, TokenKind::Less, TokenKind::Greater, TokenKind::LessEqual,
+        TokenKind::GreaterEqual, TokenKind::NotEqual, TokenKind::EndOfInput};
+    require(tokens.size() == expected.size(), "unexpected operator token count");
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        require(tokens[i].kind == expected[i], "unexpected operator token");
+    }
+}
+
+void testErrors() {
+    expectError("@", ErrorCode::InvalidCharacter);
+    expectError("'abc", ErrorCode::UnterminatedString);
+    expectError("/* abc", ErrorCode::UnterminatedComment);
+    expectError("a == b", ErrorCode::InvalidCharacter);
+    expectError("a <> b", ErrorCode::InvalidCharacter);
+}
+
+void testClosedCommentAtEof() {
+    for (const std::string sql : {"/**/", "/* comment */", "SELECT * FROM t;/* tail */"}) {
+        const auto tokens = lexOk(sql);
+        require(tokens.back().kind == TokenKind::EndOfInput, "closed comment at EOF must be accepted");
+        require(tokens.back().span.begin.offset == sql.size(), "EOF offset must include trailing comment");
+    }
+    expectError("/**/ /* missing", ErrorCode::UnterminatedComment);
+}
+
+void testCrLfAndOwnedText() {
+    const auto tokens = lexOk(std::string("-- comment\r\nSELECT\tname;"));
+    require(tokens[0].span.begin.offset == 12 && tokens[0].span.begin.line == 2 &&
+            tokens[0].span.begin.column == 1, "CRLF must count as one newline and two bytes");
+    require(tokens[1].lexeme == "name" && tokens[1].span.begin.column == 8,
+            "token must own its text after temporary SQL is destroyed");
+}
+
+} // namespace
+
+int main() {
+    try {
+        testBasicTokens();
+        testTriviaAndPositions();
+        testSingleCharacterTokens();
+        testErrors();
+        testClosedCommentAtEof();
+        testCrLfAndOwnedText();
+        std::cout << "Lexer tests passed.\n";
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

@@ -18,14 +18,37 @@ done
 "$compiler" "${flags[@]}" -c src/lexer/lexer.cpp -o build/direct/lexer.o
 "$compiler" "${flags[@]}" -c src/parser/parser.cpp -o build/direct/parser.o
 "$compiler" "${flags[@]}" -c src/semantic/analyzer.cpp -o build/direct/analyzer.o
+"$compiler" "${flags[@]}" -c src/semantic/type_rules.cpp -o build/direct/type_rules.o
+"$compiler" "${flags[@]}" -c src/catalog/memory_catalog.cpp -o build/direct/memory_catalog.o
 "$compiler" "${flags[@]}" -c src/planner/plan_builder.cpp -o build/direct/plan_builder.o
+"$compiler" "${flags[@]}" -c src/planner/plan_printer.cpp -o build/direct/plan_printer.o
+"$compiler" "${flags[@]}" -c src/optimizer/constant_fold.cpp -o build/direct/constant_fold.o
+"$compiler" "${flags[@]}" -c src/optimizer/optimizer.cpp -o build/direct/optimizer.o
 "$archiver" rcs build/direct/libminisql_frontend.a build/direct/lexer.o build/direct/parser.o
-"$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/plan_builder.o
+"$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/type_rules.o build/direct/memory_catalog.o build/direct/plan_builder.o build/direct/plan_printer.o build/direct/constant_fold.o build/direct/optimizer.o
 libraries=(build/direct/libminisql_frontend.a build/direct/libminisql_backend.a)
 
 "$compiler" "${flags[@]}" app/main.cpp "${libraries[@]}" -o build/direct/minisql
 "$compiler" "${flags[@]}" examples/contracts.cpp -o build/direct/contracts_example
 "$compiler" "${flags[@]}" tests/integration/scaffold_smoke.cpp "${libraries[@]}" -o build/direct/scaffold_smoke
-./build/direct/minisql
+"$compiler" "${flags[@]}" examples/semantic.cpp "${libraries[@]}" -o build/direct/semantic_example
+"$compiler" "${flags[@]}" tests/catalog/catalog_tests.cpp "${libraries[@]}" -o build/direct/catalog_tests
+"$compiler" "${flags[@]}" tests/semantic/semantic_tests.cpp "${libraries[@]}" -o build/direct/semantic_tests
+"$compiler" "${flags[@]}" tests/planner/plan_tests.cpp "${libraries[@]}" -o build/direct/plan_tests
+"$compiler" "${flags[@]}" examples/plans.cpp "${libraries[@]}" -o build/direct/plans_example
+"$compiler" "${flags[@]}" tests/lexer/lexer_tests.cpp "${libraries[@]}" -o build/direct/lexer_tests
+"$compiler" "${flags[@]}" tests/parser/parser_tests.cpp "${libraries[@]}" -o build/direct/parser_tests
+"$compiler" "${flags[@]}" tests/optimizer/optimizer_tests.cpp "${libraries[@]}" -o build/direct/optimizer_tests
+"$compiler" "${flags[@]}" examples/optimizer.cpp "${libraries[@]}" -o build/direct/optimizer_example
+./build/direct/minisql < /dev/null
+./build/direct/lexer_tests
+./build/direct/parser_tests
 ./build/direct/contracts_example
 ./build/direct/scaffold_smoke
+./build/direct/semantic_example
+./build/direct/catalog_tests
+./build/direct/semantic_tests
+./build/direct/plan_tests
+./build/direct/plans_example
+./build/direct/optimizer_tests
+./build/direct/optimizer_example

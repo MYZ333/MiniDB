@@ -1,0 +1,61 @@
+// 将规则集中维护，避免 Parser、Analyzer 各自猜测隐式类型转换。
+#include "type_rules.hpp"
+
+namespace minisql::semantic_detail {
+
+std::optional<DataType> unaryResult(UnaryOp op, DataType operand) {
+    if (op == UnaryOp::Negate && operand == DataType::Int) return DataType::Int;
+    if (op == UnaryOp::Not && operand == DataType::Bool) return DataType::Bool;
+    return std::nullopt;
+}
+
+std::optional<DataType> binaryResult(BinaryOp op, DataType left, DataType right) {
+    if (left != right) return std::nullopt; // 第一阶段不做任何隐式转换。
+    switch (op) {
+    case BinaryOp::Add: case BinaryOp::Subtract:
+    case BinaryOp::Multiply: case BinaryOp::Divide:
+        if (left == DataType::Int) return DataType::Int;
+        break;
+    case BinaryOp::Equal: case BinaryOp::NotEqual:
+        if (left == DataType::Int || left == DataType::Varchar) return DataType::Bool;
+        break;
+    case BinaryOp::Less: case BinaryOp::LessEqual:
+    case BinaryOp::Greater: case BinaryOp::GreaterEqual:
+        if (left == DataType::Int) return DataType::Bool;
+        break;
+    case BinaryOp::And: case BinaryOp::Or:
+        if (left == DataType::Bool) return DataType::Bool;
+        break;
+    }
+    return std::nullopt;
+}
+
+const char* typeName(DataType type) {
+    switch (type) {
+    case DataType::Int: return "INT";
+    case DataType::Varchar: return "VARCHAR";
+    case DataType::Bool: return "BOOL";
+    }
+    return "UNKNOWN";
+}
+
+const char* operatorName(UnaryOp op) { return op == UnaryOp::Not ? "NOT" : "-"; }
+
+const char* operatorName(BinaryOp op) {
+    switch (op) {
+    case BinaryOp::Add: return "+";
+    case BinaryOp::Subtract: return "-";
+    case BinaryOp::Multiply: return "*";
+    case BinaryOp::Divide: return "/";
+    case BinaryOp::Equal: return "=";
+    case BinaryOp::NotEqual: return "!=";
+    case BinaryOp::Less: return "<";
+    case BinaryOp::LessEqual: return "<=";
+    case BinaryOp::Greater: return ">";
+    case BinaryOp::GreaterEqual: return ">=";
+    case BinaryOp::And: return "AND";
+    case BinaryOp::Or: return "OR";
+    }
+    return "UNKNOWN";
+}
+} // namespace minisql::semantic_detail

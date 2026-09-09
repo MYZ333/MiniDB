@@ -1,8 +1,7 @@
-# 模块接口契约 0.2
+# 模块接口契约 0.6
 
-本文先于算法实现定义 A、B、Catalog 与执行层的衔接。当前实现的是共享数据
-结构和可编译示例；lex/parse/analyze/buildPlan 均有可链接的占位定义，
-统一返回 NotImplemented，尚未实现编译算法。
+本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、五类语句语义分析、
+逻辑计划生成、规则优化和文本打印已实现；团队 A 的 lex/parse 已合入并通过跨模块测试，执行层尚未接入。
 
 ## 数据流和所有权
 
@@ -11,6 +10,8 @@ A: SQL → Token → Statement(AST)
                          ↓ analyze(ast, catalog)
 B:                 BoundStatement
                          ↓ buildPlan(bound)
+                     LogicalPlan
+                         ↓ optimizePlan(plan)，可选
                      LogicalPlan
                          ↓
 执行层: 扫描/过滤/写入 → 存储层
@@ -43,7 +44,11 @@ parse 接受符合此约定的 TokenStream；仅 EOF 返回空语句列表。
 两者首版均遇首错返回 Diagnostic，不返回部分结果；后续错误恢复另行扩展接口。
 AST 自持字符串与子节点，不依赖 TokenStream 的生命周期。
 
-上述为实现后的约定；当前所有输入均返回 NotImplemented（包括空输入）。
+上述约定现已实现。parse 在入口检查唯一且末尾的 EOF，不接受 EOF 后还有其他 Token。
+Parser 内部使用 Diagnostic 异常快速退出递归，在 run 边界捕获并转换为 Result，
+调用方仍通过统一 Result 接口获取语法错误。
+NOT/负号/括号的递归嵌套最多 256 层，生成 AST 的单条路径最多 256 个节点；
+超过时返回 Syntax / ExpressionTooDeep，防止输入在到达 B 前先耗尽栈。
 
 ## A → B：AST
 
@@ -69,7 +74,21 @@ TableSchema 中表名/列名已归一化，列列表为建表顺序，ID 在快�
 B 把 version 写入绑定结果，再由计划生成传入 LogicalPlan。
 执行层必须在执行期间固定该模式版本，版本不符则拒绝计划并请求重新编译。
 
-本阶段只提供抽象接口，示例用固定快照演示接入；内存 Catalog 实现在下一阶段。
+`MemoryCatalog` 已提供可独立使用的内存实现（不保存记录、不持久化）：
+
+```cpp
+Result<std::shared_ptr<const TableSchema>> createTable(
+    std::string table_name, const std::vector<ColumnSpec>& columns);
+std::shared_ptr<const CatalogSnapshot> snapshot() const;
+```
+
+createTable 要求名称符合 grammar.md 的标识符规则；它统一大小写、检查重复表/列、
+空列定义和非法列类型，失败不修改模式、不消耗 ID。显式注册无源码来源，失败使用
+Execution 阶段诊断及空范围；这不代表完整执行引擎已经实现。
+成功注册分配表 ID（从 1 开始）、表内列 ID（从 1 开始）并递增模式版本。
+snapshot 复制名称索引并共享只读模式，旧快照不会看到新注册表，也可以比容器活得更久。
+版本仅在同一 Catalog 实例的历史中比较；该内存容器供第一阶段单线程使用。
+
 CREATE 产生建表描述，不预分配表列 ID，不调用 createTable。
 成功执行后，由执行层负责修改真实 Catalog 并递增版本。
 因此多语句由上层按“编译→执行成功→新快照→下一条”驱动。
@@ -79,18 +98,36 @@ CREATE 产生建表描述，不预分配表列 ID，不调用 createTable。
 ```cpp
 Result<BoundStatement> analyze(const Statement&, const CatalogSnapshot&);
 Result<LogicalPlan> buildPlan(const BoundStatement&);
+Result<LogicalPlan> optimizePlan(const LogicalPlan&); // 声明于 optimizer.hpp。
+std::string formatPlan(const LogicalPlan&); // 声明于 plan_printer.hpp。
 ```
 
 Result 为 `variant<T, Diagnostic>`，错误时不返回半成品；使用 `get_if` 或
 `holds_alternative` 检查结果。首版每条语句仅报告首个语义错误。
-当前占位入口返回所属阶段的 NotImplemented；这是开发状态，不是非法 SQL 诊断。
+NotImplemented 保留为后续开发状态错误码，当前五类语句的四个入口不再返回占位结果。
+五类语句的 analyze/buildPlan 均返回真实结果或诊断；表达式支持整数算术、比较、AND/OR/NOT。
 Diagnostic 包含阶段、稳定错误码、可读消息、SourceSpan。
 范围按字节、从 1 开始的行列、左闭右开定义；未知范围用 optional 表示，
 禁止把未知范围伪装成第 1 行。正常 A 输入必须提供真实范围。
 
+诊断按确定顺序返回：先检查表，再按 SQL 顺序检查列；INSERT 再检查值数、
+完整列覆盖、逐值类型；SELECT 最后检查 WHERE。表达式按左子树、右子树、
+当前操作符的顺序检查；静态检查不会因为 AND/OR 的运行时短路而跳过某一子树。
+UPDATE 先查表，再按赋值顺序检查目标列、重复目标、RHS 表达式及类型，最后检查 WHERE；
+DELETE 查表后检查 WHERE。空赋值列表/空 RHS 属于外部 AST 结构错误，报 InvalidAst。
+SELECT/UPDATE/DELETE 共用 bindWhere，条件省略合法，存在时必须为 BOOL。
+优先使用名称/操作符/值自身范围，缺失时回退到表达式或语句范围，最终仍可为空。
+必需表达式子节点为空时报 InvalidAst；表达式路径超过 256 个节点时报 ExpressionTooDeep。
+绑定只推导类型，不求值，所以类型合法的除零或溢出表达式保留给执行层报告。
+
 绑定结果约束：全部列引用已解析；WHERE 为 BOOL；运算符合法；INSERT 值按
 表列顺序重排；SELECT 的星号已展开；UPDATE 目标唯一且赋值类型匹配。
 buildPlan 只接受符合这些约束的结果，不再按名字查询 Catalog。
+
+buildPlan 对目标模式、值数/值类型、列 ID/ordinal、WHERE 类型、赋值重复、
+表达式空指针和深度进行附加检查，失败返回 Plan / InvalidBoundStatement。
+它不会重新推导每个操作符的类型，前置条件仍是输入来自成功的 analyze。
+生成期间保留绑定表达式的只读指针和 Catalog 版本，不计算表达式或写入元数据。
 
 ## B → 执行层：计划
 
@@ -112,8 +149,46 @@ RowId 的具体存储格式留给执行/存储层，B 只声明是否需要传�
 INSERT/UPDATE/DELETE 返回影响行数（不作为 PlanNode.output 的业务列）。
 INSERT 单行；UPDATE/DELETE 按唯一行标识定位目标记录。
 UPDATE 全部 RHS 在写入前求值，例如 SET a=b,b=a 交换旧值。
+BoundUpdate/UpdatePlan 中每个 RHS 都是对原表列的引用；生成器不会把前一个赋值
+替换进后一个 RHS。执行层必须先对旧记录计算全部新值，再一次性写回。
 表达式按左子节点先求值；AND/OR 从左向右短路。执行层检查整数溢出、除零；
 字符串按原始字节判等。不支持 NULL，暂不存在三值逻辑。
+
+当前生成器固定使用上述树结构，SELECT * 也保留 Project；省略 WHERE 才省略 Filter。
+恒真/恒假条件在 buildPlan 输出中保留，需显式调用 optimizePlan 优化。SeqScan 读取全部列，修改输入行标识通过 Filter
+原样传递；Project 和修改根不暴露内部行标识。
+
+## B 内部：规则优化
+
+optimizePlan 接受成功 analyze → buildPlan 得到的计划，也接受自身的成功输出。
+buildPlan 不自动调用优化器，调用方可以保存并打印前后两个计划。
+优化器不读 Catalog、不执行记录、不改变输入树；复用未改动的只读节点，
+只为改动的表达式及其祖先创建新节点。Catalog 版本、输出列顺序/重复列、
+表列 ID/ordinal、UPDATE 的旧行引用以及修改所需的 RowId 均保留。
+
+首版包含安全常量折叠、布尔化简和恒真 Filter 消除：
+
+- 常量整数算术/比较、字符串判等/不等、BOOL 逻辑运算可折叠。
+  折叠可能生成内部 BOOL 字面量；SQL 语法仍不支持 TRUE/FALSE 字面量。
+- 整数运算先检查边界，除零、溢出则保留原运算及操作符范围，交给执行层按需求值时报错。
+- AND/OR 遵守左到右短路；FALSE AND x、TRUE OR x 可直接化简。
+  TRUE AND x、FALSE OR x、x AND TRUE、x OR FALSE 可替换为 x。
+  x AND FALSE、x OR TRUE 保留左侧求值，避免吞掉错误；不重排谓词。
+- Filter 的条件折叠为 TRUE 后用输入节点替换；FALSE Filter 保留。
+  不删除 Update/Delete 根，不进行列裁剪、索引选择或代价优化。
+
+入口附加检查空节点、访问路径深度（最多 256 层）、Filter 的 BOOL 条件及输出/RowId
+透传、修改输入的 RowId。失败返回 Plan / InvalidPlan，不返回部分优化结果。
+这些检查不是完整计划验证或重新类型检查；被短路跳过的子树不会被遍历。
+调用方必须遵守上述有效输入前置条件，不能用此入口验证任意手工构造的计划。
+
+## 计划文本展示
+
+formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确定的 UTF-8 调试文本：首行为模式版本，
+后续以两空格缩进表示父子关系，每个节点显示参数、output 和 row_id。
+列名从计划自带模式读取，不访问 Catalog；表达式使用括号保留结构。
+字符串引号翻倍，换行/制表符/反斜杠显示为转义文本。
+该格式用于阅读和测试，不是 SQL 源码或可反序列化协议；也不是 SQL EXPLAIN 语法支持。
 
 ## 五类示例及限制
 
@@ -122,11 +197,32 @@ UPDATE 全部 RHS 在写入前求值，例如 SET a=b,b=a 交换旧值。
 其中 CREATE 使用建表前快照；其余语句使用模拟建表成功后的固定快照。
 示例涵盖 INSERT 重排、SELECT 过滤、UPDATE 旧列值表达式和 DELETE 行标识。
 
+`examples/semantic.cpp` 则调用真实 analyze：分析 CREATE → 显式注册模式 →
+分析 INSERT/SELECT。演示产生绑定结果，不构造计划、不写入或查询数据记录。
+
+`examples/plans.cpp` 贯通五类手工 AST → analyze → buildPlan → formatPlan，
+仅在 CREATE 之后显式注册测试模式。INSERT/UPDATE/DELETE 不修改记录，SELECT 不返回数据行。
+
+`examples/optimizer.cpp` 使用真实 SQL 串联 lex/parse/analyze/buildPlan/optimizePlan，
+打印优化前后文本树。测试专用参考求值器在 tests/optimizer 下，不属于产品执行接口。
+
+`tests/integration/scaffold_smoke.cpp` 已改为真实 SQL → lex → parse → analyze → buildPlan
+兼容性测试，CREATE 后由测试驱动显式注册模式；普通库调用没有自动注册副作用。
+`minisql` 命令保留 A 的标准输入→Token/AST 调试行为，完整库链路与命令行展示范围分别验收。
+
 ## 维护责任
 
-- B：共享类型、本文、文法语义约定；后续实现分析和计划生成。
+- B：共享类型、本文、文法语义约定；维护语义分析、计划生成与优化。
 - A：遵循文法生成 AST，保留源码位置，提交 SQL→AST 联调测试。
 - Catalog/执行层：遵循模式、版本、行标识和执行规则。
 - 0.1：定义 AST、Catalog、绑定结果和计划的初版契约。
 - 0.2：补充 A 的 Token、lex/parse 接口；B 原签名保持不变，补上占位实现；
   新增 NotImplemented 错误码。grammar.md 的语言范围仍为 0.1，没有新增 SQL 语法。
+- 0.3：增加 MemoryCatalog；实现 CREATE/INSERT/SELECT 语义；增加 InvalidAst、
+  ExpressionTooDeep 错误码和确定的诊断顺序。原 AST、Bound 和 analyze 签名保持不变。
+- 0.4：完成 UPDATE/DELETE 语义、五类逻辑计划生成；新增 formatPlan 展示接口。
+  复用现有 InvalidBoundStatement 错误码，AST/Bound/Plan 数据结构和语法范围保持不变。
+- 0.5：合入 A 的 Lexer/Parser/调试入口与测试；修复 EOF 处块注释、逻辑操作符位置，
+  增加 EOF 及 Parser 深度检查；公共签名、共享类型和 MiniSQL 子集保持一致。
+- 0.6：增加 optimizePlan 及 InvalidPlan，明确安全常量折叠、短路化简和恒真 Filter 消除。
+  原入口及 AST/Bound/Plan 结构不变，语言文法仍为 0.1。

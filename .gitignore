@@ -1,0 +1,24 @@
+# C++ / CMake / Visual Studio build products
+DBcompiler-main/build/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.dll
+*.exe
+
+# Java / Maven build products
+minidb-engine/target/
+*.class
+
+# Local IDE and operating-system files
+.idea/
+.vs/
+*.iml
+Thumbs.db
+.DS_Store
+
+# Local render and scratch directories
+qa_render/
+tmp/
+*.log

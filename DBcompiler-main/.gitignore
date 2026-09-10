@@ -1,0 +1,8 @@
+# 本地构建产物不属于源码交付。
+/build/
+# CLion 的本机配置与生成目录。
+/.idea/
+/cmake-build-*/
+# 团队交付副本保留用于溯源，不作为嵌套 Git 仓库提交。
+/A version/
+*:Zone.Identifier

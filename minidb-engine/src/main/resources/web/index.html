@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiniDB · SQL 演示台</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="brand"><span class="brand-mark">M</span><div><p class="eyebrow">LARGE PLATFORM SOFTWARE PRACTICUM</p><h1>MiniDB <em>Control Deck</em></h1></div></div>
+      <div class="system-state"><span id="status-dot" class="dot"></span><span id="system-status">正在检查本地引擎…</span></div>
+    </header>
+
+    <section class="notice"><span class="notice-label">MEMORY MODE</span><span>每次运行都会从空内存数据库回放当前完整脚本，不会写入磁盘。</span></section>
+
+    <section class="workspace">
+      <article class="editor-card panel">
+        <div class="panel-head"><div><p class="kicker">01 / SQL SCRIPT</p><h2>指令工作区</h2></div><div class="editor-actions"><button id="restore" class="quiet">恢复示例</button><button id="execute" class="primary"><span>▶</span> 运行全部</button></div></div>
+        <div class="editor-wrap"><div id="line-numbers" aria-hidden="true">1</div><textarea id="sql" spellcheck="false" aria-label="SQL 脚本编辑器"></textarea></div>
+        <footer class="editor-foot"><span id="cursor-info">Ln 1, Col 1</span><span>支持 CREATE · INSERT · SELECT · UPDATE · DELETE</span></footer>
+      </article>
+
+      <aside class="side-stack">
+        <article class="panel architecture"><p class="kicker">PIPELINE</p><div class="pipe"><span>SQL</span><i>→</i><span>C++ 编译器</span><i>→</i><span>JSON 计划</span><i>→</i><span>Java 引擎</span></div></article>
+        <article class="panel quick-guide"><p class="kicker">RUNBOOK</p><ol><li>编辑或粘贴完整 SQL 脚本</li><li>点击“运行全部”</li><li>查看结果与执行计划</li></ol></article>
+      </aside>
+    </section>
+
+    <section class="results-grid">
+      <article class="panel result-panel">
+        <div class="panel-head compact"><div><p class="kicker">02 / EXECUTION OUTPUT</p><h2>执行结果</h2></div><button id="clear-output" class="quiet">清空输出</button></div>
+        <div id="result" class="result-empty"><span class="empty-glyph">↳</span><p>运行脚本后，结果将在这里出现。</p></div>
+      </article>
+      <article class="panel history-panel">
+        <div class="panel-head compact"><div><p class="kicker">SESSION / BROWSER ONLY</p><h2>执行历史</h2></div><span id="history-count" class="count">0</span></div>
+        <div id="history" class="history-empty">当前页面尚无执行记录。</div>
+      </article>
+    </section>
+
+    <details class="panel plan-panel" id="plan-panel">
+      <summary><span><b>03 / COMPILER ARTIFACT</b> JSON 执行计划</span><span class="summary-hint">展开查看</span></summary>
+      <pre id="plan">等待一次成功执行…</pre>
+    </details>
+  </main>
+  <template id="command-template"><section class="command-result"><div class="command-title"></div><p></p></section></template>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 #include "minisql/plan_printer.hpp"
 
 #include <locale>
+#include <limits>
 #include <sstream>
 #include <type_traits>
 
@@ -12,6 +13,8 @@ const char* typeName(DataType type) {
     case DataType::Int: return "INT";
     case DataType::Varchar: return "VARCHAR";
     case DataType::Bool: return "BOOL";
+    case DataType::Float: return "FLOAT";
+    case DataType::Null: return "NULL";
     }
     return "UNKNOWN";
 }
@@ -53,6 +56,14 @@ std::string literal(const ScalarValue& value) {
             return text + "'";
         } else if constexpr (std::is_same_v<T, bool>) {
             return item ? "TRUE" : "FALSE";
+        } else if constexpr (std::is_same_v<T, NullValue>) {
+            return "NULL";
+        } else if constexpr (std::is_same_v<T, double>) {
+            std::ostringstream stream;
+            stream.imbue(std::locale::classic());
+            stream.precision(std::numeric_limits<double>::max_digits10);
+            stream << item;
+            return stream.str();
         } else {
             return std::to_string(item);
         }
@@ -63,40 +74,55 @@ std::string tableName(const std::shared_ptr<const TableSchema>& table) {
     return table ? table->name + "#" + std::to_string(table->id.value) : "<missing-table>";
 }
 
-// 单表计划的模式已经存在于算子中，打印器无需重新查询 Catalog。
-std::shared_ptr<const TableSchema> sourceTable(const PlanPtr& plan, std::size_t depth = 0) {
-    if (!plan || depth >= 256) return nullptr;
-    return std::visit([&](const auto& op) -> std::shared_ptr<const TableSchema> {
+using Tables = std::vector<std::shared_ptr<const TableSchema>>;
+
+void addTable(Tables& tables, const std::shared_ptr<const TableSchema>& table) {
+    if (!table) return;
+    for (const auto& present : tables) if (present->id.value == table->id.value) return;
+    tables.push_back(table);
+}
+
+// 从计划自身收集模式，不回查 Catalog；JOIN 的左右两棵子树都要遍历。
+void collectTables(const PlanPtr& plan, Tables& tables, std::size_t depth = 0) {
+    if (!plan || depth >= 256) return;
+    std::visit([&](const auto& op) {
         using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, CreateTablePlan>) return nullptr;
-        else if constexpr (std::is_same_v<T, FilterPlan> || std::is_same_v<T, ProjectPlan>)
-            return sourceTable(op.input, depth + 1);
-        else return op.table;
+        if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
+            collectTables(op.left, tables, depth + 1);
+            collectTables(op.right, tables, depth + 1);
+        } else if constexpr (std::is_same_v<T, FilterPlan> ||
+                             std::is_same_v<T, GroupByPlan> ||
+                             std::is_same_v<T, SortPlan> ||
+                             std::is_same_v<T, ProjectPlan>) {
+            collectTables(op.input, tables, depth + 1);
+        } else if constexpr (!std::is_same_v<T, CreateTablePlan>) addTable(tables, op.table);
     }, plan->node);
 }
 
-std::string columnName(const BoundColumnRef& ref, const std::shared_ptr<const TableSchema>& table) {
-    if (table && ref.table_id.value == table->id.value && ref.ordinal < table->columns.size() &&
-        ref.column_id.value == table->columns[ref.ordinal].id.value) {
-        return table->name + "." + table->columns[ref.ordinal].name;
+std::string columnName(const BoundColumnRef& ref, const Tables& tables) {
+    for (const auto& table : tables) {
+        if (ref.table_id.value == table->id.value && ref.ordinal < table->columns.size() &&
+            ref.column_id.value == table->columns[ref.ordinal].id.value) {
+            return table->name + "." + table->columns[ref.ordinal].name;
+        }
     }
     return "table#" + std::to_string(ref.table_id.value) + ".column#" + std::to_string(ref.column_id.value);
 }
 
-std::string expression(const BoundExprPtr& expr, const std::shared_ptr<const TableSchema>& table,
+std::string expression(const BoundExprPtr& expr, const Tables& tables,
                        std::size_t depth = 0) {
     if (!expr) return "<missing-expression>";
     if (depth >= 256) return "<depth-limit>";
     return std::visit([&](const auto& node) -> std::string {
         using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, BoundColumnRef>) return columnName(node, table);
+        if constexpr (std::is_same_v<T, BoundColumnRef>) return columnName(node, tables);
         else if constexpr (std::is_same_v<T, BoundLiteral>) return literal(node.value);
         else if constexpr (std::is_same_v<T, BoundUnary>)
             return std::string("(") + (node.op == UnaryOp::Not ? "NOT " : "-") +
-                   expression(node.operand, table, depth + 1) + ")";
+                   expression(node.operand, tables, depth + 1) + ")";
         else
-            return "(" + expression(node.left, table, depth + 1) + " " + opName(node.op) + " " +
-                   expression(node.right, table, depth + 1) + ")";
+            return "(" + expression(node.left, tables, depth + 1) + " " + opName(node.op) + " " +
+                   expression(node.right, tables, depth + 1) + ")";
     }, expr->node);
 }
 
@@ -104,8 +130,11 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
     out << std::string(depth * 2, ' ');
     if (!plan) { out << "<missing-plan>\n"; return; }
     if (depth >= 256) { out << "<depth-limit>\n"; return; }
-    const auto table = sourceTable(plan);
+    Tables tables;
+    collectTables(plan, tables);
     PlanPtr input;
+    PlanPtr left;
+    PlanPtr right;
     std::visit([&](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan>) {
@@ -123,22 +152,39 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
             out << ')';
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             out << "SeqScan[" << tableName(op.table);
+        } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
+            left = op.left;
+            right = op.right;
+            out << "NestedLoopJoin[" << expression(op.predicate, tables);
         } else {
             input = op.input;
             if constexpr (std::is_same_v<T, FilterPlan>) {
-                out << "Filter[" << expression(op.predicate, table);
+                out << "Filter[" << expression(op.predicate, tables);
+            } else if constexpr (std::is_same_v<T, GroupByPlan>) {
+                out << "GroupBy[";
+                for (std::size_t i = 0; i < op.keys.size(); ++i) {
+                    if (i) out << ", ";
+                    out << columnName(op.keys[i], tables);
+                }
+            } else if constexpr (std::is_same_v<T, SortPlan>) {
+                out << "Sort[";
+                for (std::size_t i = 0; i < op.items.size(); ++i) {
+                    if (i) out << ", ";
+                    out << columnName(op.items[i].column, tables) << ' '
+                        << (op.items[i].direction == SortDirection::Asc ? "ASC" : "DESC");
+                }
             } else if constexpr (std::is_same_v<T, ProjectPlan>) {
                 out << "Project[";
                 for (std::size_t i = 0; i < op.columns.size(); ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.columns[i], table);
+                    out << columnName(op.columns[i], tables);
                 }
             } else if constexpr (std::is_same_v<T, UpdatePlan>) {
                 out << "Update[" << tableName(op.table) << "; ";
                 for (std::size_t i = 0; i < op.assignments.size(); ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.assignments[i].target, table) << " = "
-                        << expression(op.assignments[i].value, table);
+                    out << columnName(op.assignments[i].target, tables) << " = "
+                        << expression(op.assignments[i].value, tables);
                 }
                 out << "; values=old-row";
             } else {
@@ -153,6 +199,8 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
     }
     out << "] row_id=" << (plan->carries_row_id ? "yes" : "no") << '\n';
     if (input) printNode(out, input, depth + 1);
+    if (left) printNode(out, left, depth + 1);
+    if (right) printNode(out, right, depth + 1);
 }
 } // namespace
 

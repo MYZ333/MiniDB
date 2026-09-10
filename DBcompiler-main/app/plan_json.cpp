@@ -6,6 +6,9 @@
 #include "minisql/parser.hpp"
 
 #include <iostream>
+#include <iomanip>
+#include <limits>
+#include <locale>
 #include <sstream>
 #include <type_traits>
 
@@ -17,6 +20,8 @@ const char* typeName(DataType type) {
     case DataType::Int: return "INT";
     case DataType::Varchar: return "VARCHAR";
     case DataType::Bool: return "BOOL";
+    case DataType::Float: return "FLOAT";
+    case DataType::Null: return "NULL";
     }
     return "UNKNOWN";
 }
@@ -66,6 +71,9 @@ void scalarJson(std::ostream& out, const ScalarValue& value) {
         using T = std::decay_t<decltype(item)>;
         if constexpr (std::is_same_v<T, std::string>) stringJson(out, item);
         else if constexpr (std::is_same_v<T, bool>) out << (item ? "true" : "false");
+        else if constexpr (std::is_same_v<T, NullValue>) out << "null";
+        else if constexpr (std::is_same_v<T, double>)
+            out << std::setprecision(std::numeric_limits<double>::max_digits10) << item;
         else out << item;
     }, value);
 }
@@ -172,10 +180,37 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             out << "\"type\":\"SeqScan\",\"table\":";
             tableJson(out, node.table);
+        } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
+            out << "\"type\":\"NestedLoopJoin\",\"predicate\":";
+            exprJson(out, node.predicate, depth + 1);
+            out << ",\"left\":";
+            nodeJson(out, node.left, depth + 1);
+            out << ",\"right\":";
+            nodeJson(out, node.right, depth + 1);
         } else if constexpr (std::is_same_v<T, FilterPlan>) {
             out << "\"type\":\"Filter\",\"predicate\":";
             exprJson(out, node.predicate, depth + 1);
             out << ",\"input\":";
+            nodeJson(out, node.input, depth + 1);
+        } else if constexpr (std::is_same_v<T, GroupByPlan>) {
+            out << "\"type\":\"GroupBy\",\"keys\":[";
+            for (std::size_t i = 0; i < node.keys.size(); ++i) {
+                if (i) out << ',';
+                refJson(out, node.keys[i]);
+            }
+            out << "],\"input\":";
+            nodeJson(out, node.input, depth + 1);
+        } else if constexpr (std::is_same_v<T, SortPlan>) {
+            out << "\"type\":\"Sort\",\"items\":[";
+            for (std::size_t i = 0; i < node.items.size(); ++i) {
+                if (i) out << ',';
+                out << "{\"column\":";
+                refJson(out, node.items[i].column);
+                out << ",\"direction\":\""
+                    << (node.items[i].direction == SortDirection::Asc ? "ASC" : "DESC")
+                    << "\"}";
+            }
+            out << "],\"input\":";
             nodeJson(out, node.input, depth + 1);
         } else if constexpr (std::is_same_v<T, ProjectPlan>) {
             out << "\"type\":\"Project\",\"columns\":[";
@@ -216,6 +251,8 @@ void printDiagnostic(const Diagnostic& error) {
 } // namespace
 
 int main() {
+    // JSON 数字必须使用点号，不受操作系统区域设置影响。
+    std::cout.imbue(std::locale::classic());
     std::ostringstream input;
     input << std::cin.rdbuf();
     auto tokens = lex(input.str());
@@ -234,6 +271,7 @@ int main() {
         if (const auto* error = std::get_if<Diagnostic>(&optimized)) { printDiagnostic(*error); return 1; }
         const LogicalPlan& logical_plan = std::get<LogicalPlan>(optimized);
         std::ostringstream root;
+        root.imbue(std::locale::classic());
         nodeJson(root, logical_plan.root);
         if (!first) std::cout << ',';
         std::cout << "{\"catalogVersion\":" << logical_plan.catalog_version << ",\"root\":" << root.str() << '}';

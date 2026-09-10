@@ -23,6 +23,19 @@ struct Fixture {
     }
 };
 
+struct MultiTableFixture {
+    MemoryCatalog catalog;
+    MultiTableFixture() {
+        value(catalog.createTable("student", {{"id", DataType::Int}, {"name", DataType::Varchar},
+                                               {"age", DataType::Int}}));
+        value(catalog.createTable("score", {{"id", DataType::Int}, {"student_id", DataType::Int},
+                                             {"value", DataType::Int}}));
+    }
+    Result<BoundStatement> analyzeSelect(SelectStmt select) {
+        return analyze(Statement{std::move(select), span(0, 100)}, *catalog.snapshot());
+    }
+};
+
 InsertStmt insert() {
     return {id("student"), std::nullopt,
         {{std::int64_t{1}, span(30)}, {std::string{"Alice"}, span(33, 7)}, {std::int64_t{20}, span(42, 2)}}};
@@ -46,13 +59,18 @@ int main() {
         auto e = failure(f.analyzeNode(CreateTableStmt{id("STUDENT", span(13, 7)), {{id("id"), DataType::Int, {}}}}), ErrorCode::TableAlreadyExists);
         check(e.span->begin.offset == 13, "wrong table location");
     });
-    suite.run("CREATE validates columns and rejects BOOL", [] {
+    suite.run("CREATE validates columns and accepts BOOL FLOAT", [] {
         Fixture f;
         failure(f.analyzeNode(CreateTableStmt{id("newtable"), {}}), ErrorCode::EmptyColumnList);
         auto e = failure(f.analyzeNode(CreateTableStmt{id("newtable"),
             {{id("id"), DataType::Int, {}}, {id("ID", span(25, 2)), DataType::Int, {}}}}), ErrorCode::DuplicateColumn);
         check(e.span->begin.offset == 25, "duplicate should locate second column");
-        failure(f.analyzeNode(CreateTableStmt{id("newtable"), {{id("flag"), DataType::Bool, span(20, 4)}}}), ErrorCode::UnsupportedType);
+        const auto created = value(f.analyzeNode(CreateTableStmt{id("newtable"),
+            {{id("flag"), DataType::Bool, span(20, 4)},
+             {id("score"), DataType::Float, span(30, 5)}}}));
+        const auto& columns = std::get<BoundCreateTable>(created.node).columns;
+        check(columns[0].type == DataType::Bool && columns[1].type == DataType::Float,
+              "extended CREATE types lost");
     });
     suite.run("INSERT omitted list uses schema order", [] {
         Fixture f;
@@ -139,6 +157,80 @@ int main() {
         auto e = failure(f.analyzeNode(SelectStmt{id("student"), std::vector<Identifier>{id("score", span(7, 5))}, nullptr}), ErrorCode::ColumnNotFound);
         check(e.span->begin.column == 8 && e.span->end.offset == 12, "SELECT diagnostic range is not half-open");
     });
+    suite.run("JOIN binds qualified columns across both table schemas", [] {
+        MultiTableFixture f;
+        SelectStmt select{id("student"),
+            std::vector<Identifier>{id("student.name"), id("score.value")},
+            bin(BinaryOp::Greater, col("score.value"), num(60))};
+        select.joins.push_back({id("score"),
+            bin(BinaryOp::Equal, col("student.id"), col("score.student_id")), {}});
+        const auto bound = value(f.analyzeSelect(std::move(select)));
+        const auto& query = std::get<BoundSelect>(bound.node);
+        check(query.joins.size() == 1 && query.columns.size() == 2,
+              "JOIN binding shape mismatch");
+        check(query.columns[0].table_id.value == query.table->id.value &&
+              query.columns[1].table_id.value == query.joins[0].table->id.value,
+              "qualified columns resolved to wrong tables");
+        check(query.joins[0].on->type == DataType::Bool && query.where->type == DataType::Bool,
+              "JOIN ON or WHERE lost BOOL type");
+    });
+    suite.run("JOIN star expands all tables and ambiguous names are rejected", [] {
+        MultiTableFixture f;
+        SelectStmt star{id("student"), AllColumns{}, nullptr};
+        star.joins.push_back({id("score"),
+            bin(BinaryOp::Equal, col("student.id"), col("score.student_id")), {}});
+        const auto star_bound = value(f.analyzeSelect(star));
+        const auto& query = std::get<BoundSelect>(star_bound.node);
+        check(query.columns.size() == 6 && query.columns[3].table_id.value == query.joins[0].table->id.value,
+              "JOIN star did not preserve table and schema order");
+
+        star.columns = std::vector<Identifier>{id("id", span(7, 2))};
+        auto error = failure(f.analyzeSelect(star), ErrorCode::AmbiguousColumn);
+        check(error.span->begin.offset == 7, "ambiguous column location mismatch");
+        star.columns = std::vector<Identifier>{id("student.id")};
+        star.joins[0].on = col("student.id", span(40, 10));
+        error = failure(f.analyzeSelect(star), ErrorCode::JoinConditionNotBoolean);
+        check(error.span->begin.offset == 40, "JOIN ON type location mismatch");
+    });
+    suite.run("JOIN rejects duplicate tables until aliases are supported", [] {
+        MultiTableFixture f;
+        SelectStmt select{id("student"), AllColumns{}, nullptr};
+        select.joins.push_back({id("student", span(25, 7)), truth(), {}});
+        const auto error = failure(f.analyzeSelect(std::move(select)), ErrorCode::DuplicateTable);
+        check(error.span->begin.offset == 25, "duplicate JOIN table location mismatch");
+    });
+    suite.run("GROUP BY enforces key-only projection and ordering", [] {
+        MultiTableFixture f;
+        SelectStmt valid{id("student"), std::vector<Identifier>{id("name")}, nullptr};
+        valid.group_by = {id("name")};
+        valid.order_by = {{id("name"), SortDirection::Desc, {}}};
+        const auto grouped_bound = value(f.analyzeSelect(valid));
+        const auto& grouped = std::get<BoundSelect>(grouped_bound.node);
+        check(grouped.group_by.size() == 1 && grouped.order_by.size() == 1 &&
+              grouped.order_by[0].direction == SortDirection::Desc,
+              "GROUP BY or ORDER BY binding mismatch");
+
+        valid.columns = std::vector<Identifier>{id("age")};
+        failure(f.analyzeSelect(valid), ErrorCode::InvalidGrouping);
+        valid.columns = std::vector<Identifier>{id("name")};
+        valid.order_by = {{id("age"), SortDirection::Asc, span(55, 3)}};
+        failure(f.analyzeSelect(valid), ErrorCode::InvalidGrouping);
+        valid.order_by.clear();
+        valid.group_by.push_back(id("NAME", span(70, 4)));
+        const auto error = failure(f.analyzeSelect(valid), ErrorCode::InvalidGrouping);
+        check(error.span->begin.offset == 70, "duplicate GROUP BY key location mismatch");
+    });
+    suite.run("ORDER BY permits a hidden column and retains item order", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<Identifier>{id("name")}, nullptr};
+        select.order_by = {{id("age"), SortDirection::Desc, {}},
+                           {id("id"), SortDirection::Asc, {}}};
+        const auto ordered_bound = value(f.analyzeNode(select));
+        const auto& ordered = std::get<BoundSelect>(ordered_bound.node);
+        check(ordered.columns.size() == 1 && ordered.order_by.size() == 2 &&
+              ordered.order_by[0].column.ordinal == 2 && ordered.order_by[1].column.ordinal == 0,
+              "hidden ORDER BY column or item order was lost");
+    });
     suite.run("nested expressions receive types without AST mutation", [] {
         Fixture f;
         auto sum = bin(BinaryOp::Add, col("AGE"), num(1));
@@ -178,10 +270,10 @@ int main() {
         check(e.span->begin.offset == 6, "NOT location mismatch");
         failure(f.where(un(UnaryOp::Negate, text("abc"))), ErrorCode::InvalidOperandType);
     });
-    suite.run("BOOL is required for logical operators and WHERE", [] {
+    suite.run("BOOL logical operators equality and WHERE rules", [] {
         Fixture f;
         for (auto op : {BinaryOp::And, BinaryOp::Or}) failure(f.where(bin(op, num(1), truth())), ErrorCode::InvalidOperandType);
-        failure(f.where(bin(BinaryOp::Equal, truth(), truth())), ErrorCode::InvalidOperandType);
+        value(f.where(bin(BinaryOp::Equal, truth(), truth())));
         auto e = failure(f.where(col("age", span(33, 3))), ErrorCode::WhereNotBoolean);
         check(e.span->begin.offset == 33, "WHERE type error location");
         failure(f.where(text("abc")), ErrorCode::WhereNotBoolean);

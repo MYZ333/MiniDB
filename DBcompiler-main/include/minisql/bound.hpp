@@ -44,10 +44,23 @@ struct BoundInsert {
     std::vector<ScalarValue> values; // 已按表列顺序重排，数量等于全部表列数。
 };
 
+struct BoundJoin {
+    std::shared_ptr<const TableSchema> table;
+    BoundExprPtr on; // 加入当前表后绑定；必须为 BOOL。
+};
+
+struct BoundOrderBy {
+    BoundColumnRef column; // 可为未投影的列；Sort 在 Project 前读取它。
+    SortDirection direction; // 每个排序键独立指定升序或降序。
+};
+
 struct BoundSelect {
     std::shared_ptr<const TableSchema> table;
     std::vector<BoundColumnRef> columns; // 星号已展开，显式重复列保留。
     BoundExprPtr where; // 若存在则必须为 BOOL。
+    std::vector<BoundJoin> joins = {}; // 按 SQL 顺序保存，生成左深连接树。
+    std::vector<BoundColumnRef> group_by = {}; // 无聚合阶段仅允许投影这些键。
+    std::vector<BoundOrderBy> order_by = {}; // 项目顺序就是多键比较优先级。
 };
 
 struct BoundAssignment {

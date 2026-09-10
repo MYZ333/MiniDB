@@ -57,10 +57,26 @@ struct InsertStmt {
 struct AllColumns { SourceLocation span; };
 using SelectList = std::variant<AllColumns, std::vector<Identifier>>;
 
+struct OrderByItem {
+    Identifier column;
+    SortDirection direction = SortDirection::Asc;
+    SourceLocation span;
+};
+
+struct JoinClause {
+    Identifier table;
+    ExprPtr on;
+    SourceLocation span;
+};
+
 struct SelectStmt {
     Identifier table;
     SelectList columns;
     ExprPtr where; // 空指针：没有 WHERE。其余表达式子节点必须非空。
+    // 默认值保持旧的三字段聚合初始化源码兼容。
+    std::vector<Identifier> group_by = {};
+    std::vector<OrderByItem> order_by = {};
+    std::vector<JoinClause> joins = {};
 };
 
 struct Assignment {

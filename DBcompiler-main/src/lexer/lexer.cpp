@@ -33,8 +33,14 @@ TokenKind keywordOrIdentifier(const std::string& lexeme) {
         {"values", TokenKind::Values}, {"select", TokenKind::Select},
         {"from", TokenKind::From}, {"where", TokenKind::Where},
         {"update", TokenKind::Update}, {"set", TokenKind::Set},
-        {"delete", TokenKind::Delete}, {"int", TokenKind::Int},
-        {"varchar", TokenKind::Varchar}, {"and", TokenKind::And},
+        {"delete", TokenKind::Delete}, {"join", TokenKind::Join},
+        {"on", TokenKind::On}, {"group", TokenKind::Group},
+        {"order", TokenKind::Order}, {"by", TokenKind::By},
+        {"asc", TokenKind::Asc}, {"desc", TokenKind::Desc},
+        {"int", TokenKind::Int}, {"varchar", TokenKind::Varchar},
+        {"bool", TokenKind::Bool}, {"float", TokenKind::Float},
+        {"null", TokenKind::Null}, {"true", TokenKind::True},
+        {"false", TokenKind::False}, {"and", TokenKind::And},
         {"or", TokenKind::Or}, {"not", TokenKind::Not},
     };
     const auto found = keywords.find(asciiLower(lexeme));
@@ -59,7 +65,7 @@ public:
             if (isIdentifierStart(ch)) {
                 tokens_.push_back(identifier(start));
             } else if (std::isdigit(static_cast<unsigned char>(ch)) != 0) {
-                tokens_.push_back(integer(start));
+                tokens_.push_back(number(start));
             } else if (ch == '\'') {
                 auto token = string(start);
                 if (const auto* diagnostic = std::get_if<Diagnostic>(&token)) {
@@ -176,10 +182,16 @@ private:
         return Token{keywordOrIdentifier(lexeme), std::move(lexeme), spanFrom(start)};
     }
 
-    Token integer(SourcePosition start) {
+    Token number(SourcePosition start) {
         const std::size_t begin = index_;
         while (!atEnd() && std::isdigit(static_cast<unsigned char>(peek())) != 0) {
             advance();
+        }
+        // 小数点两侧都必须有数字；否则把点留给限定列名或后续语法诊断。
+        if (peek() == '.' && std::isdigit(static_cast<unsigned char>(peek(1))) != 0) {
+            advance();
+            while (!atEnd() && std::isdigit(static_cast<unsigned char>(peek())) != 0) advance();
+            return Token{TokenKind::FloatLiteral, textFrom(begin), spanFrom(start)};
         }
         return Token{TokenKind::Integer, textFrom(begin), spanFrom(start)};
     }
@@ -239,6 +251,7 @@ private:
         case '(': return Token{TokenKind::LeftParen, textFrom(begin), spanFrom(start)};
         case ')': return Token{TokenKind::RightParen, textFrom(begin), spanFrom(start)};
         case ',': return Token{TokenKind::Comma, textFrom(begin), spanFrom(start)};
+        case '.': return Token{TokenKind::Dot, textFrom(begin), spanFrom(start)};
         case ';': return Token{TokenKind::Semicolon, textFrom(begin), spanFrom(start)};
         default:
             return diagnostic(ErrorCode::InvalidCharacter,

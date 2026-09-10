@@ -88,6 +88,20 @@ bool sameOutput(const PlanNode& left, const PlanNode& right) {
     return true;
 }
 
+// JOIN 的记录布局是左列后接右列；优化只能改表达式，不能改变执行层依赖的槽位顺序。
+bool isConcatenatedOutput(const PlanNode& join, const PlanNode& left, const PlanNode& right) {
+    if (join.carries_row_id || left.carries_row_id || right.carries_row_id ||
+        join.output.size() != left.output.size() + right.output.size()) return false;
+    std::size_t output_index = 0;
+    for (const auto* input : {&left, &right}) {
+        for (const auto& column : input->output) {
+            const auto& actual = join.output[output_index++];
+            if (actual.name != column.name || actual.type != column.type) return false;
+        }
+    }
+    return true;
+}
+
 template <typename T>
 PlanPtr replace(const PlanPtr& original, T op) {
     return std::make_shared<const PlanNode>(PlanNode{std::move(op), original->output, original->carries_row_id});
@@ -100,6 +114,22 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan>) {
             return plan; // 第一阶段 INSERT 已是单行字面量，无需继续折叠。
+        } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
+            auto left_result = optimizeNode(op.left, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;
+            auto right_result = optimizeNode(op.right, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&right_result)) return *error;
+            if (!op.predicate || op.predicate->type != DataType::Bool)
+                return invalid("NestedLoopJoin requires a BOOL predicate");
+            auto expression = optimizeExpr(op.predicate);
+            if (const auto* error = std::get_if<Diagnostic>(&expression)) return *error;
+            auto left = std::get<PlanPtr>(std::move(left_result));
+            auto right = std::get<PlanPtr>(std::move(right_result));
+            auto predicate = std::get<BoundExprPtr>(std::move(expression));
+            if (!isConcatenatedOutput(*plan, *left, *right))
+                return invalid("NestedLoopJoin output must concatenate left and right metadata");
+            if (left == op.left && right == op.right && predicate == op.predicate) return plan;
+            return replace(plan, NestedLoopJoinPlan{left, right, predicate});
         } else {
             auto child = optimizeNode(op.input, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&child)) return *error;
@@ -132,6 +162,21 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
                 if (!input->carries_row_id) return invalid("DELETE input requires RowId");
                 if (input == op.input) return plan;
                 return replace(plan, DeletePlan{op.table, input});
+            } else if constexpr (std::is_same_v<T, GroupByPlan>) {
+                if (op.keys.empty() || plan->carries_row_id || input->carries_row_id ||
+                    plan->output.size() != op.keys.size())
+                    return invalid("GroupBy keys and output metadata are inconsistent");
+                for (std::size_t i = 0; i < op.keys.size(); ++i) {
+                    if (plan->output[i].type != op.keys[i].type)
+                        return invalid("GroupBy output type does not match its key");
+                }
+                if (input == op.input) return plan;
+                return replace(plan, GroupByPlan{op.keys, input});
+            } else if constexpr (std::is_same_v<T, SortPlan>) {
+                if (op.items.empty() || !sameOutput(*plan, *input))
+                    return invalid("Sort requires items and must preserve input metadata");
+                if (input == op.input) return plan;
+                return replace(plan, SortPlan{op.items, input});
             } else {
                 if (input == op.input) return plan;
                 return replace(plan, ProjectPlan{op.columns, input});

@@ -60,15 +60,31 @@ void testTriviaAndPositions() {
 }
 
 void testSingleCharacterTokens() {
-    const auto tokens = lexOk("()+-*/,;= < > <= >= !=");
+    const auto tokens = lexOk("()+-*/,. ;= < > <= >= !=");
     const std::vector<TokenKind> expected{
         TokenKind::LeftParen, TokenKind::RightParen, TokenKind::Plus, TokenKind::Minus,
-        TokenKind::Star, TokenKind::Slash, TokenKind::Comma, TokenKind::Semicolon,
+        TokenKind::Star, TokenKind::Slash, TokenKind::Comma, TokenKind::Dot, TokenKind::Semicolon,
         TokenKind::Equal, TokenKind::Less, TokenKind::Greater, TokenKind::LessEqual,
         TokenKind::GreaterEqual, TokenKind::NotEqual, TokenKind::EndOfInput};
     require(tokens.size() == expected.size(), "unexpected operator token count");
     for (std::size_t i = 0; i < expected.size(); ++i) {
         require(tokens[i].kind == expected[i], "unexpected operator token");
+    }
+}
+
+void testExtendedTokens() {
+    const auto tokens = lexOk(
+        "SELECT student.id FROM student JOIN score ON student.id=score.id "
+        "GROUP BY student.id ORDER BY score.value DESC;"
+        "CREATE TABLE metrics(active BOOL, value FLOAT);"
+        "INSERT INTO metrics VALUES(TRUE,3.14,NULL,FALSE);");
+    const std::vector<TokenKind> required{TokenKind::Dot, TokenKind::Join, TokenKind::On,
+        TokenKind::Group, TokenKind::Order, TokenKind::By, TokenKind::Desc, TokenKind::Bool,
+        TokenKind::Float, TokenKind::True, TokenKind::FloatLiteral, TokenKind::Null, TokenKind::False};
+    for (const auto kind : required) {
+        bool found = false;
+        for (const auto& token : tokens) found = found || token.kind == kind;
+        require(found, "extended token kind missing");
     }
 }
 
@@ -104,6 +120,7 @@ int main() {
         testBasicTokens();
         testTriviaAndPositions();
         testSingleCharacterTokens();
+        testExtendedTokens();
         testErrors();
         testClosedCommentAtEof();
         testCrLfAndOwnedText();

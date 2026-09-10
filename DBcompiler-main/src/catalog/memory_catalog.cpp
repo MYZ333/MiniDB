@@ -46,8 +46,8 @@ Result<std::shared_ptr<const TableSchema>> MemoryCatalog::createTable(
         if (!names.insert(name).second) {
             return schemaError(ErrorCode::DuplicateColumn, "duplicate column '" + column.name + "'");
         }
-        if (column.type != DataType::Int && column.type != DataType::Varchar) {
-            return schemaError(ErrorCode::UnsupportedType, "table columns support only INT and VARCHAR");
+        if (column.type == DataType::Null) {
+            return schemaError(ErrorCode::UnsupportedType, "NULL is not a declarable column type");
         }
         fields.push_back({ColumnId{static_cast<std::uint64_t>(fields.size()) + 1},
                           std::move(name), column.type});

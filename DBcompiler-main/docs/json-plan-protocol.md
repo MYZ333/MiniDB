@@ -16,11 +16,18 @@
 导出后模拟 Catalog 注册，因此后续 INSERT、SELECT、UPDATE、DELETE 可引用新表；
 Java 引擎也必须在成功 CREATE 后以同样的表 ID、列 ID 和版本规则更新目录。
 
-节点类型为 `CreateTable`、`Insert`、`SeqScan`、`Filter`、`Project`、`Update` 和
-`Delete`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
+节点类型为 `CreateTable`、`Insert`、`SeqScan`、`NestedLoopJoin`、`Filter`、
+`GroupBy`、`Sort`、`Project`、`Update` 和 `Delete`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
 `ordinal`、`type`。表达式以 `kind: column|literal|unary|binary` 表示，运算名称与
-C++ 的 `UnaryOp`、`BinaryOp` 枚举一致。字符串、整数和内部 BOOL 分别使用 JSON
-string、number、boolean；表达式附带可选 `span` 以便 Java 报告 SQL 行列。
+C++ 的 `UnaryOp`、`BinaryOp` 枚举一致。字符串、整数/浮点、BOOL、NULL 分别使用 JSON
+string、number、boolean、null；表达式附带可选 `span` 以便 Java 报告 SQL 行列。
+
+- `NestedLoopJoin` 使用 `left`、`right` 和 `predicate`，输出顺序为左列后接右列。
+- `GroupBy` 使用 `keys` 和 `input`，当前表示按键去重。
+- `Sort` 使用有序 `items` 和 `input`；每项包含 `column` 及 `ASC`/`DESC` direction。
+
+这些字段是协议 1 的向后兼容扩展：旧的基础计划结构没有变化。当前仓库 Java 引擎只执行
+基础增删改查节点；收到高级节点会返回 InvalidPlan，后续执行算子应按 interfaces.md 接入。
 
 `carriesRowId` 为 true 时，Java 存储适配层必须让扫描结果携带稳定 RowId；UPDATE
 和 DELETE 使用该 RowId 定位原记录，不能按业务列值猜测记录身份。

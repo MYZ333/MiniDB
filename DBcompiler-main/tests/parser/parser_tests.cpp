@@ -54,6 +54,12 @@ const UnaryExpr& asUnary(const ExprPtr& expr, UnaryOp op) {
     return *unary;
 }
 
+const IdentifierExpr& asIdentifier(const ExprPtr& expr) {
+    const auto* identifier = std::get_if<IdentifierExpr>(&expr->node);
+    require(identifier != nullptr, "expected identifier expression");
+    return *identifier;
+}
+
 void testStatements() {
     const auto statements = parseOk(
         "CREATE TABLE student(id INT, name VARCHAR, age INT);"
@@ -125,6 +131,44 @@ void testExpressionPrecedence() {
     asBinary(add.right, BinaryOp::Multiply);
 }
 
+void testJoinGroupOrderAndQualifiedNames() {
+    const auto statements = parseOk(
+        "SELECT student.name FROM student JOIN score ON student.id=score.student_id "
+        "JOIN class_info ON student.class_id=class_info.id WHERE score.value>60 "
+        "GROUP BY student.name ORDER BY score.value DESC,student.name;");
+    const auto& select = std::get<SelectStmt>(statements[0].node);
+    require(std::get<std::vector<Identifier>>(select.columns)[0].text == "student.name",
+            "qualified projection not retained");
+    require(select.joins.size() == 2 && select.joins[0].table.text == "score",
+            "JOIN list not retained");
+    const auto& on = asBinary(select.joins[0].on, BinaryOp::Equal);
+    require(asIdentifier(on.left).name.text == "student.id" &&
+            asIdentifier(on.right).name.text == "score.student_id", "qualified ON names lost");
+    require(select.group_by.size() == 1 && select.group_by[0].text == "student.name",
+            "GROUP BY list not retained");
+    require(select.order_by.size() == 2 &&
+            select.order_by[0].direction == SortDirection::Desc &&
+            select.order_by[1].direction == SortDirection::Asc, "ORDER BY direction mismatch");
+}
+
+void testBoolFloatAndNull() {
+    const auto statements = parseOk(
+        "CREATE TABLE metrics(id INT,active BOOL,score FLOAT);"
+        "INSERT INTO metrics VALUES(1,TRUE,3.14);"
+        "INSERT INTO metrics VALUES(2,FALSE,NULL);"
+        "SELECT * FROM metrics WHERE active=TRUE AND score>=-0.5;");
+    const auto& create = std::get<CreateTableStmt>(statements[0].node);
+    require(create.columns[1].type == DataType::Bool && create.columns[2].type == DataType::Float,
+            "extended column types lost");
+    const auto& first = std::get<InsertStmt>(statements[1].node);
+    require(std::get<bool>(first.values[1].value) &&
+            std::get<double>(first.values[2].value) == 3.14, "extended literal value lost");
+    const auto& second = std::get<InsertStmt>(statements[2].node);
+    require(std::holds_alternative<NullValue>(second.values[2].value), "NULL literal lost");
+    const auto& where = std::get<SelectStmt>(statements[3].node).where;
+    require(asBinary(where, BinaryOp::And).right != nullptr, "extended predicate missing");
+}
+
 void testIntegerBoundaries() {
     const auto statements =
         parseOk("SELECT * FROM t WHERE -9223372036854775808 < id;");
@@ -147,6 +191,10 @@ void testSyntaxErrors() {
     expectSyntaxError("SELECT id t;");
     expectSyntaxError("INSERT INTO t(id) (1);");
     expectSyntaxError("SELECT * FROM t WHERE a < b < c;");
+    expectSyntaxError("SELECT * FROM t JOIN u;");
+    expectSyntaxError("SELECT t. FROM t;");
+    expectSyntaxError("SELECT * FROM t GROUP age;");
+    expectSyntaxError("SELECT * FROM t ORDER BY age GROUP BY id;");
 }
 
 void testLogicalOperatorLocations() {
@@ -200,6 +248,8 @@ int main() {
         testStatements();
         testSelectStarAndEmptyInput();
         testExpressionPrecedence();
+        testJoinGroupOrderAndQualifiedNames();
+        testBoolFloatAndNull();
         testIntegerBoundaries();
         testSyntaxErrors();
         testLogicalOperatorLocations();

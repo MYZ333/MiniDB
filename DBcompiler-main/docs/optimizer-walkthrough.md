@@ -1,8 +1,9 @@
 # 规则优化代码讲解
 
 这一部分由 B 负责，把已绑定、已生成的逻辑计划改写成计算更少的等价计划。
-入口是 `optimizePlan(const LogicalPlan&)`，放在 buildPlan 之后；A 的 Token/AST
-接口和 SQL 文法没有改变。新增产品模块与测试辅助模块均有中文注释。
+入口是 `optimizePlan(const LogicalPlan&)`，放在 buildPlan 之后。A version2 另有
+展示用 optimizeAstStatements，详见 A version2 合并说明；正式编译仍使用本章的
+绑定后计划优化。新增产品模块与测试辅助模块均有中文注释。
 
 ## 1. 按什么顺序读代码
 
@@ -42,6 +43,7 @@ Project[name]                     Project[name]
 ## 3. 常量折叠为什么需要单独一个模块
 
 constant_fold 只接收操作符和 ScalarValue，因此不依赖 Parser、Catalog 或计划结构。
+它也支持同类型 FLOAT 运算/比较及 BOOL 判等；非有限浮点结果和除零保持原表达式。
 返回 `optional<ScalarValue>`：有值表示可以安全替换，没有值表示继续保留原运算。
 它不返回“编译失败”，因为 `UPDATE ... SET age=1/0 WHERE 1=0` 不会计算 RHS。
 此时提前报除零会改变程序行为。

@@ -8,12 +8,13 @@ namespace minisql {
 // 第一阶段文法的全部终结符。关键字使用专门种类，Parser 无需比较字符串。
 enum class TokenKind {
     EndOfInput,
-    Identifier, Integer, String,
+    Identifier, Integer, FloatLiteral, String,
     Create, Table, Insert, Into, Values, Select, From, Where,
-    Update, Set, Delete, Int, Varchar, And, Or, Not,
+    Update, Set, Delete, Join, On, Group, Order, By, Asc, Desc,
+    Int, Varchar, Bool, Float, Null, True, False, And, Or, Not,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     Plus, Minus, Star, Slash,
-    LeftParen, RightParen, Comma, Semicolon
+    LeftParen, RightParen, Comma, Dot, Semicolon
 };
 
 struct Token {

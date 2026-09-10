@@ -1,4 +1,5 @@
-// A 阶段调试入口：从标准输入读取 SQL，输出 Token Stream 和 AST。
+// A 阶段调试入口：从标准输入读取 SQL，输出 Token、原 AST 和可选的优化 AST。
+#include "minisql/ast_optimizer.hpp"
 #include "minisql/lexer.hpp"
 #include "minisql/parser.hpp"
 
@@ -16,6 +17,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::EndOfInput: return "EndOfInput";
     case TokenKind::Identifier: return "Identifier";
     case TokenKind::Integer: return "Integer";
+    case TokenKind::FloatLiteral: return "FloatLiteral";
     case TokenKind::String: return "String";
     case TokenKind::Create: return "Create";
     case TokenKind::Table: return "Table";
@@ -28,8 +30,20 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::Update: return "Update";
     case TokenKind::Set: return "Set";
     case TokenKind::Delete: return "Delete";
+    case TokenKind::Join: return "Join";
+    case TokenKind::On: return "On";
+    case TokenKind::Group: return "Group";
+    case TokenKind::Order: return "Order";
+    case TokenKind::By: return "By";
+    case TokenKind::Asc: return "Asc";
+    case TokenKind::Desc: return "Desc";
     case TokenKind::Int: return "Int";
     case TokenKind::Varchar: return "Varchar";
+    case TokenKind::Bool: return "Bool";
+    case TokenKind::Float: return "Float";
+    case TokenKind::Null: return "Null";
+    case TokenKind::True: return "True";
+    case TokenKind::False: return "False";
     case TokenKind::And: return "And";
     case TokenKind::Or: return "Or";
     case TokenKind::Not: return "Not";
@@ -46,6 +60,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::LeftParen: return "LeftParen";
     case TokenKind::RightParen: return "RightParen";
     case TokenKind::Comma: return "Comma";
+    case TokenKind::Dot: return "Dot";
     case TokenKind::Semicolon: return "Semicolon";
     }
     return "Token";
@@ -71,6 +86,7 @@ std::string errorName(ErrorCode code) {
     case ErrorCode::IntegerOutOfRange: return "IntegerOutOfRange";
     case ErrorCode::ExpressionTooDeep: return "ExpressionTooDeep";
     case ErrorCode::NotImplemented: return "NotImplemented";
+    case ErrorCode::UnsupportedFeature: return "UnsupportedFeature";
     default: return "Error";
     }
 }
@@ -80,6 +96,8 @@ std::string typeName(DataType type) {
     case DataType::Int: return "INT";
     case DataType::Varchar: return "VARCHAR";
     case DataType::Bool: return "BOOL";
+    case DataType::Float: return "FLOAT";
+    case DataType::Null: return "NULL";
     }
     return "TYPE";
 }
@@ -117,6 +135,10 @@ void printLiteral(const LiteralValue& value) {
         using T = std::decay_t<decltype(item)>;
         if constexpr (std::is_same_v<T, std::string>) {
             std::cout << "'" << item << "'";
+        } else if constexpr (std::is_same_v<T, NullValue>) {
+            std::cout << "NULL";
+        } else if constexpr (std::is_same_v<T, bool>) {
+            std::cout << (item ? "TRUE" : "FALSE");
         } else {
             std::cout << item;
         }
@@ -223,7 +245,31 @@ void printStatement(const Statement& statement, int index) {
                 }
             }
             std::cout << '\n';
+            if (!stmt.joins.empty()) {
+                printIndent(2);
+                std::cout << "Joins\n";
+                for (const auto& join : stmt.joins) {
+                    printIndent(3);
+                    std::cout << "Join " << join.table.text << "\n";
+                    printExpr(join.on, 4);
+                }
+            }
             printWhere(stmt.where, 2);
+            if (!stmt.group_by.empty()) {
+                printIndent(2);
+                std::cout << "GroupBy";
+                for (const auto& column : stmt.group_by) std::cout << " " << column.text;
+                std::cout << '\n';
+            }
+            if (!stmt.order_by.empty()) {
+                printIndent(2);
+                std::cout << "OrderBy\n";
+                for (const auto& item : stmt.order_by) {
+                    printIndent(3);
+                    std::cout << item.column.text << " "
+                              << (item.direction == SortDirection::Asc ? "ASC" : "DESC") << '\n';
+                }
+            }
         } else if constexpr (std::is_same_v<T, UpdateStmt>) {
             printIndent(1);
             std::cout << "Update " << stmt.table.text << '\n';
@@ -241,8 +287,8 @@ void printStatement(const Statement& statement, int index) {
     }, statement.node);
 }
 
-void printAst(const std::vector<Statement>& statements) {
-    std::cout << "AST\n";
+void printAst(const std::vector<Statement>& statements, const char* title) {
+    std::cout << title << '\n';
     if (statements.empty()) {
         std::cout << "  <empty>\n";
         return;
@@ -255,9 +301,20 @@ void printAst(const std::vector<Statement>& statements) {
 
 } // namespace
 
-int main(int argc, char*[]) {
-    if (argc != 1) {
-        std::cerr << "Usage: minisql < input.sql\n";
+enum class AstOutputMode { Both, RawOnly, OptimizedOnly };
+
+int main(int argc, char* argv[]) {
+    AstOutputMode mode = AstOutputMode::Both;
+    if (argc == 2) {
+        const std::string option = argv[1];
+        if (option == "--raw-only") mode = AstOutputMode::RawOnly;
+        else if (option == "--optimized-only") mode = AstOutputMode::OptimizedOnly;
+        else {
+            std::cerr << "Usage: minisql [--raw-only|--optimized-only] < input.sql\n";
+            return 2;
+        }
+    } else if (argc != 1) {
+        std::cerr << "Usage: minisql [--raw-only|--optimized-only] < input.sql\n";
         return 2;
     }
 
@@ -278,6 +335,9 @@ int main(int argc, char*[]) {
         printDiagnostic(*diagnostic);
         return 1;
     }
-    printAst(std::get<std::vector<Statement>>(parsed));
+    const auto& statements = std::get<std::vector<Statement>>(parsed);
+    if (mode != AstOutputMode::OptimizedOnly) printAst(statements, "AST");
+    if (mode != AstOutputMode::RawOnly)
+        printAst(optimizeAstStatements(statements), "Optimized AST");
     return 0;
 }

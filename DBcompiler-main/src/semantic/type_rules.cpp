@@ -4,7 +4,7 @@
 namespace minisql::semantic_detail {
 
 std::optional<DataType> unaryResult(UnaryOp op, DataType operand) {
-    if (op == UnaryOp::Negate && operand == DataType::Int) return DataType::Int;
+    if (op == UnaryOp::Negate && (operand == DataType::Int || operand == DataType::Float)) return operand;
     if (op == UnaryOp::Not && operand == DataType::Bool) return DataType::Bool;
     return std::nullopt;
 }
@@ -14,14 +14,15 @@ std::optional<DataType> binaryResult(BinaryOp op, DataType left, DataType right)
     switch (op) {
     case BinaryOp::Add: case BinaryOp::Subtract:
     case BinaryOp::Multiply: case BinaryOp::Divide:
-        if (left == DataType::Int) return DataType::Int;
+        if (left == DataType::Int || left == DataType::Float) return left;
         break;
     case BinaryOp::Equal: case BinaryOp::NotEqual:
-        if (left == DataType::Int || left == DataType::Varchar) return DataType::Bool;
+        if (left == DataType::Int || left == DataType::Float ||
+            left == DataType::Varchar || left == DataType::Bool) return DataType::Bool;
         break;
     case BinaryOp::Less: case BinaryOp::LessEqual:
     case BinaryOp::Greater: case BinaryOp::GreaterEqual:
-        if (left == DataType::Int) return DataType::Bool;
+        if (left == DataType::Int || left == DataType::Float) return DataType::Bool;
         break;
     case BinaryOp::And: case BinaryOp::Or:
         if (left == DataType::Bool) return DataType::Bool;
@@ -35,6 +36,8 @@ const char* typeName(DataType type) {
     case DataType::Int: return "INT";
     case DataType::Varchar: return "VARCHAR";
     case DataType::Bool: return "BOOL";
+    case DataType::Float: return "FLOAT";
+    case DataType::Null: return "NULL";
     }
     return "UNKNOWN";
 }

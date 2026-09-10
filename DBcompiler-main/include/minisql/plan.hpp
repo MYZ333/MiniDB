@@ -22,8 +22,24 @@ struct InsertPlan {
     std::vector<ScalarValue> values;
 };
 struct SeqScanPlan { std::shared_ptr<const TableSchema> table; };
+// 首版内连接：输出布局固定为左输入列后接右输入列。
+struct NestedLoopJoinPlan {
+    PlanPtr left;
+    PlanPtr right;
+    BoundExprPtr predicate;
+};
 struct FilterPlan {
     BoundExprPtr predicate;
+    PlanPtr input;
+};
+// 聚合函数加入前，GroupBy 按 keys 去重并仅输出这些键。
+struct GroupByPlan {
+    std::vector<BoundColumnRef> keys;
+    PlanPtr input;
+};
+// 多键稳定优先级由 items 顺序表达；相同键行之间不保证稳定排序。
+struct SortPlan {
+    std::vector<BoundOrderBy> items;
     PlanPtr input;
 };
 struct ProjectPlan {
@@ -41,8 +57,9 @@ struct DeletePlan {
 };
 
 struct PlanNode {
-    std::variant<CreateTablePlan, InsertPlan, SeqScanPlan, FilterPlan,
-                 ProjectPlan, UpdatePlan, DeletePlan> node;
+    std::variant<CreateTablePlan, InsertPlan, SeqScanPlan, NestedLoopJoinPlan,
+                 FilterPlan, GroupByPlan, SortPlan, ProjectPlan,
+                 UpdatePlan, DeletePlan> node;
     std::vector<OutputColumn> output; // 有序业务列；修改类根节点为空。
     bool carries_row_id = false; // 内部行标识不占用 output 的业务列。
 };

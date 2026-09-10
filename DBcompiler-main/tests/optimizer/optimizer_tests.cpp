@@ -131,6 +131,22 @@ int main() {
         const auto after = value(optimizePlan(f.compile("SELECT * FROM student WHERE 'Alice'='alice';")));
         check(formatPlan(after).find("Filter[FALSE]") != std::string::npos, "string case changed");
     });
+    suite.run("FLOAT and BOOL constants fold after binding", [] {
+        MemoryCatalog catalog;
+        value(catalog.createTable("metrics", {{"active", DataType::Bool},
+                                               {"score", DataType::Float}}));
+        const auto compile = [&](const std::string& sql) {
+            const auto statements = value(parse(value(lex(sql))));
+            return value(buildPlan(value(analyze(statements[0], *catalog.snapshot()))));
+        };
+        auto after = value(optimizePlan(compile(
+            "SELECT score FROM metrics WHERE TRUE AND score>10.0+8.5;")));
+        check(formatPlan(after).find("18.5") != std::string::npos,
+              "FLOAT arithmetic was not folded");
+        after = value(optimizePlan(compile("SELECT score FROM metrics WHERE TRUE=TRUE;")));
+        check(formatPlan(after).find("Filter[") == std::string::npos,
+              "BOOL equality or true Filter was not folded");
+    });
     suite.run("safe BOOL identities preserve column evaluation", [] {
         Fixture f;
         for (const std::string expr : {"(1=1) AND age>0", "(1=0) OR age>0", "age>0 AND (1=1)", "age>0 OR (1=0)"}) {
@@ -202,6 +218,26 @@ int main() {
             check(before.root == after.root && before.catalog_version == after.catalog_version, "unchanged tree copied or altered");
         }
     });
+    suite.run("optimizer traverses JOIN GROUP BY and ORDER BY nodes", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"student_id", DataType::Int},
+                                               {"value", DataType::Int}}));
+        const auto before = f.compile(
+            "SELECT student.name FROM student "
+            "JOIN score ON student.id=score.student_id AND 1=1 "
+            "WHERE 2=2 GROUP BY student.name ORDER BY student.name DESC;");
+        const auto after = value(optimizePlan(before));
+        const auto& project = std::get<ProjectPlan>(after.root->node);
+        const auto& sort = std::get<SortPlan>(project.input->node);
+        const auto& group = std::get<GroupByPlan>(sort.input->node);
+        const auto& join = std::get<NestedLoopJoinPlan>(group.input->node);
+        check(std::holds_alternative<BoundBinary>(join.predicate->node) &&
+              formatPlan(after).find("AND") == std::string::npos &&
+              formatPlan(after).find("Filter[") == std::string::npos,
+              "advanced-node traversal did not simplify predicates");
+        const auto again = value(optimizePlan(after));
+        check(again.root == after.root, "advanced optimized plan is not idempotent");
+    });
     suite.run("SELECT equivalence on multiple predicates and rows", [] {
         Fixture f;
         for (const std::string predicate : {"1=1 AND age>10+8", "NOT(1=0) AND (id>1 OR 2=3)",
@@ -264,6 +300,21 @@ int main() {
         scan.carries_row_id = false;
         std::get<UpdatePlan>(bad.node).input = std::make_shared<const PlanNode>(scan);
         failure(optimizePlan(LogicalPlan{1, std::make_shared<const PlanNode>(bad)}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
+    });
+    suite.run("malformed JOIN GROUP BY and ORDER BY plans return diagnostics", [] {
+        Fixture f;
+        const auto scan_plan = std::get<ProjectPlan>(f.compile("SELECT * FROM student;").root->node).input;
+        auto truth_expr = std::make_shared<const BoundExpr>(BoundExpr{
+            BoundLiteral{true}, DataType::Bool, {}});
+        auto join = std::make_shared<const PlanNode>(PlanNode{
+            NestedLoopJoinPlan{scan_plan, nullptr, truth_expr}, scan_plan->output, false});
+        failure(optimizePlan(LogicalPlan{1, join}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
+        auto group = std::make_shared<const PlanNode>(PlanNode{
+            GroupByPlan{{}, scan_plan}, {}, false});
+        failure(optimizePlan(LogicalPlan{1, group}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
+        auto sort = std::make_shared<const PlanNode>(PlanNode{
+            SortPlan{{}, scan_plan}, scan_plan->output, false});
+        failure(optimizePlan(LogicalPlan{1, sort}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
     });
     return suite.finish();
 }

@@ -162,5 +162,60 @@ int main() {
         Fixture f;
         value(f.bind("SELECT * FROM student WHERE id=1;"));
     });
+    suite.run("A version2 scalar types and qualified names reach B plans", [] {
+        MemoryCatalog catalog;
+        const auto create_ast = statements(
+            "CREATE TABLE metrics(id INT,active BOOL,score FLOAT,note VARCHAR);")[0];
+        const auto create = value(analyze(create_ast, *catalog.snapshot()));
+        value(buildPlan(create));
+        const auto& definition = std::get<BoundCreateTable>(create.node);
+        value(catalog.createTable(definition.table_name, definition.columns));
+
+        auto parsed = statements("INSERT INTO metrics VALUES(1,TRUE,NULL,'first');");
+        const auto insert = value(buildPlan(value(analyze(parsed[0], *catalog.snapshot()))));
+        const auto& row = std::get<InsertPlan>(insert.root->node).values;
+        check(std::get<bool>(row[1]) && std::holds_alternative<NullValue>(row[2]),
+              "BOOL or NULL did not cross A/B boundary");
+
+        parsed = statements(
+            "SELECT metrics.id FROM metrics WHERE metrics.active=TRUE AND metrics.score>1.5;");
+        const auto select = value(buildPlan(value(analyze(parsed[0], *catalog.snapshot()))));
+        check(select.root->output[0].name == "id" &&
+              formatPlan(select).find("1.5") != std::string::npos,
+              "qualified name or FLOAT expression did not reach plan");
+    });
+    suite.run("JOIN GROUP BY ORDER BY cross the complete A/B pipeline", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"id", DataType::Int},
+                                               {"student_id", DataType::Int},
+                                               {"value", DataType::Int}}));
+        const auto plan = f.compile(
+            "SELECT student.name FROM student "
+            "JOIN score ON student.id=score.student_id "
+            "WHERE score.value>60 GROUP BY student.name ORDER BY student.name DESC;");
+        const auto& project = std::get<ProjectPlan>(plan.root->node);
+        const auto& sort = std::get<SortPlan>(project.input->node);
+        const auto& group = std::get<GroupByPlan>(sort.input->node);
+        const auto& filter = std::get<FilterPlan>(group.input->node);
+        const auto& join = std::get<NestedLoopJoinPlan>(filter.input->node);
+        check(std::holds_alternative<SeqScanPlan>(join.left->node) &&
+              std::holds_alternative<SeqScanPlan>(join.right->node),
+              "JOIN did not produce two scan inputs");
+        check(group.keys.size() == 1 && sort.items[0].direction == SortDirection::Desc &&
+              plan.root->output[0].name == "name", "GROUP/ORDER metadata was lost");
+
+        const auto hidden_sort = f.compile("SELECT student.name FROM student ORDER BY student.age DESC;");
+        check(std::holds_alternative<SortPlan>(std::get<ProjectPlan>(hidden_sort.root->node).input->node),
+              "ORDER BY hidden column must run before projection");
+
+        failure(f.bind("SELECT id FROM student JOIN score ON student.id=score.student_id;"),
+                ErrorCode::AmbiguousColumn);
+        failure(f.bind("SELECT student.id FROM student JOIN score ON student.id;"),
+                ErrorCode::JoinConditionNotBoolean);
+        failure(f.bind("SELECT student.name FROM student GROUP BY student.id;"),
+                ErrorCode::InvalidGrouping);
+        failure(f.bind("SELECT * FROM student WHERE NULL=NULL;"),
+                ErrorCode::InvalidOperandType);
+    });
     return suite.finish();
 }

@@ -30,9 +30,16 @@ int main() {
         MemoryCatalog catalog;
         failure(catalog.createTable("bad", {}), ErrorCode::EmptyColumnList, DiagnosticStage::Execution);
         failure(catalog.createTable("bad", {{"id", DataType::Int}, {"ID", DataType::Int}}), ErrorCode::DuplicateColumn, DiagnosticStage::Execution);
-        failure(catalog.createTable("bad", {{"flag", DataType::Bool}}), ErrorCode::UnsupportedType, DiagnosticStage::Execution);
+        failure(catalog.createTable("bad", {{"nothing", DataType::Null}}), ErrorCode::UnsupportedType, DiagnosticStage::Execution);
         check(catalog.snapshot()->version() == 0 && !catalog.snapshot()->findTable("bad"), "invalid table leaked");
         check(value(catalog.createTable("ok", {{"id", DataType::Int}}))->id.value == 1, "errors consumed table IDs");
+    });
+    suite.run("BOOL and FLOAT schemas are publishable", [] {
+        MemoryCatalog catalog;
+        const auto table = value(catalog.createTable("metrics",
+            {{"active", DataType::Bool}, {"score", DataType::Float}}));
+        check(table->columns[0].type == DataType::Bool &&
+              table->columns[1].type == DataType::Float, "extended types were not retained");
     });
     suite.run("snapshot outlives mutable catalog", [] {
         std::shared_ptr<const CatalogSnapshot> snapshot;

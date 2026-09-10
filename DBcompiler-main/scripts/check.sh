@@ -17,6 +17,7 @@ done
 
 "$compiler" "${flags[@]}" -c src/lexer/lexer.cpp -o build/direct/lexer.o
 "$compiler" "${flags[@]}" -c src/parser/parser.cpp -o build/direct/parser.o
+"$compiler" "${flags[@]}" -c src/parser/ast_optimizer.cpp -o build/direct/ast_optimizer.o
 "$compiler" "${flags[@]}" -c src/semantic/analyzer.cpp -o build/direct/analyzer.o
 "$compiler" "${flags[@]}" -c src/semantic/type_rules.cpp -o build/direct/type_rules.o
 "$compiler" "${flags[@]}" -c src/catalog/memory_catalog.cpp -o build/direct/memory_catalog.o
@@ -24,7 +25,7 @@ done
 "$compiler" "${flags[@]}" -c src/planner/plan_printer.cpp -o build/direct/plan_printer.o
 "$compiler" "${flags[@]}" -c src/optimizer/constant_fold.cpp -o build/direct/constant_fold.o
 "$compiler" "${flags[@]}" -c src/optimizer/optimizer.cpp -o build/direct/optimizer.o
-"$archiver" rcs build/direct/libminisql_frontend.a build/direct/lexer.o build/direct/parser.o
+"$archiver" rcs build/direct/libminisql_frontend.a build/direct/lexer.o build/direct/parser.o build/direct/ast_optimizer.o
 "$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/type_rules.o build/direct/memory_catalog.o build/direct/plan_builder.o build/direct/plan_printer.o build/direct/constant_fold.o build/direct/optimizer.o
 libraries=(build/direct/libminisql_frontend.a build/direct/libminisql_backend.a)
 
@@ -39,14 +40,22 @@ libraries=(build/direct/libminisql_frontend.a build/direct/libminisql_backend.a)
 "$compiler" "${flags[@]}" examples/plans.cpp "${libraries[@]}" -o build/direct/plans_example
 "$compiler" "${flags[@]}" tests/lexer/lexer_tests.cpp "${libraries[@]}" -o build/direct/lexer_tests
 "$compiler" "${flags[@]}" tests/parser/parser_tests.cpp "${libraries[@]}" -o build/direct/parser_tests
+"$compiler" "${flags[@]}" tests/parser/ast_optimizer_tests.cpp "${libraries[@]}" -o build/direct/ast_optimizer_tests
 "$compiler" "${flags[@]}" tests/optimizer/optimizer_tests.cpp "${libraries[@]}" -o build/direct/optimizer_tests
 "$compiler" "${flags[@]}" examples/optimizer.cpp "${libraries[@]}" -o build/direct/optimizer_example
 ./build/direct/minisql < /dev/null
-printf "CREATE TABLE t(id INT); INSERT INTO t VALUES (1); SELECT * FROM t;" | ./build/direct/minisql_plan_json > build/direct/plan.json
+printf "CREATE TABLE t(id INT); INSERT INTO t VALUES (1); SELECT * FROM t;" |
+    ./build/direct/minisql_plan_json > build/direct/plan.json
 grep -q '"protocolVersion":1' build/direct/plan.json
 grep -q '"type":"Project"' build/direct/plan.json
+printf "CREATE TABLE s(id INT,name VARCHAR); CREATE TABLE x(sid INT); SELECT s.name FROM s JOIN x ON s.id=x.sid GROUP BY s.name ORDER BY s.name DESC;" |
+    ./build/direct/minisql_plan_json > build/direct/advanced-plan.json
+grep -q '"type":"NestedLoopJoin"' build/direct/advanced-plan.json
+grep -q '"type":"GroupBy"' build/direct/advanced-plan.json
+grep -q '"type":"Sort"' build/direct/advanced-plan.json
 ./build/direct/lexer_tests
 ./build/direct/parser_tests
+./build/direct/ast_optimizer_tests
 ./build/direct/contracts_example
 ./build/direct/scaffold_smoke
 ./build/direct/semantic_example

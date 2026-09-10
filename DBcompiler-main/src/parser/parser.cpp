@@ -3,6 +3,7 @@
 
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <type_traits>
@@ -34,6 +35,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::EndOfInput: return "end of input";
     case TokenKind::Identifier: return "identifier";
     case TokenKind::Integer: return "integer";
+    case TokenKind::FloatLiteral: return "float";
     case TokenKind::String: return "string";
     case TokenKind::Create: return "CREATE";
     case TokenKind::Table: return "TABLE";
@@ -46,8 +48,20 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::Update: return "UPDATE";
     case TokenKind::Set: return "SET";
     case TokenKind::Delete: return "DELETE";
+    case TokenKind::Join: return "JOIN";
+    case TokenKind::On: return "ON";
+    case TokenKind::Group: return "GROUP";
+    case TokenKind::Order: return "ORDER";
+    case TokenKind::By: return "BY";
+    case TokenKind::Asc: return "ASC";
+    case TokenKind::Desc: return "DESC";
     case TokenKind::Int: return "INT";
     case TokenKind::Varchar: return "VARCHAR";
+    case TokenKind::Bool: return "BOOL";
+    case TokenKind::Float: return "FLOAT";
+    case TokenKind::Null: return "NULL";
+    case TokenKind::True: return "TRUE";
+    case TokenKind::False: return "FALSE";
     case TokenKind::And: return "AND";
     case TokenKind::Or: return "OR";
     case TokenKind::Not: return "NOT";
@@ -64,6 +78,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::LeftParen: return "(";
     case TokenKind::RightParen: return ")";
     case TokenKind::Comma: return ",";
+    case TokenKind::Dot: return ".";
     case TokenKind::Semicolon: return ";";
     }
     return "token";
@@ -108,6 +123,16 @@ std::int64_t parseIntegerMagnitude(const Token& token, bool negative) {
     }
     const auto value = static_cast<std::int64_t>(magnitude);
     return negative ? -value : value;
+}
+
+double parseFloatValue(const Token& token, bool negative) {
+    try {
+        const double value = std::stod(token.lexeme);
+        return negative ? -value : value;
+    } catch (const std::out_of_range&) {
+        throw Diagnostic{DiagnosticStage::Syntax, ErrorCode::IntegerOutOfRange,
+                         "floating-point literal is out of range", token.span};
+    }
 }
 
 std::string decodeString(const Token& token) {
@@ -251,8 +276,16 @@ private:
     }
 
     Identifier identifier() {
-        const Token& token = consume(TokenKind::Identifier, "identifier");
-        return Identifier{token.lexeme, token.span};
+        const Token& first = consume(TokenKind::Identifier, "identifier");
+        std::string text = first.lexeme;
+        SourceLocation span = first.span;
+        // A 将限定名保留为一段原文，B 再按点分离限定符并做名称绑定。
+        while (match(TokenKind::Dot)) {
+            const Token& part = consume(TokenKind::Identifier, "identifier after '.'");
+            text += "." + part.lexeme;
+            span = merge(span, part.span);
+        }
+        return Identifier{std::move(text), span};
     }
 
     DataType typeName() {
@@ -262,7 +295,10 @@ private:
         if (match(TokenKind::Varchar)) {
             return DataType::Varchar;
         }
-        throw syntaxError("unexpected " + tokenName(current().kind) + ", expected INT or VARCHAR",
+        if (match(TokenKind::Bool)) return DataType::Bool;
+        if (match(TokenKind::Float)) return DataType::Float;
+        throw syntaxError("unexpected " + tokenName(current().kind) +
+                              ", expected INT, VARCHAR, BOOL or FLOAT",
                           locationOf(current()));
     }
 
@@ -318,12 +354,19 @@ private:
             return LocatedLiteral{parseIntegerMagnitude(token, negative),
                                   merge(start, locationOf(token))};
         }
+        if (match(TokenKind::FloatLiteral)) {
+            const Token& token = previous();
+            return LocatedLiteral{parseFloatValue(token, negative), merge(start, locationOf(token))};
+        }
         if (!negative && match(TokenKind::String)) {
             const Token& token = previous();
             return LocatedLiteral{decodeString(token), token.span};
         }
+        if (!negative && match(TokenKind::True)) return LocatedLiteral{true, previous().span};
+        if (!negative && match(TokenKind::False)) return LocatedLiteral{false, previous().span};
+        if (!negative && match(TokenKind::Null)) return LocatedLiteral{NullValue{}, previous().span};
         throw syntaxError("unexpected " + tokenName(current().kind) +
-                              ", expected integer or string literal",
+                              ", expected integer, float, string, boolean or NULL literal",
                           locationOf(current()));
     }
 
@@ -335,11 +378,47 @@ private:
             columns = names();
         }
         consume(TokenKind::From, "FROM");
-        SelectStmt stmt{identifier(), std::move(columns), nullptr};
+        SelectStmt stmt{identifier(), std::move(columns), nullptr, {}, {}, {}};
+        while (match(TokenKind::Join)) stmt.joins.push_back(joinClause(previous()));
         if (match(TokenKind::Where)) {
             stmt.where = expression();
         }
+        if (match(TokenKind::Group)) stmt.group_by = groupByList();
+        if (match(TokenKind::Order)) stmt.order_by = orderByList();
         return stmt;
+    }
+
+    JoinClause joinClause(const Token& join_token) {
+        Identifier table = identifier();
+        consume(TokenKind::On, "ON");
+        ExprPtr on = expression();
+        const SourceLocation span = merge(join_token.span, on->span);
+        return JoinClause{std::move(table), std::move(on), span};
+    }
+
+    std::vector<Identifier> groupByList() {
+        consume(TokenKind::By, "BY");
+        return names();
+    }
+
+    std::vector<OrderByItem> orderByList() {
+        consume(TokenKind::By, "BY");
+        std::vector<OrderByItem> result{orderByItem()};
+        while (match(TokenKind::Comma)) result.push_back(orderByItem());
+        return result;
+    }
+
+    OrderByItem orderByItem() {
+        const SourceLocation start = locationOf(current());
+        Identifier column = identifier();
+        SortDirection direction = SortDirection::Asc;
+        SourceLocation end = column.span;
+        if (match(TokenKind::Asc)) end = previous().span;
+        else if (match(TokenKind::Desc)) {
+            direction = SortDirection::Desc;
+            end = previous().span;
+        }
+        return OrderByItem{std::move(column), direction, merge(start, end)};
     }
 
     UpdateStmt updateStatement() {
@@ -458,6 +537,11 @@ private:
                     LiteralExpr{parseIntegerMagnitude(integer, true)},
                     merge(locationOf(op), locationOf(integer))});
             }
+            if (match(TokenKind::FloatLiteral)) {
+                const Token& number = previous();
+                return makeExpr(Expr{LiteralExpr{parseFloatValue(number, true)},
+                                     merge(locationOf(op), locationOf(number))});
+            }
             ExprPtr operand = unary();
             return makeExpr(Expr{
                 UnaryExpr{UnaryOp::Negate, operand, op.span}, merge(locationOf(op), operand->span)});
@@ -466,20 +550,27 @@ private:
     }
 
     ExprPtr primary() {
-        if (match(TokenKind::Identifier)) {
-            const Token& token = previous();
-            return makeExpr(Expr{
-                IdentifierExpr{Identifier{token.lexeme, token.span}}, token.span});
+        if (check(TokenKind::Identifier)) {
+            Identifier name = identifier();
+            const SourceLocation span = name.span;
+            return makeExpr(Expr{IdentifierExpr{std::move(name)}, span});
         }
         if (match(TokenKind::Integer)) {
             const Token& token = previous();
             return makeExpr(Expr{
                 LiteralExpr{parseIntegerMagnitude(token, false)}, token.span});
         }
+        if (match(TokenKind::FloatLiteral)) {
+            const Token& token = previous();
+            return makeExpr(Expr{LiteralExpr{parseFloatValue(token, false)}, token.span});
+        }
         if (match(TokenKind::String)) {
             const Token& token = previous();
             return makeExpr(Expr{LiteralExpr{decodeString(token)}, token.span});
         }
+        if (match(TokenKind::True)) return makeExpr(Expr{LiteralExpr{true}, previous().span});
+        if (match(TokenKind::False)) return makeExpr(Expr{LiteralExpr{false}, previous().span});
+        if (match(TokenKind::Null)) return makeExpr(Expr{LiteralExpr{NullValue{}}, previous().span});
         if (match(TokenKind::LeftParen)) {
             const SourceLocation start = locationOf(previous());
             const NestingGuard guard(nesting_, start);

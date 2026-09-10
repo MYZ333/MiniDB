@@ -10,8 +10,8 @@
 
 namespace minisql {
 
-// BOOL 只用于表达式结果，不能声明为第一阶段的表列类型。
-enum class DataType { Int, Varchar, Bool };
+// Null 仅表示 NULL 字面量的内部类型，不能声明为表列类型。
+enum class DataType { Int, Varchar, Bool, Float, Null };
 
 struct SourcePosition {
     std::size_t offset = 0; // 从 0 开始的 UTF-8 字节偏移。
@@ -42,11 +42,15 @@ inline std::string normalizeName(std::string name) {
     return name;
 }
 
-// SQL 输入字面量没有 BOOL；绑定后计算出的值可以包含 BOOL。
-using LiteralValue = std::variant<std::int64_t, std::string>;
-using ScalarValue = std::variant<std::int64_t, std::string, bool>;
+// NULL 暂用于 INSERT 空值；表达式中的三值逻辑留给后续执行契约。
+struct NullValue {};
+inline bool operator==(NullValue, NullValue) noexcept { return true; }
+inline bool operator!=(NullValue, NullValue) noexcept { return false; }
+using LiteralValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
+using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
 
 enum class UnaryOp { Negate, Not };
+enum class SortDirection { Asc, Desc };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
@@ -65,7 +69,9 @@ enum class ErrorCode {
     InvalidBoundStatement, CatalogVersionMismatch, DivisionByZero, IntegerOverflow,
     NotImplemented, // 骨架入口专用：模块未实现，不表示用户的 SQL 有错。
     InvalidAst, ExpressionTooDeep, // 防御手工/外部 AST 的空子节点和过深嵌套。
-    InvalidPlan // 优化入口发现缺失子节点或不满足基本结构约定的计划。
+    InvalidPlan, // 优化入口发现缺失子节点或不满足基本结构约定的计划。
+    UnsupportedFeature, // 已识别但当前阶段尚未定义行为的语法。
+    AmbiguousColumn, DuplicateTable, InvalidGrouping, JoinConditionNotBoolean
 };
 
 struct Diagnostic {

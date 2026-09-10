@@ -16,6 +16,30 @@ struct Fixture {
     LogicalPlan compile(T stmt) { return value(buildPlan(bind(std::move(stmt)))); }
 };
 
+struct MultiTableFixture {
+    MemoryCatalog catalog;
+    MultiTableFixture() {
+        value(catalog.createTable("student", {{"id", DataType::Int}, {"name", DataType::Varchar},
+                                               {"age", DataType::Int}}));
+        value(catalog.createTable("score", {{"id", DataType::Int}, {"student_id", DataType::Int},
+                                             {"value", DataType::Int}}));
+    }
+    BoundStatement bind(SelectStmt select) {
+        return value(analyze(Statement{std::move(select), {}}, *catalog.snapshot()));
+    }
+    LogicalPlan compile(SelectStmt select) { return value(buildPlan(bind(std::move(select)))); }
+};
+
+SelectStmt joinedQuery() {
+    SelectStmt select{id("student"), std::vector<Identifier>{id("student.name")},
+        bin(BinaryOp::Greater, col("score.value"), num(60))};
+    select.joins.push_back({id("score"),
+        bin(BinaryOp::Equal, col("student.id"), col("score.student_id")), {}});
+    select.group_by = {id("student.name")};
+    select.order_by = {{id("student.name"), SortDirection::Desc, {}}};
+    return select;
+}
+
 UpdateStmt increment(ExprPtr where = nullptr) {
     return {id("student"), {{id("age"), bin(BinaryOp::Add, col("age"), num(1)), {}}}, std::move(where)};
 }
@@ -71,6 +95,35 @@ int main() {
         auto plan = f.compile(SelectStmt{id("student"), std::vector<Identifier>{id("age"), id("name"), id("AGE")}, nullptr});
         check(plan.root->output.size() == 3 && plan.root->output[0].name == "age" &&
               plan.root->output[1].name == "name" && plan.root->output[2].name == "age", "projection deduplicated or reordered");
+    });
+    suite.run("JOIN GROUP BY ORDER BY produce execution-order plan nodes", [] {
+        MultiTableFixture f;
+        const auto plan = f.compile(joinedQuery());
+        const auto& project = std::get<ProjectPlan>(plan.root->node);
+        const auto& sort = std::get<SortPlan>(project.input->node);
+        const auto& group = std::get<GroupByPlan>(sort.input->node);
+        const auto& filter = std::get<FilterPlan>(group.input->node);
+        const auto& join = std::get<NestedLoopJoinPlan>(filter.input->node);
+        check(std::holds_alternative<SeqScanPlan>(join.left->node) &&
+              std::holds_alternative<SeqScanPlan>(join.right->node),
+              "NestedLoopJoin children must be scans");
+        check(join.left->output.size() == 3 && join.right->output.size() == 3 &&
+              filter.input->output.size() == 6, "JOIN output must concatenate left and right schemas");
+        check(group.keys.size() == 1 && std::holds_alternative<FilterPlan>(group.input->node) &&
+              sort.items[0].direction == SortDirection::Desc,
+              "GROUP or ORDER payload mismatch");
+        check(plan.root->output.size() == 1 && plan.root->output[0].name == "name" &&
+              !plan.root->carries_row_id, "advanced SELECT root metadata mismatch");
+    });
+    suite.run("ORDER BY hidden column runs before Project", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<Identifier>{id("name")}, nullptr};
+        select.order_by = {{id("age"), SortDirection::Desc, {}}};
+        const auto plan = f.compile(std::move(select));
+        const auto& project = std::get<ProjectPlan>(plan.root->node);
+        const auto& sort = std::get<SortPlan>(project.input->node);
+        check(sort.input->output.size() == 3 && project.input->output.size() == 3 &&
+              plan.root->output.size() == 1, "hidden sort key was projected away too early");
     });
     suite.run("UPDATE filtered scan carries row identity", [] {
         Fixture f;
@@ -151,6 +204,25 @@ int main() {
             BoundBinary{BinaryOp::Add, nullptr, nullptr, {}}, DataType::Int, {}});
         failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
     });
+    suite.run("planner defensively rejects malformed JOIN and grouping contracts", [] {
+        MultiTableFixture f;
+        auto bound = f.bind(joinedQuery());
+        auto& select = std::get<BoundSelect>(bound.node);
+        const auto group = select.group_by[0];
+        select.group_by.push_back(group);
+        failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
+        select.group_by = {group};
+        select.columns[0] = select.joins[0].table
+            ? BoundColumnRef{select.joins[0].table->id, select.joins[0].table->columns[2].id,
+                             2, DataType::Int}
+            : group;
+        failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
+        select.columns = {group};
+        select.joins[0].on = std::make_shared<const BoundExpr>(BoundExpr{
+            BoundLiteral{std::int64_t{1}}, DataType::Int, span(40)});
+        auto error = failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
+        check(!error.message.empty(), "malformed JOIN diagnostic missing");
+    });
     suite.run("SELECT plan printer golden output and repeatability", [] {
         Fixture f;
         auto bound = f.bind(SelectStmt{id("student"), std::vector<Identifier>{id("name")}, bin(BinaryOp::Greater, col("age"), num(18))});
@@ -170,6 +242,17 @@ int main() {
             "Update[student#1; student.age = (student.age + 1); values=old-row] output=[] row_id=no\n"
             "  SeqScan[student#1] output=[id:INT, name:VARCHAR, age:INT] row_id=yes\n";
         check(output == expected, "UPDATE printed contract mismatch");
+    });
+    suite.run("advanced SELECT printer shows both JOIN branches and key directions", [] {
+        MultiTableFixture f;
+        const auto output = formatPlan(f.compile(joinedQuery()));
+        check(output.find("Project[student.name]") != std::string::npos &&
+              output.find("Sort[student.name DESC]") != std::string::npos &&
+              output.find("GroupBy[student.name]") != std::string::npos &&
+              output.find("NestedLoopJoin[(student.id = score.student_id)]") != std::string::npos &&
+              output.find("  SeqScan[student#1]") != std::string::npos &&
+              output.find("  SeqScan[score#2]") != std::string::npos,
+              "advanced plan printer omitted an operator or JOIN branch");
     });
     suite.run("printer renders CREATE DELETE and escaped INSERT strings", [] {
         MemoryCatalog empty;

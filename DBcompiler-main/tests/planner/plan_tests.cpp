@@ -115,6 +115,34 @@ int main() {
         check(plan.root->output.size() == 1 && plan.root->output[0].name == "name" &&
               !plan.root->carries_row_id, "advanced SELECT root metadata mismatch");
     });
+    suite.run("self JOIN plan preserves relation instances and output aliases", [] {
+        Fixture f;
+        SelectStmt select{id("student"),
+            std::vector<Identifier>{id("e.name"), id("m.name")}, nullptr};
+        select.table_alias = id("e");
+        select.column_aliases = {id("employee_name"), id("manager_name")};
+        select.joins.push_back({id("student"),
+            bin(BinaryOp::Equal, col("e.age"), col("m.id")), {}, id("m")});
+        const auto plan = f.compile(std::move(select));
+        const auto& project = std::get<ProjectPlan>(plan.root->node);
+        const auto& join = std::get<NestedLoopJoinPlan>(project.input->node);
+        const auto& left = std::get<SeqScanPlan>(join.left->node);
+        const auto& right = std::get<SeqScanPlan>(join.right->node);
+        check(left.table->id.value == right.table->id.value &&
+              left.relation_id == 1 && right.relation_id == 2 &&
+              left.relation_name == "e" && right.relation_name == "m",
+              "self JOIN scans lost relation identity");
+        check(project.columns[0].relation_id == 1 &&
+              project.columns[1].relation_id == 2 &&
+              plan.root->output[0].name == "employee_name" &&
+              plan.root->output[1].name == "manager_name",
+              "Project lost relation or output aliases");
+        const auto printed = formatPlan(plan);
+        check(printed.find("NestedLoopJoin[(e.age = m.id)]") != std::string::npos &&
+              printed.find("SeqScan[student#1 AS e]") != std::string::npos &&
+              printed.find("SeqScan[student#1 AS m]") != std::string::npos,
+              "plan printer does not distinguish self JOIN aliases");
+    });
     suite.run("ORDER BY hidden column runs before Project", [] {
         Fixture f;
         SelectStmt select{id("student"), std::vector<Identifier>{id("name")}, nullptr};

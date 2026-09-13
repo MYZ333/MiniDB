@@ -53,6 +53,11 @@ printf "CREATE TABLE s(id INT,name VARCHAR); CREATE TABLE x(sid INT); SELECT s.n
 grep -q '"type":"NestedLoopJoin"' build/direct/advanced-plan.json
 grep -q '"type":"GroupBy"' build/direct/advanced-plan.json
 grep -q '"type":"Sort"' build/direct/advanced-plan.json
+printf "CREATE TABLE employee(id INT,manager_id INT); SELECT e.id AS employee_id FROM employee AS e JOIN employee m ON e.manager_id=m.id ORDER BY employee_id;" |
+    ./build/direct/minisql_plan_json > build/direct/alias-plan.json
+grep -q '"relationName":"e"' build/direct/alias-plan.json
+grep -q '"relationName":"m"' build/direct/alias-plan.json
+grep -q '"name":"employee_id"' build/direct/alias-plan.json
 ./build/direct/lexer_tests
 ./build/direct/parser_tests
 ./build/direct/ast_optimizer_tests

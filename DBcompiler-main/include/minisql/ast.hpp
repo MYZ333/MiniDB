@@ -67,6 +67,7 @@ struct JoinClause {
     Identifier table;
     ExprPtr on;
     SourceLocation span;
+    std::optional<Identifier> alias = {}; // 关系实例名；省略时使用真实表名。
 };
 
 struct SelectStmt {
@@ -77,6 +78,9 @@ struct SelectStmt {
     std::vector<Identifier> group_by = {};
     std::vector<OrderByItem> order_by = {};
     std::vector<JoinClause> joins = {};
+    std::optional<Identifier> table_alias = {};
+    // 与显式 columns 一一对应；nullopt 表示该项沿用模式列名。
+    std::vector<std::optional<Identifier>> column_aliases = {};
 };
 
 struct Assignment {

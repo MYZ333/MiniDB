@@ -74,12 +74,12 @@ void testSingleCharacterTokens() {
 
 void testExtendedTokens() {
     const auto tokens = lexOk(
-        "SELECT student.id FROM student JOIN score ON student.id=score.id "
+        "SELECT student.id AS student_id FROM student s JOIN score AS x ON s.id=x.id "
         "GROUP BY student.id ORDER BY score.value DESC;"
         "CREATE TABLE metrics(active BOOL, value FLOAT);"
         "INSERT INTO metrics VALUES(TRUE,3.14,NULL,FALSE);");
     const std::vector<TokenKind> required{TokenKind::Dot, TokenKind::Join, TokenKind::On,
-        TokenKind::Group, TokenKind::Order, TokenKind::By, TokenKind::Desc, TokenKind::Bool,
+        TokenKind::Group, TokenKind::Order, TokenKind::By, TokenKind::Desc, TokenKind::As, TokenKind::Bool,
         TokenKind::Float, TokenKind::True, TokenKind::FloatLiteral, TokenKind::Null, TokenKind::False};
     for (const auto kind : required) {
         bool found = false;

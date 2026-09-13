@@ -10,6 +10,7 @@ struct BoundColumnRef {
     ColumnId column_id;
     std::size_t ordinal; // 在原表模式中的序号，不是 Project 输出的位置。
     DataType type;
+    std::uint64_t relation_id = 0; // 同一物理表的不同 FROM/JOIN 实例必须不同。
 };
 
 struct BoundExpr;
@@ -47,6 +48,8 @@ struct BoundInsert {
 struct BoundJoin {
     std::shared_ptr<const TableSchema> table;
     BoundExprPtr on; // 加入当前表后绑定；必须为 BOOL。
+    std::string relation_name = {}; // 已归一化的表别名或真实表名。
+    std::uint64_t relation_id = 0;
 };
 
 struct BoundOrderBy {
@@ -61,6 +64,9 @@ struct BoundSelect {
     std::vector<BoundJoin> joins = {}; // 按 SQL 顺序保存，生成左深连接树。
     std::vector<BoundColumnRef> group_by = {}; // 无聚合阶段仅允许投影这些键。
     std::vector<BoundOrderBy> order_by = {}; // 项目顺序就是多键比较优先级。
+    std::string relation_name = {}; // FROM 表的别名或真实表名。
+    std::uint64_t relation_id = 0;
+    std::vector<std::string> output_names = {}; // SELECT 别名解析后的最终列名。
 };
 
 struct BoundAssignment {

@@ -22,7 +22,7 @@ C++ SQL 编译器 ── JSON 逻辑执行计划 ──► Java 数据库引擎
 ```
 
 - C++ 编译器负责 SQL 的词法、语法、语义、逻辑计划和基础优化，并输出 JSON 计划；
-  编译侧已支持 BOOL/FLOAT/NULL、限定名、JOIN、无聚合 GROUP BY 和多列 ORDER BY。
+  编译侧已支持 BOOL/FLOAT/NULL、表/列别名、自连接、JOIN、无聚合 GROUP BY 和多列 ORDER BY。
 - Java 执行引擎负责 CreateTable、Insert、SeqScan、NestedLoopJoin、Filter、GroupBy、
   Sort、Project、Update、Delete 的实际执行、表达式求值、运行期错误和结果集生成。
 - `RecordStore` 是执行层与存储层的边界；后续页式存储只需实现该接口，不需改动执行器。
@@ -61,12 +61,12 @@ DELETE FROM student WHERE id = 1;
 
 - 编译器数据类型：`INT`、`VARCHAR`、`BOOL`、`FLOAT`，INSERT 支持 `NULL`
 - 编译器表达式：同类型数值运算和比较、字符串/布尔判等、`NOT` / `AND` / `OR`
-- 编译器查询：限定列名、内连接 JOIN、无聚合 GROUP BY、多列 ORDER BY ASC/DESC
+- 编译器查询：表/列别名、自连接、内连接 JOIN、无聚合 GROUP BY、多列 ORDER BY ASC/DESC
 - Java 引擎执行类型：`INT`、`FLOAT`、`VARCHAR`、`BOOL`，记录可保存 `NULL`
 - Java 引擎高级查询：内连接、无聚合分组、多列排序、隐藏排序列和规定的 NULL 顺序
 - 错误处理：词法/语法/语义错误，以及除零、整数溢出、类型不匹配等执行期错误
 
-暂不支持聚合函数、表别名、外连接、索引、事务和并发控制。
+暂不支持聚合函数、外连接、索引、事务和并发控制。
 
 ## 数据与持久化说明
 

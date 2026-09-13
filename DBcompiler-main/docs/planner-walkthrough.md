@@ -111,7 +111,7 @@ Update[student#1; student.age = (student.age + 1); values=old-row] output=[] row
     SeqScan[student#1] output=[id:INT, name:VARCHAR, age:INT] row_id=yes
 ```
 
-当前通过 63 个行为用例：Catalog 5 个、语义 38 个、计划/打印 20 个。
+当前通过 65 个行为用例：Catalog 5 个、语义 39 个、计划/打印 21 个。
 另有接口联调、手工结构示例、语义示例和五类计划演示。
 直接构建使用 C++17 严格警告，并逐个检查 11 个公共头文件；环境无可运行的 CMake，
 因此尚未在本机验证 CMake/CTest 路径。A 合并后另增加词法/语法测试和 12 个

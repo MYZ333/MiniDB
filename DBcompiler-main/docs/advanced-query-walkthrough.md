@@ -13,8 +13,9 @@ SelectStmt
 
 `bound.hpp` 的 `BoundJoin` 保存右表模式和 BOOL 类型的 ON 表达式，`BoundOrderBy`
 保存排序列引用与 ASC/DESC。`BoundSelect` 按 SQL 顺序保存 joins、group_by 和 order_by。
-所有列都使用 `BoundColumnRef`，其中 table_id/column_id 表示身份，ordinal 只用于读取
-所属表模式中的列。计划生成阶段不再按字符串查 Catalog。
+所有列都使用 `BoundColumnRef`。table_id/column_id 表示物理模式身份，relation_id
+表示一次 FROM/JOIN 出现，ordinal 只用于读取所属表模式中的列。计划生成阶段不再按
+字符串查 Catalog。
 
 `plan.hpp` 增加三个节点：
 
@@ -26,21 +27,22 @@ SelectStmt
 
 ## 2. 多表名称如何绑定
 
-`analyzer.cpp` 用 `BindingScope` 保存当前可见表。开始时只有 FROM 表；每处理一个 JOIN，
-先检查右表没有重复，再把它加入作用域，然后绑定 ON。因此第二个 JOIN 的 ON 可以引用
-FROM 表、第一个 JOIN 表和刚加入的第二个右表。
+`analyzer.cpp` 用 `BindingScope` 保存当前可见关系实例。每项包含物理表模式、有效名称
+和 relation_id。每处理一个 JOIN，先检查关系名没有重复，再把它加入作用域，然后绑定 ON。
+因此同一物理表可以用 `employee e`、`employee m` 两个实例完成自连接。
 
 `resolveColumn` 处理两种名称：
 
-- `score.value` 先按 `score` 限定表，再查 `value`；
+- `score.value` 先按表名或别名限定关系实例，再查 `value`；
 - `value` 遍历全部可见表，恰好命中一次才成功，命中多次返回 AmbiguousColumn。
 
 SELECT 星号按作用域顺序展开，所以输出顺序为 FROM 表的全部列，随后是每个 JOIN 表的
 全部列。显式选择列仍保留用户写下的顺序和重复项。JOIN ON 和 WHERE 都通过统一的
 布尔绑定辅助函数检查，但使用不同错误码，便于调用方解释错误来源。
 
-当前语法没有表别名。`student JOIN student` 无法区分两个实例，因此语义阶段直接返回
-DuplicateTable；加入别名后需要把作用域键从表名改为“表实例名”。
+表声明别名后，真实表名不再是该实例的限定符。选择列别名保存到
+`BoundSelect.output_names`，由 Project.output 成为 Java 结果表头。ORDER BY 可把唯一的
+输出别名还原到源 `BoundColumnRef`；更早执行的 WHERE、JOIN ON、GROUP BY 不可见它。
 
 ## 3. 分组和排序规则
 
@@ -74,7 +76,7 @@ Project                  最后裁剪并排列 SELECT 输出
 ```
 
 每个 NestedLoopJoin 的输出模式是 `left.output + right.output`。表达式求值不能仅按显示列名
-定位，因为两表都可能有 id；执行层应使用 BoundColumnRef 的表 ID、列 ID 和各输入布局映射。
+定位，因为两表都可能有 id；执行层使用 relation ID、表 ID、列 ID 和各输入布局映射。
 当前计划选择嵌套循环只为建立清晰的首版接口，未来可由优化器替换为哈希连接。
 
 `validate` 防御手工构造的 BoundSelect：检查右表、BOOL ON、可见列身份、重复表、重复分组键，
@@ -82,8 +84,8 @@ Project                  最后裁剪并排列 SELECT 输出
 
 ## 5. 打印和优化
 
-`plan_printer.cpp` 的 `collectTables` 同时递归 JOIN 左右分支，再用稳定 ID 把表达式恢复成
-`student.id` 形式。`printNode` 对二叉 JOIN 分别打印 left/right，对 GroupBy、Sort 等一元
+`plan_printer.cpp` 的 `collectRelations` 同时递归 JOIN 左右分支，再用关系实例 ID 把
+表达式恢复成 `e.id` 形式。`printNode` 对二叉 JOIN 分别打印 left/right，对 GroupBy、Sort 等一元
 节点打印 input。因此打印结果可直接检查真实树形，而不依赖节点地址。
 
 `optimizer.cpp` 会递归优化 JOIN 两侧并折叠 ON 中的常量表达式，也会穿过 GroupBy 和 Sort。

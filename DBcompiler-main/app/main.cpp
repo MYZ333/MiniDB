@@ -37,6 +37,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::By: return "By";
     case TokenKind::Asc: return "Asc";
     case TokenKind::Desc: return "Desc";
+    case TokenKind::As: return "As";
     case TokenKind::Int: return "Int";
     case TokenKind::Varchar: return "Varchar";
     case TokenKind::Bool: return "Bool";
@@ -234,14 +235,19 @@ void printStatement(const Statement& statement, int index) {
             std::cout << '\n';
         } else if constexpr (std::is_same_v<T, SelectStmt>) {
             printIndent(1);
-            std::cout << "Select from " << stmt.table.text << '\n';
+            std::cout << "Select from " << stmt.table.text;
+            if (stmt.table_alias) std::cout << " AS " << stmt.table_alias->text;
+            std::cout << '\n';
             printIndent(2);
             std::cout << "Columns";
             if (std::holds_alternative<AllColumns>(stmt.columns)) {
                 std::cout << " *";
             } else {
-                for (const auto& column : std::get<std::vector<Identifier>>(stmt.columns)) {
-                    std::cout << " " << column.text;
+                const auto& columns = std::get<std::vector<Identifier>>(stmt.columns);
+                for (std::size_t i = 0; i < columns.size(); ++i) {
+                    std::cout << " " << columns[i].text;
+                    if (!stmt.column_aliases.empty() && stmt.column_aliases[i])
+                        std::cout << " AS " << stmt.column_aliases[i]->text;
                 }
             }
             std::cout << '\n';
@@ -250,7 +256,9 @@ void printStatement(const Statement& statement, int index) {
                 std::cout << "Joins\n";
                 for (const auto& join : stmt.joins) {
                     printIndent(3);
-                    std::cout << "Join " << join.table.text << "\n";
+                    std::cout << "Join " << join.table.text;
+                    if (join.alias) std::cout << " AS " << join.alias->text;
+                    std::cout << "\n";
                     printExpr(join.on, 4);
                 }
             }

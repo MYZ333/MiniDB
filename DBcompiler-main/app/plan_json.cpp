@@ -104,6 +104,7 @@ void tableJson(std::ostream& out, const std::shared_ptr<const TableSchema>& tabl
 
 void refJson(std::ostream& out, const BoundColumnRef& ref) {
     out << "{\"tableId\":" << ref.table_id.value << ",\"columnId\":" << ref.column_id.value
+        << ",\"relationId\":" << ref.relation_id
         << ",\"ordinal\":" << ref.ordinal << ",\"type\":";
     stringJson(out, typeName(ref.type));
     out << '}';
@@ -180,6 +181,8 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             out << "\"type\":\"SeqScan\",\"table\":";
             tableJson(out, node.table);
+            out << ",\"relationId\":" << node.relation_id << ",\"relationName\":";
+            stringJson(out, node.relation_name);
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             out << "\"type\":\"NestedLoopJoin\",\"predicate\":";
             exprJson(out, node.predicate, depth + 1);

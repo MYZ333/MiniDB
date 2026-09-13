@@ -5,9 +5,9 @@
 已合入团队成员的 A version2，实现扩展 Lexer、Parser、AST 优化展示和前端调试入口；结合本地 B，
 五类语句已通过 **SQL → Token → AST → 语义分析 → 逻辑计划** 联调。
 现已增加 B 的规则优化：安全常量折叠、布尔化简、恒真 Filter 消除，并提供前后计划对照。
-JOIN、无聚合 GROUP BY 和多列 ORDER BY 已完成 B 侧绑定、计划生成、打印、优化遍历及 JSON 导出。
-本目录不读写数据库记录；仓库相邻的 `minidb-engine` 通过 JSON 消费基础增删改查计划。
-高级查询的 Java 执行算子仍待接入。两次合并范围见
+JOIN、无聚合 GROUP BY、多列 ORDER BY、表/列别名和自连接已完成绑定、计划生成、打印、
+优化遍历及 JSON 导出。本目录不读写数据库记录；仓库相邻的 `minidb-engine` 通过 JSON
+消费增删改查与高级查询计划。两次合并范围见
 [A 第一版合并说明](docs/a-merge-notes.md)和 [A version2 合并说明](docs/a-version2-merge-notes.md)。
 
 ## 1. 目录结构
@@ -63,9 +63,9 @@ DBcompiler/
 │   ├── lexer/lexer_tests.cpp # A：词法及扩展 Token 回归
 │   ├── parser/               # A：语法与 4 组 AST 优化测试
 │   ├── catalog/catalog_tests.cpp # B：5 个模式/快照行为用例
-│   ├── semantic/semantic_tests.cpp # B：38 个语义行为用例
+│   ├── semantic/semantic_tests.cpp # B：39 个语义行为用例
 │   ├── test_support.hpp      # 测试断言和手工 AST 辅助，不属于产品 API
-│   ├── planner/plan_tests.cpp # B：20 个计划结构与打印用例
+│   ├── planner/plan_tests.cpp # B：21 个计划结构与打印用例
 │   ├── optimizer/            # B：24 组优化测试及独立参考求值器
 │   └── integration/scaffold_smoke.cpp # 14 个真实 SQL → Plan/诊断兼容用例
 ├── scripts/check.sh          # 无 CMake 时的编译及检查脚本
@@ -83,8 +83,8 @@ DBcompiler/
 | 工作 | A：词法与语法 | B：语义与计划 |
 |---|---|---|
 | 输入处理 | lex：关键字、注释、转义、位置、EOF | 不处理字符流 |
-| 语法结构 | parse：五类语句、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，不自行解析 SQL |
-| 名称与类型 | 保留名称原文和源码范围 | Catalog 查询、表列绑定、类型检查、INSERT 重排、UPDATE 规则 |
+| 语法结构 | parse：五类语句、别名、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，不自行解析 SQL |
+| 名称与类型 | 保留名称原文和源码范围 | Catalog 查询、关系实例/表列绑定、类型检查、INSERT 重排、UPDATE 规则 |
 | 计划生成 | 提供准确的 AST | 构造增删改查及 NestedLoopJoin/GroupBy/Sort 计划 |
 | 规则优化 | 展示用 AST 折叠，维护原始/优化 AST 对照 | 绑定后计划折叠、布尔化简、恒真 Filter 消除和等价性测试 |
 | 错误与测试 | 词法/语法诊断，lexer/parser 测试 | 语义/计划诊断，semantic/planner 测试 |

@@ -55,6 +55,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::By: return "BY";
     case TokenKind::Asc: return "ASC";
     case TokenKind::Desc: return "DESC";
+    case TokenKind::As: return "AS";
     case TokenKind::Int: return "INT";
     case TokenKind::Varchar: return "VARCHAR";
     case TokenKind::Bool: return "BOOL";
@@ -288,6 +289,18 @@ private:
         return Identifier{std::move(text), span};
     }
 
+    // 别名只能是一段普通标识符，不能写成带点限定名。
+    Identifier simpleIdentifier() {
+        const Token& token = consume(TokenKind::Identifier, "alias");
+        return Identifier{token.lexeme, token.span};
+    }
+
+    std::optional<Identifier> optionalAlias() {
+        if (match(TokenKind::As)) return simpleIdentifier();
+        if (check(TokenKind::Identifier)) return simpleIdentifier();
+        return std::nullopt;
+    }
+
     DataType typeName() {
         if (match(TokenKind::Int)) {
             return DataType::Int;
@@ -372,13 +385,24 @@ private:
 
     SelectStmt selectStatement() {
         SelectList columns;
+        std::vector<std::optional<Identifier>> aliases;
         if (match(TokenKind::Star)) {
             columns = AllColumns{locationOf(previous())};
         } else {
-            columns = names();
+            std::vector<Identifier> selected;
+            selected.push_back(identifier());
+            aliases.push_back(optionalAlias());
+            while (match(TokenKind::Comma)) {
+                selected.push_back(identifier());
+                aliases.push_back(optionalAlias());
+            }
+            columns = std::move(selected);
         }
         consume(TokenKind::From, "FROM");
-        SelectStmt stmt{identifier(), std::move(columns), nullptr, {}, {}, {}};
+        Identifier table = identifier();
+        auto table_alias = optionalAlias();
+        SelectStmt stmt{std::move(table), std::move(columns), nullptr, {}, {}, {},
+                        std::move(table_alias), std::move(aliases)};
         while (match(TokenKind::Join)) stmt.joins.push_back(joinClause(previous()));
         if (match(TokenKind::Where)) {
             stmt.where = expression();
@@ -390,10 +414,11 @@ private:
 
     JoinClause joinClause(const Token& join_token) {
         Identifier table = identifier();
+        auto alias = optionalAlias();
         consume(TokenKind::On, "ON");
         ExprPtr on = expression();
         const SourceLocation span = merge(join_token.span, on->span);
-        return JoinClause{std::move(table), std::move(on), span};
+        return JoinClause{std::move(table), std::move(on), span, std::move(alias)};
     }
 
     std::vector<Identifier> groupByList() {

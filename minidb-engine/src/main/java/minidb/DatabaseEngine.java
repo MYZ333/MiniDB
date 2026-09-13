@@ -18,10 +18,11 @@ public final class DatabaseEngine {
     public record QueryResult(List<String> columns, List<List<Object>> rows) implements ExecutionResult { }
     public sealed interface ExecutionResult permits CommandResult, QueryResult { }
 
-    /** Identifies a column after JOIN; ordinal remains its position inside the source table. */
-    private record ColumnSlot(long tableId, long columnId, int ordinal, String type) { }
+    /** Identifies a column and relation instance; ordinal remains its source-table position. */
+    private record ColumnSlot(
+        long tableId, long columnId, long relationId, int ordinal, String type) { }
 
-    /** Intermediate row with column identity and optional per-table RowId for data modification. */
+    /** Intermediate row with column identity and optional per-relation RowId for modification. */
     private record PlanRow(Map<Long, Long> rowIds, List<ColumnSlot> layout, List<Object> values) { }
 
     private final RecordStore records;
@@ -175,16 +176,18 @@ public final class DatabaseEngine {
 
     private List<PlanRow> scan(Map<String, Object> node) {
         TableSchema table = resolveTable(map(node.get("table"), "scan table"));
+        long relationId = optionalLong(node.get("relationId"), table.id());
         List<ColumnSlot> layout = new ArrayList<>();
         for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
             ColumnSchema column = table.columns().get(ordinal);
-            layout.add(new ColumnSlot(table.id(), column.id(), ordinal, column.type()));
+            layout.add(new ColumnSlot(
+                table.id(), column.id(), relationId, ordinal, column.type()));
         }
         List<PlanRow> result = new ArrayList<>();
         for (StoredRow row : records.scan(table.id())) {
             if (row.values().size() != layout.size())
                 throw new EngineException("StorageFailure", "stored row does not match table schema");
-            result.add(new PlanRow(Map.of(table.id(), row.id()), layout, row.values()));
+            result.add(new PlanRow(Map.of(relationId, row.id()), layout, row.values()));
         }
         return result;
     }
@@ -260,7 +263,7 @@ public final class DatabaseEngine {
         for (Map.Entry<Long, Long> entry : right.rowIds().entrySet())
             if (rowIds.putIfAbsent(entry.getKey(), entry.getValue()) != null)
                 throw new EngineException("InvalidPlan",
-                    "join contains the same table more than once");
+                    "join contains a duplicate relation instance");
         List<ColumnSlot> layout = new ArrayList<>(left.layout());
         layout.addAll(right.layout());
         List<Object> values = new ArrayList<>(left.values());
@@ -397,10 +400,12 @@ public final class DatabaseEngine {
     private ColumnSlot columnSlot(Map<String, Object> reference, PlanRow row) {
         long tableId = longValue(reference.get("tableId"), "column table id");
         long columnId = longValue(reference.get("columnId"), "column id");
+        long relationId = optionalLong(reference.get("relationId"), tableId);
         int ordinal = Math.toIntExact(longValue(reference.get("ordinal"), "column ordinal"));
         String type = string(reference.get("type"), "column type");
         for (ColumnSlot slot : row.layout()) {
-            if (slot.tableId() == tableId && slot.columnId() == columnId) {
+            if (slot.tableId() == tableId && slot.columnId() == columnId
+                && slot.relationId() == relationId) {
                 if (slot.ordinal() != ordinal || !slot.type().equals(type))
                     throw new EngineException("InvalidPlan",
                         "column reference metadata does not match catalog");
@@ -413,15 +418,18 @@ public final class DatabaseEngine {
 
     private List<Object> tableValues(TableSchema table, PlanRow row) {
         List<Object> values = new ArrayList<>();
+        long relationId = row.rowIds().containsKey(0L) ? 0 : table.id();
         for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
             ColumnSchema column = table.columns().get(ordinal);
-            values.add(columnValue(ref(table.id(), column, ordinal), row));
+            values.add(columnValue(ref(table.id(), column, relationId, ordinal), row));
         }
         return values;
     }
 
     private long rowIdFor(TableSchema table, PlanRow row) {
-        Long rowId = row.rowIds().get(table.id());
+        Long rowId = row.rowIds().get(0L);
+        // protocolVersion=1 plans emitted before relationId used tableId as the row key.
+        if (rowId == null) rowId = row.rowIds().get(table.id());
         if (rowId == null)
             throw new EngineException("InvalidPlan",
                 "input does not carry target table RowId");
@@ -504,10 +512,11 @@ public final class DatabaseEngine {
     }
 
     private static Map<String, Object> ref(
-        long tableId, ColumnSchema column, int ordinal) {
+        long tableId, ColumnSchema column, long relationId, int ordinal) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("tableId", tableId);
         result.put("columnId", column.id());
+        result.put("relationId", relationId);
         result.put("ordinal", (long) ordinal);
         result.put("type", column.type());
         return result;
@@ -540,6 +549,9 @@ public final class DatabaseEngine {
     private static long longValue(Object value, String label) {
         if (value instanceof Long number) return number;
         throw new EngineException("ProtocolError", label + " must be an integer");
+    }
+    private static long optionalLong(Object value, long fallback) {
+        return value == null ? fallback : longValue(value, "optional integer");
     }
     private static EngineException error(
         String code, String message, Map<String, Object> expression) {

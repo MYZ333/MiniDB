@@ -6,7 +6,8 @@ CREATE、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是�
 
 执行器支持 `INT/FLOAT/VARCHAR/BOOL` 和可存储的 `NULL`，并能执行 SeqScan、
 NestedLoopJoin、Filter、GroupBy、Sort、Project。当前 GroupBy 按键去重，尚不计算聚合函数。
-内部算子通过带列身份的 `PlanRow` 传行，因此 JOIN 后仍按 `tableId + columnId` 精确取列。
+内部算子通过带列身份的 `PlanRow` 传行，因此 JOIN 后按
+`relationId + tableId + columnId` 精确取列，并支持同一物理表自连接。
 
 构建 Java 引擎：
 

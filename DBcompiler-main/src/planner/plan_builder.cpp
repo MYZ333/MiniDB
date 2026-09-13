@@ -21,17 +21,25 @@ bool validRef(const BoundColumnRef& ref, const TableSchema& table) {
            ref.type == table.columns[ref.ordinal].type;
 }
 
-using Tables = std::vector<std::shared_ptr<const TableSchema>>;
+struct Relation {
+    std::shared_ptr<const TableSchema> table;
+    std::uint64_t id;
+    std::string name;
+};
+using Relations = std::vector<Relation>;
 
-bool validRef(const BoundColumnRef& ref, const Tables& tables) {
-    for (const auto& table : tables) if (table && validRef(ref, *table)) return true;
+bool validRef(const BoundColumnRef& ref, const Relations& relations) {
+    for (const auto& relation : relations)
+        if (relation.table && relation.id == ref.relation_id &&
+            validRef(ref, *relation.table)) return true;
     return false;
 }
 
 bool sameRef(const BoundColumnRef& left, const BoundColumnRef& right) {
     return left.table_id.value == right.table_id.value &&
            left.column_id.value == right.column_id.value &&
-           left.ordinal == right.ordinal && left.type == right.type;
+           left.ordinal == right.ordinal && left.type == right.type &&
+           left.relation_id == right.relation_id;
 }
 
 bool containsRef(const std::vector<BoundColumnRef>& refs, const BoundColumnRef& target) {
@@ -47,23 +55,23 @@ DataType valueType(const ScalarValue& value) {
     return DataType::Null;
 }
 
-std::optional<Diagnostic> checkExpr(const BoundExprPtr& expr, const Tables& tables,
+std::optional<Diagnostic> checkExpr(const BoundExprPtr& expr, const Relations& relations,
                                     std::size_t depth = 0) {
     if (!expr) return invalid("required bound expression is missing");
     if (depth >= 256) return invalid("bound expression exceeds 256 levels", expr->span);
     return std::visit([&](const auto& node) -> std::optional<Diagnostic> {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, BoundColumnRef>) {
-            if (!validRef(node, tables) || node.type != expr->type)
+            if (!validRef(node, relations) || node.type != expr->type)
                 return invalid("bound column does not match target schema", expr->span);
         } else if constexpr (std::is_same_v<T, BoundLiteral>) {
             if (valueType(node.value) != expr->type)
                 return invalid("bound literal type does not match value", expr->span);
         } else if constexpr (std::is_same_v<T, BoundUnary>) {
-            return checkExpr(node.operand, tables, depth + 1);
+            return checkExpr(node.operand, relations, depth + 1);
         } else {
-            if (auto error = checkExpr(node.left, tables, depth + 1)) return error;
-            return checkExpr(node.right, tables, depth + 1);
+            if (auto error = checkExpr(node.left, relations, depth + 1)) return error;
+            return checkExpr(node.right, relations, depth + 1);
         }
         return std::nullopt;
     }, expr->node);
@@ -76,26 +84,32 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
             if (stmt.table_name.empty() || stmt.columns.empty()) return invalid("CREATE requires a name and columns");
         } else if constexpr (std::is_same_v<T, BoundSelect>) {
             if (!stmt.table || stmt.table->columns.empty()) return invalid("base table schema is missing or empty");
-            Tables tables{stmt.table};
+            Relations relations{{stmt.table, stmt.relation_id,
+                                 stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}};
             for (const auto& join : stmt.joins) {
                 if (!join.table || join.table->columns.empty() || !join.on || join.on->type != DataType::Bool)
                     return invalid("JOIN requires a table and BOOL predicate");
-                for (const auto& table : tables) {
-                    if (table->id.value == join.table->id.value) return invalid("JOIN table is duplicated");
+                const std::string name =
+                    join.relation_name.empty() ? join.table->name : join.relation_name;
+                for (const auto& relation : relations) {
+                    if (relation.id == join.relation_id || relation.name == name)
+                        return invalid("JOIN relation identity or name is duplicated");
                 }
-                tables.push_back(join.table);
-                if (auto error = checkExpr(join.on, tables)) return error;
+                relations.push_back({join.table, join.relation_id, name});
+                if (auto error = checkExpr(join.on, relations)) return error;
             }
             if (stmt.where) {
                 if (stmt.where->type != DataType::Bool) return invalid("WHERE must be BOOL", stmt.where->span);
-                if (auto error = checkExpr(stmt.where, tables)) return error;
+                if (auto error = checkExpr(stmt.where, relations)) return error;
             }
             if (stmt.columns.empty()) return invalid("SELECT requires output columns");
+            if (!stmt.output_names.empty() && stmt.output_names.size() != stmt.columns.size())
+                return invalid("SELECT output names do not match columns");
             for (const auto& ref : stmt.columns)
-                if (!validRef(ref, tables)) return invalid("SELECT column does not match visible schemas");
+                if (!validRef(ref, relations)) return invalid("SELECT column does not match visible schemas");
             std::vector<BoundColumnRef> checked_groups;
             for (const auto& ref : stmt.group_by) {
-                if (!validRef(ref, tables)) return invalid("GROUP BY column does not match visible schemas");
+                if (!validRef(ref, relations)) return invalid("GROUP BY column does not match visible schemas");
                 if (containsRef(checked_groups, ref)) return invalid("GROUP BY column is duplicated");
                 checked_groups.push_back(ref);
             }
@@ -106,7 +120,7 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                 }
             }
             for (const auto& item : stmt.order_by) {
-                if (!validRef(item.column, tables)) return invalid("ORDER BY column does not match visible schemas");
+                if (!validRef(item.column, relations)) return invalid("ORDER BY column does not match visible schemas");
                 if (!stmt.group_by.empty() && !containsRef(stmt.group_by, item.column))
                     return invalid("ORDER BY column must occur in GROUP BY");
             }
@@ -122,7 +136,8 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
             } else {
                 if (stmt.where) {
                     if (stmt.where->type != DataType::Bool) return invalid("WHERE must be BOOL", stmt.where->span);
-                    if (auto error = checkExpr(stmt.where, Tables{stmt.table})) return error;
+                    if (auto error = checkExpr(stmt.where,
+                        Relations{{stmt.table, 0, stmt.table->name}})) return error;
                 }
                 if constexpr (std::is_same_v<T, BoundUpdate>) {
                     if (stmt.assignments.empty()) return invalid("UPDATE requires assignments");
@@ -130,7 +145,8 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                     for (const auto& assignment : stmt.assignments) {
                         if (!validRef(assignment.target, *stmt.table) || !seen.insert(assignment.target.ordinal).second)
                             return invalid("UPDATE target is invalid or duplicated");
-                        if (auto error = checkExpr(assignment.value, Tables{stmt.table})) return error;
+                        if (auto error = checkExpr(assignment.value,
+                            Relations{{stmt.table, 0, stmt.table->name}})) return error;
                         if (assignment.target.type != assignment.value->type)
                             return invalid("UPDATE value type does not match target", assignment.value->span);
                     }
@@ -162,35 +178,42 @@ std::vector<OutputColumn> scanOutput(const std::shared_ptr<const TableSchema>& t
     return output;
 }
 
-const ColumnSchema& schemaColumn(const BoundColumnRef& ref, const Tables& tables) {
-    for (const auto& table : tables) {
-        if (table->id.value == ref.table_id.value) return table->columns[ref.ordinal];
+const ColumnSchema& schemaColumn(const BoundColumnRef& ref, const Relations& relations) {
+    for (const auto& relation : relations) {
+        if (relation.id == ref.relation_id &&
+            relation.table->id.value == ref.table_id.value)
+            return relation.table->columns[ref.ordinal];
     }
     throw std::logic_error("validated column reference has no table");
 }
 
 std::vector<OutputColumn> referencedOutput(const std::vector<BoundColumnRef>& refs,
-                                           const Tables& tables) {
+                                           const Relations& relations,
+                                           const std::vector<std::string>& names = {}) {
     std::vector<OutputColumn> output;
-    for (const auto& ref : refs) {
-        const auto& column = schemaColumn(ref, tables);
-        output.push_back({column.name, ref.type});
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+        const auto& column = schemaColumn(refs[i], relations);
+        output.push_back({names.empty() ? column.name : names[i], refs[i].type});
     }
     return output;
 }
 
-PlanPtr selectSource(const BoundSelect& stmt, Tables& tables) {
-    auto input = node(SeqScanPlan{stmt.table}, scanOutput(stmt.table));
+PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
+    auto input = node(SeqScanPlan{stmt.table, stmt.relation_id,
+        stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}, scanOutput(stmt.table));
     for (const auto& join : stmt.joins) {
-        auto right = node(SeqScanPlan{join.table}, scanOutput(join.table));
+        auto right = node(SeqScanPlan{join.table, join.relation_id,
+            join.relation_name.empty() ? join.table->name : join.relation_name},
+            scanOutput(join.table));
         auto output = input->output;
         output.insert(output.end(), right->output.begin(), right->output.end());
         input = node(NestedLoopJoinPlan{input, right, join.on}, std::move(output));
-        tables.push_back(join.table);
+        relations.push_back({join.table, join.relation_id,
+            join.relation_name.empty() ? join.table->name : join.relation_name});
     }
     if (stmt.where) input = node(FilterPlan{stmt.where, input}, input->output);
     if (!stmt.group_by.empty())
-        input = node(GroupByPlan{stmt.group_by, input}, referencedOutput(stmt.group_by, tables));
+        input = node(GroupByPlan{stmt.group_by, input}, referencedOutput(stmt.group_by, relations));
     if (!stmt.order_by.empty()) input = node(SortPlan{stmt.order_by, input}, input->output);
     return input;
 }
@@ -205,9 +228,11 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
         } else if constexpr (std::is_same_v<T, BoundInsert>) {
             return node(InsertPlan{stmt.table, stmt.values});
         } else if constexpr (std::is_same_v<T, BoundSelect>) {
-            Tables tables{stmt.table};
-            auto input = selectSource(stmt, tables);
-            return node(ProjectPlan{stmt.columns, input}, referencedOutput(stmt.columns, tables));
+            Relations relations{{stmt.table, stmt.relation_id,
+                stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}};
+            auto input = selectSource(stmt, relations);
+            return node(ProjectPlan{stmt.columns, input},
+                        referencedOutput(stmt.columns, relations, stmt.output_names));
         } else if constexpr (std::is_same_v<T, BoundUpdate>) {
             // 修改操作的输入携带行标识，根只返回影响行数（执行结果，不是业务列）。
             return node(UpdatePlan{stmt.table, stmt.assignments, source(stmt.table, stmt.where, true)});

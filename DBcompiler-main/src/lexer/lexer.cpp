@@ -36,7 +36,7 @@ TokenKind keywordOrIdentifier(const std::string& lexeme) {
         {"delete", TokenKind::Delete}, {"join", TokenKind::Join},
         {"on", TokenKind::On}, {"group", TokenKind::Group},
         {"order", TokenKind::Order}, {"by", TokenKind::By},
-        {"asc", TokenKind::Asc}, {"desc", TokenKind::Desc},
+        {"asc", TokenKind::Asc}, {"desc", TokenKind::Desc}, {"as", TokenKind::As},
         {"int", TokenKind::Int}, {"varchar", TokenKind::Varchar},
         {"bool", TokenKind::Bool}, {"float", TokenKind::Float},
         {"null", TokenKind::Null}, {"true", TokenKind::True},

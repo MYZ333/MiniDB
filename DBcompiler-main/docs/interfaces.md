@@ -59,7 +59,8 @@ Statement 保存整条语句范围；Identifier 保存原始拼写及精确范�
 
 SELECT 使用 `variant<AllColumns, vector<Identifier>>` 区分星号和列清单。
 INSERT 使用 optional 列清单区分省略和显式给定，显式清单不得为空。
-SelectStmt 追加 group_by、order_by、joins，并为旧的三字段聚合初始化提供空默认值。
+SelectStmt 追加 group_by、order_by、joins、FROM 表别名和与选择列平行的 column_aliases，
+并为旧的三字段聚合初始化提供空默认值。JoinClause 可携带右表别名。
 限定名由 Parser 合并为 `table.column` 的 Identifier.text；原始范围覆盖整个限定名。
 字面量允许 int64_t/double/string/bool/NullValue；DataType 增加 Float，Null 仅为内部字面量类型。
 
@@ -137,17 +138,19 @@ UPDATE/DELETE 与 SELECT 共用布尔条件检查，WHERE 省略合法，存在�
 必需表达式子节点为空时报 InvalidAst；表达式路径超过 256 个节点时报 ExpressionTooDeep。
 绑定只推导类型，不求值，所以类型合法的除零或溢出表达式保留给执行层报告。
 INSERT 的 NULL 允许写入任意类型列，执行层需为记录提供空值表示；NULL 参与表达式时
-因尚无三值逻辑而报 InvalidOperandType。限定名按表名解析；未限定列名在全部可见表中
-查找，命中多个表时返回 AmbiguousColumn。同表重复 JOIN 在别名功能加入前返回 DuplicateTable。
+因尚无三值逻辑而报 InvalidOperandType。限定名按关系有效名称解析；声明表别名后必须以
+别名限定。未限定列名在全部可见关系实例中查找，命中多个实例时返回 AmbiguousColumn。
+同一物理表可用不同别名自连接；重复关系名返回 DuplicateTable。选择列别名决定 Project
+输出名称，并可由 ORDER BY 引用；同名输出别名被引用时返回 AmbiguousColumn。
 JOIN ON 必须为 BOOL，否则返回 JoinConditionNotBoolean。无聚合 GROUP BY 要求所有投影列
 和排序列都属于分组键，重复键或不满足约束返回 InvalidGrouping。
 
 绑定结果约束：全部列引用已解析；WHERE/JOIN ON 为 BOOL；运算符合法；INSERT 值按
 表列顺序重排；SELECT 的星号已按可见表顺序展开；JOIN 表保持 SQL 顺序；GROUP/ORDER
-键保存稳定的表 ID、列 ID、ordinal 和类型；UPDATE 目标唯一且赋值类型匹配。
+键保存稳定的关系实例 ID、表 ID、列 ID、ordinal 和类型；UPDATE 目标唯一且赋值类型匹配。
 buildPlan 只接受符合这些约束的结果，不再按名字查询 Catalog。
 
-buildPlan 对目标模式、值数/值类型、列 ID/ordinal、WHERE/JOIN ON 类型、JOIN 表重复、
+buildPlan 对目标模式、值数/值类型、relation ID、列 ID/ordinal、WHERE/JOIN ON 类型、关系名重复、
 GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 表达式空指针和深度进行附加检查，失败返回 Plan / InvalidBoundStatement。
 它不会重新推导每个操作符的类型，前置条件仍是输入来自成功的 analyze。
@@ -164,10 +167,11 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 | DeleteStmt | 表模式、可选 BOOL 条件 | Delete → [Filter] → SeqScan |
 
 PlanNode 的 output 是有序业务列模式，carries_row_id 是内部行标识属性。
-SeqScan 第一阶段输出全表列；Filter 保留子节点的模式和行标识。
-Project 输出选择列，可有重复名称，丢弃内部行标识。
+SeqScan 第一阶段输出全表列，并携带 relation_id/relation_name；Filter 保留子节点的模式和行标识。
+Project 输出选择列及列别名，可有重复名称，丢弃内部行标识。
 NestedLoopJoin 执行内连接：对左输入的每行依次扫描右输入，仅输出 ON 为 TRUE 的组合行；
 输出业务列是左模式后接右模式。多个 JOIN 按 SQL 顺序形成左深树，当前不选择其他连接算法。
+自连接的多个扫描共享 table_id，但 relation_id 不同；执行层按 relation_id 和 column_id 定位值。
 GroupBy 在聚合函数尚未加入时按 keys 去重，输出恰好为分组键顺序；分组比较中两个 NULL
 属于同一组。Sort 保留输入模式，按 items 顺序比较，ASC/DESC 分别表示升/降序；ASC 把
 NULL 放在非 NULL 之后，DESC 把 NULL 放在非 NULL 之前，相同键之间的最终顺序未定义。
@@ -263,3 +267,5 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
   B 完成标量类型与单表限定名适配；尚无计划契约的扩展子句统一返回 UnsupportedFeature。
 - 0.8：B 增加多表作用域、歧义诊断、BoundJoin/BoundOrderBy，以及 NestedLoopJoin、
   GroupBy、Sort 计划节点；明确无聚合分组、隐藏排序列和执行层行布局契约。
+- 0.9：增加表/列别名和 ORDER BY 输出别名；以 relation_id 区分同一物理表的自连接实例，
+  JSON 协议保持版本 1 并为旧计划保留 tableId 回退。

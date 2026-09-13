@@ -151,6 +151,23 @@ void testJoinGroupOrderAndQualifiedNames() {
             select.order_by[1].direction == SortDirection::Asc, "ORDER BY direction mismatch");
 }
 
+void testTableAndColumnAliases() {
+    const auto statements = parseOk(
+        "SELECT e.name AS employee_name,m.name manager_name "
+        "FROM employee AS e JOIN employee m ON e.manager_id=m.id;");
+    const auto& select = std::get<SelectStmt>(statements[0].node);
+    require(select.table_alias && select.table_alias->text == "e",
+            "explicit base-table alias lost");
+    require(select.joins.size() == 1 && select.joins[0].alias &&
+            select.joins[0].alias->text == "m", "implicit JOIN alias lost");
+    require(select.column_aliases.size() == 2 &&
+            select.column_aliases[0] &&
+            select.column_aliases[0]->text == "employee_name" &&
+            select.column_aliases[1] &&
+            select.column_aliases[1]->text == "manager_name",
+            "column aliases lost");
+}
+
 void testBoolFloatAndNull() {
     const auto statements = parseOk(
         "CREATE TABLE metrics(id INT,active BOOL,score FLOAT);"
@@ -249,6 +266,7 @@ int main() {
         testSelectStarAndEmptyInput();
         testExpressionPrecedence();
         testJoinGroupOrderAndQualifiedNames();
+        testTableAndColumnAliases();
         testBoolFloatAndNull();
         testIntegerBoundaries();
         testSyntaxErrors();

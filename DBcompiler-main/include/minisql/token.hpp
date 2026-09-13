@@ -10,7 +10,7 @@ enum class TokenKind {
     EndOfInput,
     Identifier, Integer, FloatLiteral, String,
     Create, Table, Insert, Into, Values, Select, From, Where,
-    Update, Set, Delete, Join, On, Group, Order, By, Asc, Desc,
+    Update, Set, Delete, Join, On, Group, Order, By, Asc, Desc, As,
     Int, Varchar, Bool, Float, Null, True, False, And, Or, Not,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     Plus, Minus, Star, Slash,

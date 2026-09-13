@@ -31,16 +31,27 @@ ScalarValue scalar(const LiteralValue& value) {  //把literal value转成scalar 
     return std::visit([](const auto& item) -> ScalarValue { return item; }, value);
 }
 
-BoundColumnRef columnRef(const TableSchema& table, std::size_t index) {
-    const auto& field = table.columns[index];
-    return {table.id, field.id, index, field.type};
+struct RelationBinding {
+    std::shared_ptr<const TableSchema> table;
+    std::string name;
+    std::uint64_t id;
+};
+
+BoundColumnRef columnRef(const RelationBinding& relation, std::size_t index) {
+    const auto& field = relation.table->columns[index];
+    return {relation.table->id, field.id, index, field.type, relation.id};
 }
 
-using BindingScope = std::vector<std::shared_ptr<const TableSchema>>;
+using BindingScope = std::vector<RelationBinding>;
+
+BindingScope singleTableScope(const std::shared_ptr<const TableSchema>& table) {
+    return BindingScope{{table, table->name, 0}};
+}
 
 bool sameColumn(const BoundColumnRef& left, const BoundColumnRef& right) {
     return left.table_id.value == right.table_id.value &&
-           left.column_id.value == right.column_id.value;
+           left.column_id.value == right.column_id.value &&
+           left.relation_id == right.relation_id;
 }
 
 bool containsColumn(const std::vector<BoundColumnRef>& columns, const BoundColumnRef& target) {
@@ -64,16 +75,16 @@ Result<BoundColumnRef> resolveColumn(const Identifier& name, const BindingScope&
     }
 
     std::optional<BoundColumnRef> match;
-    for (const auto& table : scope) {
-        if (qualifier && table->name != *qualifier) continue;
-        for (std::size_t index = 0; index < table->columns.size(); ++index) {
-            if (table->columns[index].name != normalized) continue;
+    for (const auto& relation : scope) {
+        if (qualifier && relation.name != *qualifier) continue;
+        for (std::size_t index = 0; index < relation.table->columns.size(); ++index) {
+            if (relation.table->columns[index].name != normalized) continue;
             if (match) {
                 return error(ErrorCode::AmbiguousColumn,
-                    "column '" + name.text + "' is ambiguous; qualify it with a table name",
+                    "column '" + name.text + "' is ambiguous; qualify it with a table alias",
                     location(name.span, fallback));
             }
-            match = columnRef(*table, index);
+            match = columnRef(relation, index);
         }
     }
     if (match) return *match;
@@ -145,7 +156,7 @@ private:
             }
             std::unordered_set<std::size_t> seen;
             for (const auto& name : *stmt.columns) {
-                auto resolved = resolveColumn(name, BindingScope{table}, statement_span_);
+                auto resolved = resolveColumn(name, singleTableScope(table), statement_span_);
                 if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
                 auto ref = std::get<BoundColumnRef>(resolved);
                 if (!seen.insert(ref.ordinal).second) {
@@ -155,7 +166,9 @@ private:
                 targets.push_back(ref);
             }
         } else {
-            for (std::size_t i = 0; i < table->columns.size(); ++i) targets.push_back(columnRef(*table, i));
+            const auto scope = singleTableScope(table);
+            for (std::size_t i = 0; i < table->columns.size(); ++i)
+                targets.push_back(columnRef(scope.front(), i));
         }
         if (targets.size() != stmt.values.size()) {
             return error(ErrorCode::ValueCountMismatch, "INSERT has " + std::to_string(targets.size()) +
@@ -183,42 +196,79 @@ private:
     }
 
     Result<BoundStatement> bindStatement(const SelectStmt& stmt) {
+        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+            return error(ErrorCode::InvalidAst, "table alias must be a simple identifier",
+                         location(stmt.table_alias->span, statement_span_));
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        BindingScope scope{table};
+        const std::string relation_name = stmt.table_alias
+            ? normalizeName(stmt.table_alias->text) : table->name;
+        BindingScope scope{{table, relation_name, 1}};
         std::vector<BoundJoin> joins;
         for (const auto& join : stmt.joins) {
+            if (join.alias && join.alias->text.find('.') != std::string::npos)
+                return error(ErrorCode::InvalidAst, "JOIN alias must be a simple identifier",
+                             location(join.alias->span, location(join.span, statement_span_)));
             auto joined_lookup = findTable(join.table);
             if (const auto* failure = std::get_if<Diagnostic>(&joined_lookup)) return *failure;
             auto joined = std::get<std::shared_ptr<const TableSchema>>(joined_lookup);
+            const std::string joined_name = join.alias
+                ? normalizeName(join.alias->text) : joined->name;
             for (const auto& visible : scope) {
-                if (visible->id.value == joined->id.value) {
+                if (visible.name == joined_name) {
                     return error(ErrorCode::DuplicateTable,
-                        "table '" + join.table.text + "' occurs more than once without aliases",
-                        location(join.table.span, location(join.span, statement_span_)));
+                        "relation name '" + joined_name + "' occurs more than once",
+                        location(join.alias ? join.alias->span : join.table.span,
+                                 location(join.span, statement_span_)));
                 }
             }
-            scope.push_back(joined); // ON 可以引用刚加入的右表及之前所有左侧表。
+            const std::uint64_t relation_id = scope.size() + 1;
+            scope.push_back({joined, joined_name, relation_id});
             auto condition = bindBoolean(join.on, scope, "JOIN ON", ErrorCode::JoinConditionNotBoolean);
             if (const auto* failure = std::get_if<Diagnostic>(&condition)) return *failure;
-            joins.push_back({std::move(joined), std::get<BoundExprPtr>(std::move(condition))});
+            joins.push_back({std::move(joined), std::get<BoundExprPtr>(std::move(condition)),
+                             joined_name, relation_id});
         }
         std::vector<BoundColumnRef> columns;
+        std::vector<std::string> output_names;
+        std::vector<std::pair<std::string, BoundColumnRef>> output_aliases;
         if (std::holds_alternative<AllColumns>(stmt.columns)) {
+            if (!stmt.column_aliases.empty())
+                return error(ErrorCode::InvalidAst,
+                             "SELECT * cannot carry column aliases", statement_span_);
             for (const auto& visible : scope) {
-                for (std::size_t i = 0; i < visible->columns.size(); ++i)
-                    columns.push_back(columnRef(*visible, i));
+                for (std::size_t i = 0; i < visible.table->columns.size(); ++i) {
+                    columns.push_back(columnRef(visible, i));
+                    output_names.push_back(visible.table->columns[i].name);
+                }
             }
         } else {
             const auto& names = std::get<std::vector<Identifier>>(stmt.columns);
             if (names.empty()) {
                 return error(ErrorCode::EmptyColumnList, "SELECT column list must not be empty", statement_span_);
             }
-            for (const auto& name : names) {
+            if (!stmt.column_aliases.empty() && stmt.column_aliases.size() != names.size())
+                return error(ErrorCode::InvalidAst,
+                             "SELECT aliases must match the selected columns", statement_span_);
+            for (std::size_t i = 0; i < names.size(); ++i) {
+                const auto& name = names[i];
                 auto resolved = resolveColumn(name, scope, statement_span_);
                 if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
-                columns.push_back(std::get<BoundColumnRef>(resolved)); // 保留重复选择列。
+                auto ref = std::get<BoundColumnRef>(resolved);
+                columns.push_back(ref);
+                if (!stmt.column_aliases.empty() && stmt.column_aliases[i]) {
+                    if (stmt.column_aliases[i]->text.find('.') != std::string::npos)
+                        return error(ErrorCode::InvalidAst,
+                            "column alias must be a simple identifier",
+                            location(stmt.column_aliases[i]->span, statement_span_));
+                    auto alias = normalizeName(stmt.column_aliases[i]->text);
+                    output_names.push_back(alias);
+                    output_aliases.push_back({std::move(alias), ref});
+                } else {
+                    output_names.push_back(
+                        scope[ref.relation_id - 1].table->columns[ref.ordinal].name);
+                }
             }
         }
         auto predicate = bindWhere(stmt.where, scope);
@@ -248,9 +298,27 @@ private:
 
         std::vector<BoundOrderBy> order_by;
         for (const auto& item : stmt.order_by) {
-            auto resolved = resolveColumn(item.column, scope, item.span);
-            if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
-            auto ref = std::get<BoundColumnRef>(resolved);
+            std::optional<BoundColumnRef> alias_match;
+            const auto order_name = normalizeName(item.column.text);
+            if (order_name.find('.') == std::string::npos) {
+                for (const auto& alias : output_aliases) {
+                    if (alias.first != order_name) continue;
+                    if (alias_match) {
+                        return error(ErrorCode::AmbiguousColumn,
+                            "ORDER BY alias '" + item.column.text + "' is ambiguous",
+                            location(item.column.span, item.span));
+                    }
+                    alias_match = alias.second;
+                }
+            }
+            BoundColumnRef ref;
+            if (alias_match) {
+                ref = *alias_match;
+            } else {
+                auto resolved = resolveColumn(item.column, scope, item.span);
+                if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
+                ref = std::get<BoundColumnRef>(resolved);
+            }
             if (!group_by.empty() && !containsColumn(group_by, ref)) {
                 return error(ErrorCode::InvalidGrouping,
                     "ORDER BY column must occur in GROUP BY in a grouped query",
@@ -260,7 +328,8 @@ private:
         }
         return success(BoundSelect{std::move(table), std::move(columns),
                                    std::get<BoundExprPtr>(std::move(predicate)),
-                                   std::move(joins), std::move(group_by), std::move(order_by)});
+                                   std::move(joins), std::move(group_by), std::move(order_by),
+                                   relation_name, 1, std::move(output_names)});
     }
 
     Result<BoundStatement> bindStatement(const UpdateStmt& stmt) {
@@ -274,7 +343,7 @@ private:
         std::vector<BoundAssignment> assignments;
         for (const auto& assignment : stmt.assignments) {
             const auto span = location(assignment.span, statement_span_);
-            auto resolved = resolveColumn(assignment.target, BindingScope{table}, span);
+            auto resolved = resolveColumn(assignment.target, singleTableScope(table), span);
             if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
             auto target = std::get<BoundColumnRef>(resolved);
             if (!targets.insert(target.ordinal).second) {
@@ -283,7 +352,7 @@ private:
                     location(assignment.target.span, span));
             }
             // 始终绑定到同一份原表模式，不用先前赋值替换 RHS 中的列引用。
-            auto expression = bindExpr(assignment.value, BindingScope{table}, 0, span);
+            auto expression = bindExpr(assignment.value, singleTableScope(table), 0, span);
             if (const auto* failure = std::get_if<Diagnostic>(&expression)) return *failure;
             auto rhs = std::get<BoundExprPtr>(std::move(expression));
             if (rhs->type != target.type) {
@@ -293,7 +362,7 @@ private:
             }
             assignments.push_back({target, std::move(rhs)});
         }
-        auto predicate = bindWhere(stmt.where, BindingScope{table});
+        auto predicate = bindWhere(stmt.where, singleTableScope(table));
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
         return success(BoundUpdate{std::move(table), std::move(assignments),
                                    std::get<BoundExprPtr>(std::move(predicate))});
@@ -303,7 +372,7 @@ private:
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        auto predicate = bindWhere(stmt.where, BindingScope{table});
+        auto predicate = bindWhere(stmt.where, singleTableScope(table));
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
         return success(BoundDelete{std::move(table), std::get<BoundExprPtr>(std::move(predicate))});
     }

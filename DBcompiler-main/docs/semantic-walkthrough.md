@@ -100,7 +100,8 @@ SELECT bound: output ordinal 1; WHERE column ID 3; predicate BOOL=1
 ```
 
 4 个 Catalog 用例检查模式规范化、快照隔离、失败注册原子性和生命周期。
-语义测试现扩展至 38 个用例，检查五类语句、JOIN/GROUP/ORDER、类型规则、准确范围、深度边界和无副作用。
+语义测试现扩展至 39 个用例，检查五类语句、别名/自连接、JOIN/GROUP/ORDER、类型规则、
+准确范围、深度边界和无副作用。
 test_support.hpp 只是测试辅助；实际算法位于 src 中，测试通过公共 analyze 调用它。
 
 当前环境没有 CMake，已用直接构建脚本通过严格警告编译及全部用例；CMake 配置

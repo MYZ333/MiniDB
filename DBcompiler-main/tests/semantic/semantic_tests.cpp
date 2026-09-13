@@ -192,12 +192,41 @@ int main() {
         error = failure(f.analyzeSelect(star), ErrorCode::JoinConditionNotBoolean);
         check(error.span->begin.offset == 40, "JOIN ON type location mismatch");
     });
-    suite.run("JOIN rejects duplicate tables until aliases are supported", [] {
+    suite.run("self JOIN uses distinct alias relation identities", [] {
+        Fixture f;
+        SelectStmt select{id("student"),
+            std::vector<Identifier>{id("e.name"), id("m.name")}, nullptr};
+        select.table_alias = id("e");
+        select.column_aliases = {id("employee_name"), id("manager_name")};
+        select.order_by = {{id("employee_name"), SortDirection::Desc, {}}};
+        select.joins.push_back({id("student"),
+            bin(BinaryOp::Equal, col("e.id"), col("m.age")), {}, id("m")});
+        const auto bound = value(f.analyzeNode(std::move(select)));
+        const auto& query = std::get<BoundSelect>(bound.node);
+        check(query.relation_name == "e" && query.relation_id == 1 &&
+              query.joins[0].relation_name == "m" &&
+              query.joins[0].relation_id == 2,
+              "relation aliases or instance IDs were lost");
+        check(query.columns[0].table_id.value == query.columns[1].table_id.value &&
+              query.columns[0].relation_id != query.columns[1].relation_id,
+              "self JOIN columns do not distinguish relation instances");
+        check(query.output_names[0] == "employee_name" &&
+              query.output_names[1] == "manager_name", "column aliases were not bound");
+        check(query.order_by[0].column.relation_id == query.columns[0].relation_id &&
+              query.order_by[0].column.column_id.value == query.columns[0].column_id.value,
+              "ORDER BY output alias did not resolve to its source column");
+    });
+    suite.run("aliases hide physical names and duplicate relation names fail", [] {
         MultiTableFixture f;
-        SelectStmt select{id("student"), AllColumns{}, nullptr};
-        select.joins.push_back({id("student", span(25, 7)), truth(), {}});
-        const auto error = failure(f.analyzeSelect(std::move(select)), ErrorCode::DuplicateTable);
-        check(error.span->begin.offset == 25, "duplicate JOIN table location mismatch");
+        SelectStmt hidden{id("student"), std::vector<Identifier>{id("student.name")}, nullptr};
+        hidden.table_alias = id("s");
+        failure(f.analyzeSelect(std::move(hidden)), ErrorCode::ColumnNotFound);
+
+        SelectStmt duplicate{id("student"), AllColumns{}, nullptr};
+        duplicate.table_alias = id("x");
+        duplicate.joins.push_back({id("score"), truth(), {}, id("X", span(25, 1))});
+        const auto error = failure(f.analyzeSelect(std::move(duplicate)), ErrorCode::DuplicateTable);
+        check(error.span->begin.offset == 25, "duplicate alias location mismatch");
     });
     suite.run("GROUP BY enforces key-only projection and ordering", [] {
         MultiTableFixture f;

@@ -17,11 +17,11 @@ executeProgramJson
 
 `DatabaseEngine` 内部因此增加两个只供执行算子使用的记录：
 
-- `ColumnSlot` 保存 `tableId`、`columnId`、源表 ordinal 和类型；
-- `PlanRow` 保存各源表 RowId、当前列布局和对应值。
+- `ColumnSlot` 保存 `relationId`、`tableId`、`columnId`、源表 ordinal 和类型；
+- `PlanRow` 保存各关系实例 RowId、当前列布局和对应值。
 
 `SeqScan` 根据 Catalog 创建布局。表达式读取列时，`columnSlot` 先用
-`tableId + columnId` 查找，再检查 ordinal 和类型是否与 Catalog 一致。这样 JOIN 拼接
+`relationId + tableId + columnId` 查找，再检查 ordinal 和类型是否与 Catalog 一致。这样 JOIN 拼接
 左右值数组后不会把两个表的同位置列混淆。存储层接口没有变化。
 
 ## 2. 五个输入算子

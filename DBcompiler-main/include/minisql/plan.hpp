@@ -21,7 +21,11 @@ struct InsertPlan {
     std::shared_ptr<const TableSchema> table;
     std::vector<ScalarValue> values;
 };
-struct SeqScanPlan { std::shared_ptr<const TableSchema> table; };
+struct SeqScanPlan {
+    std::shared_ptr<const TableSchema> table;
+    std::uint64_t relation_id = 0;
+    std::string relation_name = {};
+};
 // 首版内连接：输出布局固定为左输入列后接右输入列。
 struct NestedLoopJoinPlan {
     PlanPtr left;

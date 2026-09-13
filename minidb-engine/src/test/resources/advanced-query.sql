@@ -20,3 +20,11 @@ SELECT age FROM student GROUP BY age ORDER BY age DESC;
 SELECT name FROM student ORDER BY gpa ASC;
 SELECT name FROM student ORDER BY gpa DESC;
 SELECT name FROM student WHERE active = TRUE ORDER BY id ASC;
+
+CREATE TABLE employee(id INT, name VARCHAR, manager_id INT);
+INSERT INTO employee VALUES (1, 'CEO', 1);
+INSERT INTO employee VALUES (2, 'Developer', 1);
+INSERT INTO employee VALUES (3, 'Intern', 2);
+SELECT e.name AS employee_name, m.name manager_name
+FROM employee AS e JOIN employee m ON e.manager_id = m.id
+ORDER BY employee_name DESC;

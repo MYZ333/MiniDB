@@ -17,7 +17,7 @@ public final class AdvancedQueryEngineTest {
         List<DatabaseEngine.ExecutionResult> results =
             new DatabaseEngine().executeProgramJson(Files.readString(Path.of(args[0])));
 
-        check(results.size() == 16, "every statement must produce one result");
+        check(results.size() == 21, "every statement must produce one result");
         assertRows(results.get(11), List.of(
             List.of(1L, 95.0),
             List.of(2L, 91.0),
@@ -39,16 +39,23 @@ public final class AdvancedQueryEngineTest {
         assertRows(results.get(15), List.of(
             List.of("Alice"), List.of("Carol"), List.of("Dave")),
             "BOOL predicate and hidden INT sort key");
+        DatabaseEngine.QueryResult aliases = assertRows(results.get(20), List.of(
+            List.of("Intern", "Developer"),
+            List.of("Developer", "CEO"),
+            List.of("CEO", "CEO")), "self JOIN with table and ORDER BY aliases");
+        check(aliases.columns().equals(List.of("employee_name", "manager_name")),
+            "explicit and implicit column aliases must become output names");
 
         System.out.println("AdvancedQueryEngineTest passed");
     }
 
-    private static void assertRows(
+    private static DatabaseEngine.QueryResult assertRows(
         DatabaseEngine.ExecutionResult raw, List<List<Object>> expected, String label) {
         if (!(raw instanceof DatabaseEngine.QueryResult query))
             throw new AssertionError(label + ": expected query result");
         check(query.rows().equals(expected),
             label + ": expected " + expected + ", got " + query.rows());
+        return query;
     }
 
     private static void check(boolean condition, String message) {

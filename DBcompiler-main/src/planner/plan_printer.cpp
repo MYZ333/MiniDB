@@ -74,55 +74,67 @@ std::string tableName(const std::shared_ptr<const TableSchema>& table) {
     return table ? table->name + "#" + std::to_string(table->id.value) : "<missing-table>";
 }
 
-using Tables = std::vector<std::shared_ptr<const TableSchema>>;
+struct Relation {
+    std::shared_ptr<const TableSchema> table;
+    std::uint64_t id;
+    std::string name;
+};
+using Relations = std::vector<Relation>;
 
-void addTable(Tables& tables, const std::shared_ptr<const TableSchema>& table) {
+void addRelation(Relations& relations, const std::shared_ptr<const TableSchema>& table,
+                 std::uint64_t id, std::string name) {
     if (!table) return;
-    for (const auto& present : tables) if (present->id.value == table->id.value) return;
-    tables.push_back(table);
+    for (const auto& present : relations) if (present.id == id) return;
+    relations.push_back({table, id, name.empty() ? table->name : std::move(name)});
 }
 
 // 从计划自身收集模式，不回查 Catalog；JOIN 的左右两棵子树都要遍历。
-void collectTables(const PlanPtr& plan, Tables& tables, std::size_t depth = 0) {
+void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t depth = 0) {
     if (!plan || depth >= 256) return;
     std::visit([&](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
-            collectTables(op.left, tables, depth + 1);
-            collectTables(op.right, tables, depth + 1);
+            collectRelations(op.left, relations, depth + 1);
+            collectRelations(op.right, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, FilterPlan> ||
                              std::is_same_v<T, GroupByPlan> ||
                              std::is_same_v<T, SortPlan> ||
                              std::is_same_v<T, ProjectPlan>) {
-            collectTables(op.input, tables, depth + 1);
-        } else if constexpr (!std::is_same_v<T, CreateTablePlan>) addTable(tables, op.table);
+            collectRelations(op.input, relations, depth + 1);
+        } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
+            addRelation(relations, op.table, op.relation_id, op.relation_name);
+        } else if constexpr (!std::is_same_v<T, CreateTablePlan>) {
+            addRelation(relations, op.table, 0, op.table ? op.table->name : std::string{});
+        }
     }, plan->node);
 }
 
-std::string columnName(const BoundColumnRef& ref, const Tables& tables) {
-    for (const auto& table : tables) {
-        if (ref.table_id.value == table->id.value && ref.ordinal < table->columns.size() &&
+std::string columnName(const BoundColumnRef& ref, const Relations& relations) {
+    for (const auto& relation : relations) {
+        const auto& table = relation.table;
+        if (ref.relation_id == relation.id && ref.table_id.value == table->id.value &&
+            ref.ordinal < table->columns.size() &&
             ref.column_id.value == table->columns[ref.ordinal].id.value) {
-            return table->name + "." + table->columns[ref.ordinal].name;
+            return relation.name + "." + table->columns[ref.ordinal].name;
         }
     }
     return "table#" + std::to_string(ref.table_id.value) + ".column#" + std::to_string(ref.column_id.value);
 }
 
-std::string expression(const BoundExprPtr& expr, const Tables& tables,
+std::string expression(const BoundExprPtr& expr, const Relations& relations,
                        std::size_t depth = 0) {
     if (!expr) return "<missing-expression>";
     if (depth >= 256) return "<depth-limit>";
     return std::visit([&](const auto& node) -> std::string {
         using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, BoundColumnRef>) return columnName(node, tables);
+        if constexpr (std::is_same_v<T, BoundColumnRef>) return columnName(node, relations);
         else if constexpr (std::is_same_v<T, BoundLiteral>) return literal(node.value);
         else if constexpr (std::is_same_v<T, BoundUnary>)
             return std::string("(") + (node.op == UnaryOp::Not ? "NOT " : "-") +
-                   expression(node.operand, tables, depth + 1) + ")";
+                   expression(node.operand, relations, depth + 1) + ")";
         else
-            return "(" + expression(node.left, tables, depth + 1) + " " + opName(node.op) + " " +
-                   expression(node.right, tables, depth + 1) + ")";
+            return "(" + expression(node.left, relations, depth + 1) + " " + opName(node.op) + " " +
+                   expression(node.right, relations, depth + 1) + ")";
     }, expr->node);
 }
 
@@ -130,8 +142,8 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
     out << std::string(depth * 2, ' ');
     if (!plan) { out << "<missing-plan>\n"; return; }
     if (depth >= 256) { out << "<depth-limit>\n"; return; }
-    Tables tables;
-    collectTables(plan, tables);
+    Relations relations;
+    collectRelations(plan, relations);
     PlanPtr input;
     PlanPtr left;
     PlanPtr right;
@@ -152,39 +164,41 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
             out << ')';
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             out << "SeqScan[" << tableName(op.table);
+            if (op.table && !op.relation_name.empty() && op.relation_name != op.table->name)
+                out << " AS " << op.relation_name;
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             left = op.left;
             right = op.right;
-            out << "NestedLoopJoin[" << expression(op.predicate, tables);
+            out << "NestedLoopJoin[" << expression(op.predicate, relations);
         } else {
             input = op.input;
             if constexpr (std::is_same_v<T, FilterPlan>) {
-                out << "Filter[" << expression(op.predicate, tables);
+                out << "Filter[" << expression(op.predicate, relations);
             } else if constexpr (std::is_same_v<T, GroupByPlan>) {
                 out << "GroupBy[";
                 for (std::size_t i = 0; i < op.keys.size(); ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.keys[i], tables);
+                    out << columnName(op.keys[i], relations);
                 }
             } else if constexpr (std::is_same_v<T, SortPlan>) {
                 out << "Sort[";
                 for (std::size_t i = 0; i < op.items.size(); ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.items[i].column, tables) << ' '
+                    out << columnName(op.items[i].column, relations) << ' '
                         << (op.items[i].direction == SortDirection::Asc ? "ASC" : "DESC");
                 }
             } else if constexpr (std::is_same_v<T, ProjectPlan>) {
                 out << "Project[";
                 for (std::size_t i = 0; i < op.columns.size(); ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.columns[i], tables);
+                    out << columnName(op.columns[i], relations);
                 }
             } else if constexpr (std::is_same_v<T, UpdatePlan>) {
                 out << "Update[" << tableName(op.table) << "; ";
                 for (std::size_t i = 0; i < op.assignments.size(); ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.assignments[i].target, tables) << " = "
-                        << expression(op.assignments[i].value, tables);
+                    out << columnName(op.assignments[i].target, relations) << " = "
+                        << expression(op.assignments[i].value, relations);
                 }
                 out << "; values=old-row";
             } else {

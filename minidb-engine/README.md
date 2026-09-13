@@ -4,6 +4,10 @@
 CREATE、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是存储系统
 完成前的替身；后续 Java 页式存储只需实现 `RecordStore`。
 
+执行器支持 `INT/FLOAT/VARCHAR/BOOL` 和可存储的 `NULL`，并能执行 SeqScan、
+NestedLoopJoin、Filter、GroupBy、Sort、Project。当前 GroupBy 按键去重，尚不计算聚合函数。
+内部算子通过带列身份的 `PlanRow` 传行，因此 JOIN 后仍按 `tableId + columnId` 精确取列。
+
 构建 Java 引擎：
 
 ```powershell
@@ -22,6 +26,14 @@ Get-Content demo.sql | .\build\minisql_plan_json | java -jar .\minidb-engine\tar
 mvn '-Dmaven.repo.local=target/maven-repo' test-compile
 java -ea -cp "target/classes;target/test-classes" minidb.EngineTest
 ```
+
+高级算子的跨语言回归需从仓库根目录运行：
+
+```bash
+bash scripts/check_advanced_execution.sh
+```
+
+实现讲解见 [高级查询执行器](docs/advanced-query-execution.md)。
 
 ## Web 演示台
 

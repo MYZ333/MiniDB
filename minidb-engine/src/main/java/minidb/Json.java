@@ -113,9 +113,34 @@ final class Json {
         int digits = position;
         while (position < text.length() && Character.isDigit(text.charAt(position))) position++;
         if (digits == position) throw error("invalid JSON value");
-        if (position < text.length() && (text.charAt(position) == '.' || text.charAt(position) == 'e' || text.charAt(position) == 'E'))
-            throw error("MiniDB plan JSON accepts integer numbers only");
-        try { return Long.parseLong(text.substring(start, position)); } catch (NumberFormatException ex) { throw error("integer out of range"); }
+        boolean floating = false;
+        if (consume('.')) {
+            floating = true;
+            int fraction = position;
+            while (position < text.length() && Character.isDigit(text.charAt(position))) position++;
+            if (fraction == position) throw error("invalid JSON number");
+        }
+        if (position < text.length()
+            && (text.charAt(position) == 'e' || text.charAt(position) == 'E')) {
+            floating = true;
+            position++;
+            if (position < text.length()
+                && (text.charAt(position) == '+' || text.charAt(position) == '-')) position++;
+            int exponent = position;
+            while (position < text.length() && Character.isDigit(text.charAt(position))) position++;
+            if (exponent == position) throw error("invalid JSON exponent");
+        }
+        String encoded = text.substring(start, position);
+        try {
+            if (!floating) return Long.parseLong(encoded);
+            double parsed = Double.parseDouble(encoded);
+            if (!Double.isFinite(parsed))
+                throw error("floating-point number is out of range");
+            return parsed;
+        } catch (NumberFormatException ex) {
+            throw error(floating
+                ? "floating-point number is out of range" : "integer out of range");
+        }
     }
     private Object keyword(String word, Object value) {
         if (!text.startsWith(word, position)) throw error("invalid JSON value"); position += word.length(); return value;

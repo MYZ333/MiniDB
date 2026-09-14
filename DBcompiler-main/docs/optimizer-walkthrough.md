@@ -4,6 +4,8 @@
 入口是 `optimizePlan(const LogicalPlan&)`，放在 buildPlan 之后。A version2 另有
 展示用 optimizeAstStatements，详见 A version2 合并说明；正式编译仍使用本章的
 绑定后计划优化。新增产品模块与测试辅助模块均有中文注释。
+需要用 SQL、前后计划和实际行数量化展示效果时，可直接阅读
+[规则优化效果演示](optimizer-demo.md)。
 
 ## 1. 按什么顺序读代码
 

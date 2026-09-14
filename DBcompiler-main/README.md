@@ -31,6 +31,7 @@ DBcompiler/
 │   ├── remaining-features-walkthrough.md # A 扩展在 B/JSON/Java 中的完整数据流
 │   ├── explain-analyze-walkthrough.md # EXPLAIN 包装、采样与演示讲解
 │   ├── optimizer-walkthrough.md # 安全常量计算、树改写与等价性验证讲解
+│   ├── optimizer-demo.md       # 优化 SQL、前后计划、运行统计与量化效果
 │   ├── json-plan-protocol.md # C++ 到 Java 的 JSON 计划字段约定
 │   └── a-merge-notes.md      # A 来源、兼容修复、测试结果与阅读顺序
 ├── include/minisql/           # 跨模块公共头文件
@@ -210,7 +211,8 @@ CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
    EXPLAIN 按 ExplainStmt → BoundExplain → ExplainPlan → Profiler 阅读
    [EXPLAIN ANALYZE 实现讲解](docs/explain-analyze-walkthrough.md)。
    优化部分按 constant_fold → optimizeNode → predicate_pushdown → empty_result → column_pruning 阅读
-   [优化代码讲解](docs/optimizer-walkthrough.md)。
+   [优化代码讲解](docs/optimizer-walkthrough.md)，再用
+   [优化效果演示](docs/optimizer-demo.md)中的 SQL 和 EXPLAIN ANALYZE 结果准备答辩。
 4. 新增功能时在所属 tests 目录增加行为测试，显式更新 CMake；若新增源文件，
    同步 scripts/check.sh 的构建清单。
 5. scaffold_smoke 已升级为真实 SQL 联调。语法、类型或计划规则变更应同时覆盖

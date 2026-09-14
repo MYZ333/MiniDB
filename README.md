@@ -125,7 +125,9 @@ FLOAT、BOOL、NULL、五类聚合、HAVING、DISTINCT、分页、LIKE、DDL 约
 
 聚合代码的阅读顺序和答辩示例见 [聚合实现讲解](DBcompiler-main/docs/aggregate-walkthrough.md)。
 EXPLAIN 的包装结构、采样点和演示脚本见 [EXPLAIN ANALYZE 实现讲解](DBcompiler-main/docs/explain-analyze-walkthrough.md)。
-谓词下推的语义边界和列依赖传播见 [规则优化代码讲解](DBcompiler-main/docs/optimizer-walkthrough.md)。
+谓词下推的语义边界和列依赖传播见 [规则优化代码讲解](DBcompiler-main/docs/optimizer-walkthrough.md)；
+可直接用于答辩的 SQL、前后计划和量化结果见
+[规则优化效果演示](DBcompiler-main/docs/optimizer-demo.md)。
 
 ## 后续工作
 

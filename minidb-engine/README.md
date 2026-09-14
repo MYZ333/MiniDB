@@ -48,7 +48,8 @@ bash scripts/check_advanced_execution.sh
 EXPLAIN 的运行时采样与副作用边界见
 [EXPLAIN ANALYZE 实现讲解](../DBcompiler-main/docs/explain-analyze-walkthrough.md)。
 扫描列契约、谓词下推和列裁剪数据流见
-[规则优化代码讲解](../DBcompiler-main/docs/optimizer-walkthrough.md)。
+[规则优化代码讲解](../DBcompiler-main/docs/optimizer-walkthrough.md)，具体 SQL、运行行数和
+优化前后对比见[规则优化效果演示](../DBcompiler-main/docs/optimizer-demo.md)。
 
 ## Web 演示台
 

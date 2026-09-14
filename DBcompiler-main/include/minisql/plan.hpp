@@ -81,11 +81,15 @@ struct DeletePlan {
     std::shared_ptr<const TableSchema> table;
     PlanPtr input; // 必须携带行标识，不能通过业务值猜测是哪一条记录。
 };
+struct ExplainPlan {
+    PlanPtr input; // 被解释的优化后计划；普通 EXPLAIN 不执行它。
+    bool analyze = false;
+};
 
 struct PlanNode {
     std::variant<CreateTablePlan, DropTablePlan, InsertPlan, SeqScanPlan, NestedLoopJoinPlan,
                  FilterPlan, GroupByPlan, AggregatePlan, SortPlan, ProjectPlan,
-                 UpdatePlan, DeletePlan> node;
+                 UpdatePlan, DeletePlan, ExplainPlan> node;
     std::vector<OutputColumn> output; // 有序业务列；修改类根节点为空。
     bool carries_row_id = false; // 内部行标识不占用 output 的业务列。
 };

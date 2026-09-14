@@ -119,6 +119,18 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
         if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, DropTablePlan> ||
                       std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan>) {
             return plan; // DDL、字面量 INSERT 和扫描没有可折叠的子表达式。
+        } else if constexpr (std::is_same_v<T, ExplainPlan>) {
+            if (plan->carries_row_id || plan->output.size() != 1 ||
+                plan->output[0].name != "QUERY PLAN" ||
+                plan->output[0].type != DataType::Varchar)
+                return invalid("EXPLAIN output must be one VARCHAR column without RowId");
+            if (op.input && std::holds_alternative<ExplainPlan>(op.input->node))
+                return invalid("nested EXPLAIN is not supported");
+            auto child = optimizeNode(op.input, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&child)) return *error;
+            auto input = std::get<PlanPtr>(std::move(child));
+            if (input == op.input) return plan;
+            return replace(plan, ExplainPlan{std::move(input), op.analyze});
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             auto left_result = optimizeNode(op.left, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;

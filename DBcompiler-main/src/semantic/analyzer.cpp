@@ -1,5 +1,6 @@
 // B：将 AST 的名称解析为具体表列，并为每个表达式推导类型。
-// 六类语句共享名字解析、表达式类型规则和布尔子句检查。
+// 六类基础语句共享名字解析、表达式类型规则和布尔子句检查；
+// EXPLAIN 复用完整基础绑定结果。
 #include "minisql/compiler.hpp"
 #include "type_rules.hpp"
 
@@ -250,6 +251,17 @@ private:
             names.push_back(std::move(name));
         }
         return success(BoundDropTable{std::move(names), stmt.if_exists});
+    }
+
+    Result<BoundStatement> bindStatement(const ExplainStmt& stmt) {
+        // EXPLAIN 不放宽目标 SQL 的语义规则；先完整绑定，再加上解释属性。
+        auto target = std::visit([this](const auto& node) {
+            return bindStatement(node);
+        }, stmt.target);
+        if (const auto* failure = std::get_if<Diagnostic>(&target)) return *failure;
+        auto bound = std::make_shared<const BoundStatement>(
+            std::get<BoundStatement>(std::move(target)));
+        return success(BoundExplain{std::move(bound), stmt.analyze});
     }
 
     Result<BoundStatement> bindStatement(const InsertStmt& stmt) {

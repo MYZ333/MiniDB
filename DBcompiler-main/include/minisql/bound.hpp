@@ -124,10 +124,18 @@ struct BoundDelete {
     BoundExprPtr where;
 };
 
+struct BoundStatement;
+
+struct BoundExplain {
+    // 使用只读指针保存完整目标语句，使其 CatalogVersion 和绑定结果都不可被包装层篡改。
+    std::shared_ptr<const BoundStatement> target;
+    bool analyze = false;
+};
+
 struct BoundStatement {
     CatalogVersion catalog_version;
     std::variant<BoundCreateTable, BoundDropTable, BoundInsert, BoundSelect,
-                 BoundUpdate, BoundDelete> node;
+                 BoundUpdate, BoundDelete, BoundExplain> node;
 };
 
 } // namespace minisql

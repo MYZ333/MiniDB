@@ -35,6 +35,7 @@ TokenKind keywordOrIdentifier(const std::string& lexeme) {
         {"distinct", TokenKind::Distinct},
         {"from", TokenKind::From}, {"where", TokenKind::Where},
         {"having", TokenKind::Having},
+        {"explain", TokenKind::Explain}, {"analyze", TokenKind::Analyze},
         {"update", TokenKind::Update}, {"set", TokenKind::Set},
         {"delete", TokenKind::Delete}, {"join", TokenKind::Join},
         {"inner", TokenKind::Inner}, {"left", TokenKind::Left},

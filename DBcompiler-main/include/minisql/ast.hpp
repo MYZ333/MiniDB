@@ -134,8 +134,18 @@ struct DeleteStmt {
     std::optional<Identifier> table_alias = {}; // DELETE 目标表别名；声明后限定列应使用别名。
 };
 
+// EXPLAIN 只包裹一条基础语句，禁止继续嵌套 EXPLAIN，避免产生含糊的执行语义。
+using ExplainTarget = std::variant<CreateTableStmt, DropTableStmt, InsertStmt, SelectStmt,
+                                   UpdateStmt, DeleteStmt>;
+
+struct ExplainStmt {
+    ExplainTarget target;
+    bool analyze = false; // true 时执行目标计划并收集每个算子的实际行数和耗时。
+};
+
 struct Statement {
-    std::variant<CreateTableStmt, DropTableStmt, InsertStmt, SelectStmt, UpdateStmt, DeleteStmt> node;
+    std::variant<CreateTableStmt, DropTableStmt, InsertStmt, SelectStmt, UpdateStmt, DeleteStmt,
+                 ExplainStmt> node;
     SourceLocation span;
 };
 

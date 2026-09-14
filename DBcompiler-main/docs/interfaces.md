@@ -1,6 +1,6 @@
-# 模块接口契约 0.12
+# 模块接口契约 0.13
 
-本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、六类语句语义分析、
+本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、六类基础语句与 EXPLAIN 语义分析、
 逻辑计划生成、规则优化和文本打印已实现；A version2 的扩展 lex/parse 与 AST 展示优化已合入。
 本仓库通过 `app/plan_json.cpp` 把计划交给相邻 Java 引擎，具体协议见 json-plan-protocol.md。
 
@@ -53,7 +53,8 @@ NOT/负号/括号的递归嵌套最多 256 层，生成 AST 的单条路径最�
 
 ## A → B：AST
 
-`ast.hpp` 定义 CreateTableStmt、DropTableStmt、InsertStmt、SelectStmt、UpdateStmt、DeleteStmt。
+`ast.hpp` 定义 CreateTableStmt、DropTableStmt、InsertStmt、SelectStmt、UpdateStmt、DeleteStmt
+和 ExplainStmt。ExplainTarget 只允许前六类基础语句，所以语法层不能嵌套 EXPLAIN。
 Statement 保存整条语句范围；Identifier 保存原始拼写及精确范围。
 一元/二元表达式另存运算符范围，便于把类型错误定位到操作符。
 
@@ -130,8 +131,8 @@ std::string formatPlan(const LogicalPlan&); // 声明于 plan_printer.hpp。
 
 Result 为 `variant<T, Diagnostic>`，错误时不返回半成品；使用 `get_if` 或
 `holds_alternative` 检查结果。首版每条语句仅报告首个语义错误。
-NotImplemented 保留为后续开发状态错误码，当前六类语句的四个入口不再返回占位结果。
-六类语句的 analyze/buildPlan 均返回真实结果或诊断；表达式支持 INT/FLOAT 同类型
+NotImplemented 保留为后续开发状态错误码，当前基础语句及 EXPLAIN 的四个入口不再返回占位结果。
+各类语句的 analyze/buildPlan 均返回真实结果或诊断；表达式支持 INT/FLOAT 同类型
 算术与比较、VARCHAR/BOOL 判等、LIKE、空值判定以及 AND/OR/NOT。
 Diagnostic 包含阶段、稳定错误码、可读消息、SourceSpan。
 范围按字节、从 1 开始的行列、左闭右开定义；未知范围用 optional 表示，
@@ -177,6 +178,7 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 | SelectStmt（含聚合） | 分组键、聚合项、最终输出名、聚合后排序 | Aggregate → [Filter] → {NestedLoopJoin} → SeqScan |
 | UpdateStmt | 目标列、已定型 RHS、可选 BOOL 条件 | Update → [Filter] → SeqScan |
 | DeleteStmt | 表模式、可选 BOOL 条件 | Delete → [Filter] → SeqScan |
+| ExplainStmt | 已绑定目标语句、analyze 标志 | Explain → 目标根计划 |
 
 PlanNode 的 output 是有序业务列模式，carries_row_id 是内部行标识属性。
 SeqScan 第一阶段输出全表列，并携带 relation_id/relation_name；Filter 保留子节点的模式和行标识。
@@ -195,6 +197,8 @@ RowId 的具体存储格式留给执行/存储层，B 只声明是否需要传�
 
 执行结果约定：SELECT 返回按 output 排列的记录；CREATE/DROP 返回成功状态；
 INSERT/UPDATE/DELETE 返回影响行数（不作为 PlanNode.output 的业务列）。
+普通 EXPLAIN 返回单列 `QUERY PLAN` 文本树且不调用目标计划；EXPLAIN ANALYZE
+先执行目标计划，再在各行附加 actual rows/time/loops。其中 time 是包含子算子的累计墙钟时间。
 INSERT 可多行；UPDATE/DELETE 按唯一行标识定位目标记录。
 UPDATE 全部 RHS 在写入前求值，例如 SET a=b,b=a 交换旧值。
 BoundUpdate/UpdatePlan 中每个 RHS 都是对原表列的引用；生成器不会把前一个赋值
@@ -224,7 +228,8 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
   TRUE AND x、FALSE OR x、x AND TRUE、x OR FALSE 可替换为 x。
   x AND FALSE、x OR TRUE 保留左侧求值，避免吞掉错误；不重排谓词。
 - Filter 的条件折叠为 TRUE 后用输入节点替换；FALSE Filter 保留。优化器递归穿过
-  GroupBy/Aggregate/Sort，并折叠 NestedLoopJoin 的 ON 表达式，但不删除恒真 JOIN 或改变连接顺序。
+  GroupBy/Aggregate/Sort 和 Explain 的目标计划，并折叠 NestedLoopJoin 的 ON 表达式，
+  但不删除恒真 JOIN 或改变连接顺序。
   不删除 Update/Delete 根，不进行列裁剪、索引选择或代价优化。
 
 入口附加检查空节点、访问路径深度（最多 256 层）、Filter 的 BOOL 条件及输出/RowId
@@ -238,7 +243,8 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
 后续以两空格缩进表示父子关系，每个节点显示参数、output 和 row_id。
 列名从计划自带模式读取，不访问 Catalog；表达式使用括号保留结构。
 字符串引号翻倍，换行/制表符/反斜杠显示为转义文本。
-该格式用于阅读和测试，不是 SQL 源码或可反序列化协议；也不是 SQL EXPLAIN 语法支持。
+该格式用于 C++ 阅读和测试，不是 SQL 源码或可反序列化协议。SQL EXPLAIN
+最终面向用户的 `QUERY PLAN` 文本由 Java 执行层从同一 JSON 计划树生成，ANALYZE 统计也只能在该层填充。
 
 ## 示例及限制
 
@@ -272,7 +278,7 @@ AggregatePlan 保存 group_keys/items/order_by/having/input 以及 distinct/limi
 HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
 重复输入行。其 output 保存最终名字和类型，carries_row_id=false。优化器可优化其输入，
 但不能因输入为空而删掉全表 Aggregate：全表空输入仍须输出 COUNT=0 的一行。
-详细类型、NULL、空输入和支持范围以 grammar.md 0.23 为准；JSON 字段见 json-plan-protocol.md。
+详细类型、NULL、空输入和支持范围以 grammar.md 0.24 为准；JSON 字段见 json-plan-protocol.md。
 
 ## 维护责任
 
@@ -303,3 +309,5 @@ HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter �
   UPDATE/DELETE 别名通过单表作用域绑定且 relation_id=0；未实现的 AST 标记显式返回 UnsupportedFeature。
 - 0.12：完成上述 A 扩展的 B 侧实现。Bound/Plan/JSON 保存 SELECT/HAVING/ORDER 表达式、
   DISTINCT/分页、外连接类型、约束元数据、多行 INSERT 和 DROP；Java 引擎实现执行与写入原子检查。
+- 0.13：新增 ExplainStmt/BoundExplain/ExplainPlan 端到端契约。普通 EXPLAIN 仅展示优化计划；
+  ANALYZE 通过 Java 统一分派点执行目标并采集 actual rows、包含子树的 time 和 loops。

@@ -101,5 +101,16 @@ int main() {
                   std::get<std::int64_t>(std::get<LiteralExpr>(order.expression->node).value) == 18,
               "ORDER BY expression was not folded");
     });
+    suite.run("AST optimizer traverses an EXPLAIN target", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "EXPLAIN ANALYZE SELECT id FROM t WHERE TRUE AND id>10+8;"));
+        const auto& explain = std::get<ExplainStmt>(after.node);
+        const auto& select = std::get<SelectStmt>(explain.target);
+        const auto& comparison = std::get<BinaryExpr>(select.where->node);
+        check(explain.analyze && comparison.op == BinaryOp::Greater &&
+              std::get<std::int64_t>(
+                  std::get<LiteralExpr>(comparison.right->node).value) == 18,
+              "EXPLAIN target expression was not optimized");
+    });
     return suite.finish();
 }

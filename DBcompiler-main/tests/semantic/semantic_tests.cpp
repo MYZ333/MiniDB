@@ -560,5 +560,17 @@ int main() {
         auto e = failure(f.analyzeNode(UpdateStmt{id("student"), {{id("age"), nullptr, span(20, 6)}}, nullptr}), ErrorCode::InvalidAst);
         check(e.span->begin.offset == 20, "null RHS must use assignment range");
     });
+    suite.run("EXPLAIN preserves target binding and ANALYZE mode", [] {
+        Fixture f;
+        ExplainStmt explain{SelectStmt{id("student"), std::vector<Identifier>{id("name")},
+            bin(BinaryOp::Greater, col("age"), num(18))}, true};
+        const auto bound = value(f.analyzeNode(std::move(explain)));
+        const auto& wrapper = std::get<BoundExplain>(bound.node);
+        check(wrapper.analyze && wrapper.target &&
+              std::holds_alternative<BoundSelect>(wrapper.target->node),
+              "EXPLAIN target did not pass through semantic analysis");
+        ExplainStmt missing{SelectStmt{id("missing"), AllColumns{}, nullptr}, false};
+        failure(f.analyzeNode(std::move(missing)), ErrorCode::TableNotFound);
+    });
     return suite.finish();
 }

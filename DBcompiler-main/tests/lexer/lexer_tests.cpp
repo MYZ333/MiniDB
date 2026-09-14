@@ -102,6 +102,9 @@ void testExtendedTokens() {
         for (const auto& token : tokens) found = found || token.kind == kind;
         require(found, "extended token kind missing");
     }
+    const auto explain = lexOk("EXPLAIN ANALYZE SELECT * FROM metrics;");
+    require(explain[0].kind == TokenKind::Explain && explain[1].kind == TokenKind::Analyze,
+            "EXPLAIN ANALYZE keywords are missing");
 }
 
 void testErrors() {

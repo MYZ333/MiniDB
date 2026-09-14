@@ -1,4 +1,4 @@
-# MiniSQL 文法（接口版本 0.23）
+# MiniSQL 文法（接口版本 0.24）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 已整合 feature-zhangbo 的语法扩展与 B 的聚合实现。下列 EBNF 描述 A 能解析的范围，
@@ -18,7 +18,7 @@
   第一阶段不允许字符串跨行。字符串值保持大小写和 UTF-8 字节内容。
 - 跳过空白、`--` 行注释和不嵌套的 `/* ... */` 块注释。
 - 支持运算符 `= != <> < <= > >= + - * /`；不支持 `==`。
-- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、INNER/LEFT/RIGHT/FULL OUTER JOIN、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN 和 COUNT/SUM/AVG/MIN/MAX 关键字。
+- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、INNER/LEFT/RIGHT/FULL OUTER JOIN、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN、COUNT/SUM/AVG/MIN/MAX 以及 EXPLAIN/EXPLAIN ANALYZE 关键字。
 - INSERT 值位置不支持 `DEFAULT` 关键字；省略列时由 B 写入列 DEFAULT 或 NULL。
 - COUNT/SUM/AVG/MIN/MAX 由 A 识别为关键字，不能再作为未加引号的普通表名、列名或别名。
 - 每条语句必须以分号结束；空输入合法；单独的空分号不是语句。
@@ -31,7 +31,9 @@
 
 ```ebnf
 program     = { statement } ;
-statement   = (create | drop | insert | select | update | delete), ";" ;
+statement   = (explain | base_statement), ";" ;
+explain     = EXPLAIN, [ANALYZE], base_statement ;
+base_statement = create | drop | insert | select | update | delete ;
 create      = CREATE, TABLE, name, "(", column_def,
               { ",", column_def }, ")" ;
 column_def  = name, type, { column_constraint } ;
@@ -91,8 +93,8 @@ LiteralExpr；FLOAT_LITERAL 同样可带负号。整数在应用符号后检查�
 例如 `NOT age > 18` 为 `NOT (age > 18)`，`a < b < c` 是语法错误。
 这是对 PPT 第 16 页文法与优先级文字不一致的明确取舍。
 
-递归下降的 statement 分支分别以 CREATE / DROP / INSERT / SELECT / UPDATE /
-DELETE 开始；where 的 FIRST 为 WHERE；SELECT 中其后允许 GROUP/HAVING/ORDER/LIMIT 或分号。not_expr 的 FIRST
+递归下降的 statement 可以以 EXPLAIN 开始，base_statement 分支分别以 CREATE / DROP /
+INSERT / SELECT / UPDATE / DELETE 开始；where 的 FIRST 为 WHERE；SELECT 中其后允许 GROUP/HAVING/ORDER/LIMIT 或分号。not_expr 的 FIRST
 包括 NOT、负号、标识符、整数、浮点数、字符串、TRUE/FALSE、NULL 和左括号。
 SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY → LIMIT/OFFSET。
 
@@ -109,6 +111,7 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 | SELECT 计算表达式、聚合结果算术、ORDER BY 表达式 | 支持 | 支持 |
 | LIKE/NOT LIKE、VARCHAR(n)、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT | 支持 | 支持 |
 | 多行 INSERT、DROP TABLE（含 IF EXISTS 和多表名） | 支持 | 支持 |
+| EXPLAIN / EXPLAIN ANALYZE | 支持包裹六类基础语句 | 展示优化后计划；ANALYZE 额外执行并采样 |
 
 B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划再把它们传给 Java。
 因此 LIMIT 不会被忽略，外连接不会退化为内连接，多行 INSERT 和建表约束也不会丢失。
@@ -152,6 +155,10 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
   UNIQUE 允许多个 NULL。INSERT 与 UPDATE 在写入前针对最终表状态检查，失败不留下部分写入。
 - DROP TABLE 可带多个名字。无 IF EXISTS 时先验证全部表再删除；IF EXISTS 忽略缺失表。
   至少删除一张表时 CatalogVersion 只增加一次，存储中的记录随表删除。
+- EXPLAIN 将一条基础语句绑定并优化后包装为 ExplainPlan，返回单列 `QUERY PLAN`
+  文本树，不执行目标语句。EXPLAIN ANALYZE 执行相同的目标计划，并为每个算子
+  输出累计实际行数、包含子算子的耗时和调用次数。它对 INSERT/UPDATE/DELETE/CREATE/DROP
+  具有真实副作用；执行失败时返回原执行错误。EXPLAIN 不能嵌套 EXPLAIN。
 - WHERE/ON 必须为 BOOL；AND/OR 从左到右短路。优化不得吞掉可达的除零、溢出或其源码位置。
   整数除法向零截断。聚合 DISTINCT、COUNT(1)、聚合参数算术和嵌套调用仍不在 A 的文法中。
 
@@ -175,6 +182,8 @@ SELECT age, COUNT(*) AS rows, SUM(id)+1 FROM student
   GROUP BY age HAVING COUNT(*)>0 ORDER BY SUM(id) DESC LIMIT 10;
 SELECT DISTINCT s.name FROM student s LEFT JOIN student t ON s.id=t.id
   WHERE s.name LIKE 'A%' ORDER BY s.age+1;
+EXPLAIN SELECT name FROM student WHERE age >= 18 ORDER BY id;
+EXPLAIN ANALYZE SELECT age, COUNT(*) FROM student GROUP BY age;
 DELETE FROM student s WHERE s.id <> 1;
 DROP TABLE IF EXISTS student;
 ```
@@ -218,3 +227,5 @@ SELECT * FROM student OFFSET 2; -- OFFSET 当前必须跟在 LIMIT 后
 - 0.22：整合 A 0.7–0.21 与 B 聚合分支（原 B 文法 0.7）。统一新 SelectItem/聚合 AST，保留聚合执行，接通 IS NULL 与 DML 别名，显式拒绝仅解析扩展。
 - 0.23：B 完成 A 侧剩余扩展：计算/聚合表达式、表达式排序、HAVING、DISTINCT、LIMIT/OFFSET、
   LIKE、外连接、多行 INSERT、DROP TABLE，以及 VARCHAR 长度和列约束；同步扩展 JSON 与 Java 执行层。
+- 0.24：新增 EXPLAIN/EXPLAIN ANALYZE。AST、Bound 和 Plan 使用显式包装节点；Java 按真实
+  算子调用路径采集 actual rows/time/loops，并明确 ANALYZE 修改类语句的副作用。

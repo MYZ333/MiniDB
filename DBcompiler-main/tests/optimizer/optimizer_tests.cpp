@@ -329,5 +329,24 @@ int main() {
             SortPlan{{}, scan_plan}, scan_plan->output, false});
         failure(optimizePlan(LogicalPlan{1, sort}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
     });
+    suite.run("optimizer traverses the EXPLAIN target", [] {
+        Fixture f;
+        const auto before = f.compile(
+            "EXPLAIN ANALYZE SELECT name FROM student WHERE 1=1 AND age>10+8;");
+        const auto after = value(optimizePlan(before));
+        const auto& explain = std::get<ExplainPlan>(after.root->node);
+        const auto& project = std::get<ProjectPlan>(explain.input->node);
+        const auto& filter = std::get<FilterPlan>(project.input->node);
+        const auto& comparison = std::get<BoundBinary>(filter.predicate->node);
+        check(explain.analyze && comparison.op == BinaryOp::Greater &&
+              std::get<std::int64_t>(
+                  std::get<BoundLiteral>(comparison.right->node).value) == 18,
+              "EXPLAIN target was not optimized");
+        auto malformed = *after.root;
+        malformed.output[0].name = "wrong";
+        failure(optimizePlan(LogicalPlan{after.catalog_version,
+                    std::make_shared<const PlanNode>(std::move(malformed))}),
+                ErrorCode::InvalidPlan, DiagnosticStage::Plan);
+    });
     return suite.finish();
 }

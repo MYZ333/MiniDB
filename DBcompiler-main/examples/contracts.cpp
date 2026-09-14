@@ -116,6 +116,7 @@ void printOutline(const PlanNode& plan) {
             else if constexpr (std::is_same_v<T, ProjectPlan>) std::cout << "Project";
             else if constexpr (std::is_same_v<T, UpdatePlan>) std::cout << "Update";
             else if constexpr (std::is_same_v<T, DeletePlan>) std::cout << "Delete";
+            else if constexpr (std::is_same_v<T, ExplainPlan>) std::cout << "Explain";
             std::cout << " -> ";
             printOutline(*op.input);
         }

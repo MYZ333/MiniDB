@@ -386,10 +386,14 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
             }
             out << "],\"input\":";
             nodeJson(out, node.input, depth + 1);
-        } else {
+        } else if constexpr (std::is_same_v<T, DeletePlan>) {
             out << "\"type\":\"Delete\",\"table\":";
             tableJson(out, node.table);
             out << ",\"input\":";
+            nodeJson(out, node.input, depth + 1);
+        } else {
+            out << "\"type\":\"Explain\",\"analyze\":"
+                << (node.analyze ? "true" : "false") << ",\"input\":";
             nodeJson(out, node.input, depth + 1);
         }
     }, plan->node);
@@ -431,10 +435,18 @@ int main() {
         if (!first) std::cout << ',';
         std::cout << "{\"catalogVersion\":" << logical_plan.catalog_version << ",\"root\":" << root.str() << '}';
         first = false;
-        if (const auto* create = std::get_if<BoundCreateTable>(&std::get<BoundStatement>(bound).node)) {
+        const BoundStatement& bound_statement = std::get<BoundStatement>(bound);
+        // 编译脚本时模拟后续可见的 Catalog；只有 ANALYZE 才会执行被包装的 DDL。
+        const BoundStatement* effect = &bound_statement;
+        if (const auto* explain = std::get_if<BoundExplain>(&effect->node)) {
+            effect = explain->analyze ? explain->target.get() : nullptr;
+        }
+        if (effect && std::get_if<BoundCreateTable>(&effect->node)) {
+            const auto* create = std::get_if<BoundCreateTable>(&effect->node);
             auto registered = catalog.createTable(create->table_name, create->columns);
             if (const auto* error = std::get_if<Diagnostic>(&registered)) { printDiagnostic(*error); return 1; }
-        } else if (const auto* drop = std::get_if<BoundDropTable>(&std::get<BoundStatement>(bound).node)) {
+        } else if (effect && std::get_if<BoundDropTable>(&effect->node)) {
+            const auto* drop = std::get_if<BoundDropTable>(&effect->node);
             auto removed = catalog.dropTables(drop->table_names, drop->if_exists);
             if (const auto* error = std::get_if<Diagnostic>(&removed)) { printDiagnostic(*error); return 1; }
         }

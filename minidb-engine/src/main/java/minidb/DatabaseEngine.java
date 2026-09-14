@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -39,11 +40,30 @@ public final class DatabaseEngine {
     private record AggregateRow(
         List<Object> groupValues, List<Object> outputValues, List<PlanRow> sourceRows) { }
 
+    /** One runtime sample per concrete JSON plan-node object. Times are inclusive of children. */
+    private record ProfileMetric(long rows, long nanos, long loops) { }
+
+    private static final class Profiler {
+        private final IdentityHashMap<Map<String, Object>, ProfileMetric> metrics =
+            new IdentityHashMap<>();
+
+        void record(Map<String, Object> node, long rows, long nanos) {
+            ProfileMetric previous = metrics.get(node);
+            metrics.put(node, previous == null
+                ? new ProfileMetric(rows, nanos, 1)
+                : new ProfileMetric(previous.rows() + rows, previous.nanos() + nanos,
+                                    previous.loops() + 1));
+        }
+
+        ProfileMetric get(Map<String, Object> node) { return metrics.get(node); }
+    }
+
     private final RecordStore records;
     private final Map<Long, TableSchema> tablesById = new LinkedHashMap<>();
     private final Map<String, TableSchema> tablesByName = new LinkedHashMap<>();
     private long catalogVersion;
     private long nextTableId = 1;
+    private Profiler activeProfiler;
 
     public DatabaseEngine() { this(new InMemoryRecordStore()); }
     public DatabaseEngine(RecordStore records) { this.records = Objects.requireNonNull(records); }
@@ -67,6 +87,16 @@ public final class DatabaseEngine {
 
     private ExecutionResult executeNode(Map<String, Object> node) {
         String type = string(node.get("type"), "node type");
+        if (type.equals("Explain")) return explain(node);
+        if (activeProfiler == null) return executeNodeRaw(node, type);
+        long started = System.nanoTime();
+        ExecutionResult result = executeNodeRaw(node, type);
+        activeProfiler.record(node, resultRows(result), System.nanoTime() - started);
+        return result;
+    }
+
+    /** Runs a statement root without adding a second sample around the dispatch itself. */
+    private ExecutionResult executeNodeRaw(Map<String, Object> node, String type) {
         return switch (type) {
             case "CreateTable" -> createTable(node);
             case "DropTable" -> dropTable(node);
@@ -79,6 +109,257 @@ public final class DatabaseEngine {
                 throw new EngineException("InvalidPlan", type + " cannot be an execution root");
             default -> throw new EngineException("InvalidPlan", "unknown plan node: " + type);
         };
+    }
+
+    /** EXPLAIN is read-only; ANALYZE executes the same child plan while profiling it. */
+    private QueryResult explain(Map<String, Object> node) {
+        List<Object> output = list(node.get("output"), "EXPLAIN output");
+        Map<String, Object> outputColumn = output.size() == 1
+            ? map(output.get(0), "EXPLAIN output column") : Map.of();
+        if (output.size() != 1 || !"QUERY PLAN".equals(outputColumn.get("name")) ||
+            !"VARCHAR".equals(outputColumn.get("type")) ||
+            optionalBoolean(node.get("carriesRowId"), false))
+            throw new EngineException("InvalidPlan",
+                "EXPLAIN output must be one QUERY PLAN VARCHAR column without RowId");
+        Map<String, Object> input = map(node.get("input"), "EXPLAIN input");
+        boolean analyze = optionalBoolean(node.get("analyze"), false);
+        String rootType = string(input.get("type"), "EXPLAIN root type");
+        if (!List.of("CreateTable", "DropTable", "Insert", "Project", "Aggregate",
+                     "Update", "Delete").contains(rootType))
+            throw new EngineException("InvalidPlan",
+                rootType + " cannot be an EXPLAIN statement root");
+        // Build the outline first so malformed trees fail before ANALYZE can cause a side effect.
+        validateExplainTree(input, 0);
+        Profiler completed = null;
+        if (analyze) {
+            if (activeProfiler != null)
+                throw new EngineException("InvalidPlan", "nested EXPLAIN ANALYZE is not supported");
+            activeProfiler = new Profiler();
+            try {
+                executeNode(input);
+                completed = activeProfiler;
+            } finally {
+                activeProfiler = null;
+            }
+        }
+        List<String> lines = new ArrayList<>();
+        appendExplainLines(input, 0, completed, lines);
+        List<List<Object>> rows = new ArrayList<>();
+        for (String line : lines) rows.add(List.of(line));
+        return new QueryResult(List.of("QUERY PLAN"), List.copyOf(rows));
+    }
+
+    private long resultRows(ExecutionResult result) {
+        if (result instanceof QueryResult query) return query.rows().size();
+        return ((CommandResult) result).affectedRows();
+    }
+
+    /** Validates the display tree before ANALYZE starts and therefore before any mutation. */
+    private void validateExplainTree(Map<String, Object> node, int depth) {
+        if (depth >= 256)
+            throw new EngineException("InvalidPlan", "EXPLAIN plan exceeds 256 levels");
+        String type = string(node.get("type"), "EXPLAIN node type");
+        describeNode(node); // Also validates all attributes used by the presentation layer.
+        switch (type) {
+            case "NestedLoopJoin" -> {
+                validateExplainTree(map(node.get("left"), "join left input"), depth + 1);
+                validateExplainTree(map(node.get("right"), "join right input"), depth + 1);
+            }
+            case "Filter", "GroupBy", "Aggregate", "Sort", "Project", "Update", "Delete" ->
+                validateExplainTree(map(node.get("input"), type + " input"), depth + 1);
+            case "CreateTable", "DropTable", "Insert", "SeqScan" -> { }
+            default -> throw new EngineException("InvalidPlan",
+                "unknown EXPLAIN plan node: " + type);
+        }
+    }
+
+    /** Emits a deterministic pre-order tree so parent and child statistics are easy to compare. */
+    private void appendExplainLines(Map<String, Object> node, int depth,
+                                    Profiler profiler, List<String> lines) {
+        StringBuilder line = new StringBuilder("  ".repeat(depth)).append(describeNode(node));
+        if (profiler != null) {
+            ProfileMetric metric = profiler.get(node);
+            if (metric == null) line.append(" (never executed)");
+            else line.append(String.format(Locale.ROOT,
+                " (actual rows=%d time=%.3f ms loops=%d)", metric.rows(),
+                metric.nanos() / 1_000_000.0, metric.loops()));
+        }
+        lines.add(line.toString());
+        String type = string(node.get("type"), "EXPLAIN node type");
+        if (type.equals("NestedLoopJoin")) {
+            appendExplainLines(map(node.get("left"), "join left input"), depth + 1,
+                               profiler, lines);
+            appendExplainLines(map(node.get("right"), "join right input"), depth + 1,
+                               profiler, lines);
+        } else if (List.of("Filter", "GroupBy", "Aggregate", "Sort", "Project",
+                           "Update", "Delete").contains(type)) {
+            appendExplainLines(map(node.get("input"), type + " input"), depth + 1,
+                               profiler, lines);
+        }
+    }
+
+    private String describeNode(Map<String, Object> node) {
+        String type = string(node.get("type"), "EXPLAIN node type");
+        return switch (type) {
+            case "CreateTable" -> "CreateTable [" +
+                string(node.get("tableName"), "tableName") + "]";
+            case "DropTable" -> "DropTable [" + joinStrings(
+                list(node.get("tableNames"), "tableNames"), "table name") + "]";
+            case "Insert" -> {
+                Map<String, Object> table = map(node.get("table"), "insert table");
+                List<Object> rows = node.get("rows") instanceof List<?>
+                    ? list(node.get("rows"), "insert rows") : List.of();
+                yield "Insert [" + string(table.get("name"), "table name") +
+                    "; rows=" + (rows.isEmpty() ? 1 : rows.size()) + "]";
+            }
+            case "SeqScan" -> {
+                Map<String, Object> table = map(node.get("table"), "scan table");
+                String tableName = string(table.get("name"), "table name");
+                String relation = node.get("relationName") instanceof String
+                    ? string(node.get("relationName"), "relation name") : tableName;
+                yield "SeqScan [" + tableName +
+                    (relation.isEmpty() || relation.equals(tableName) ? "" : " AS " + relation) + "]";
+            }
+            case "NestedLoopJoin" -> "NestedLoopJoin [" +
+                (node.get("joinType") == null ? "INNER" :
+                    string(node.get("joinType"), "join type")) + "; " +
+                describeExpression(map(node.get("predicate"), "join predicate"), 0) + "]";
+            case "Filter" -> "Filter [" +
+                describeExpression(map(node.get("predicate"), "filter predicate"), 0) + "]";
+            case "GroupBy" -> "GroupBy [" + describeReferences(
+                list(node.get("keys"), "group keys"), "group key") + "]";
+            case "Aggregate" -> "Aggregate [group=" + describeReferences(
+                list(node.get("groupKeys"), "group keys"), "group key") +
+                "; output=" + describeOutput(node) + aggregateModifiers(node) + "]";
+            case "Sort" -> "Sort [" + describeSortItems(
+                list(node.get("items"), "sort items")) + "]";
+            case "Project" -> "Project [" + describeOutput(node) +
+                queryModifiers(node) + "]";
+            case "Update" -> "Update [" + string(
+                map(node.get("table"), "update table").get("name"), "table name") +
+                "; assignments=" + list(node.get("assignments"), "assignments").size() + "]";
+            case "Delete" -> "Delete [" + string(
+                map(node.get("table"), "delete table").get("name"), "table name") + "]";
+            default -> throw new EngineException("InvalidPlan",
+                "unknown EXPLAIN plan node: " + type);
+        };
+    }
+
+    private String describeOutput(Map<String, Object> node) {
+        List<String> names = new ArrayList<>();
+        for (Object raw : list(node.get("output"), "output"))
+            names.add(string(map(raw, "output column").get("name"), "output name"));
+        return String.join(", ", names);
+    }
+
+    private String queryModifiers(Map<String, Object> node) {
+        StringBuilder result = new StringBuilder();
+        if (optionalBoolean(node.get("distinct"), false)) result.append("; DISTINCT");
+        Long limit = nodeLong(node.get("limit"));
+        if (limit != null) result.append("; limit=").append(limit);
+        long offset = optionalLong(node.get("offset"), 0);
+        if (offset != 0) result.append("; offset=").append(offset);
+        return result.toString();
+    }
+
+    private String aggregateModifiers(Map<String, Object> node) {
+        StringBuilder result = new StringBuilder(queryModifiers(node));
+        if (node.get("having") instanceof Map<?, ?>)
+            result.append("; having=").append(describeExpression(
+                map(node.get("having"), "HAVING"), 0));
+        return result.toString();
+    }
+
+    private String describeSortItems(List<Object> values) {
+        List<String> items = new ArrayList<>();
+        for (Object raw : values) {
+            Map<String, Object> item = map(raw, "sort item");
+            String kind = item.get("kind") == null
+                ? "column" : string(item.get("kind"), "sort kind");
+            String key = kind.equals("column")
+                ? describeColumn(map(item.get("column"), "sort column"))
+                : describeExpression(map(item.get("expression"), "sort expression"), 0);
+            items.add(key + " " + string(item.get("direction"), "sort direction"));
+        }
+        return String.join(", ", items);
+    }
+
+    private String describeReferences(List<Object> values, String label) {
+        List<String> references = new ArrayList<>();
+        for (Object raw : values) references.add(describeColumn(map(raw, label)));
+        return references.isEmpty() ? "<all>" : String.join(", ", references);
+    }
+
+    private String describeColumn(Map<String, Object> reference) {
+        long tableId = longValue(reference.get("tableId"), "table id");
+        long columnId = longValue(reference.get("columnId"), "column id");
+        TableSchema table = tablesById.get(tableId);
+        if (table != null) {
+            for (ColumnSchema column : table.columns())
+                if (column.id() == columnId) return table.name() + "." + column.name();
+        }
+        return "table#" + tableId + ".column#" + columnId;
+    }
+
+    private String describeExpression(Map<String, Object> expression, int depth) {
+        if (depth >= 256)
+            throw new EngineException("InvalidPlan", "EXPLAIN expression exceeds 256 levels");
+        String kind = string(expression.get("kind"), "expression kind");
+        return switch (kind) {
+            case "column" -> describeColumn(map(expression.get("column"), "column"));
+            case "literal" -> displayLiteral(expression.get("value"));
+            case "aggregate" -> string(expression.get("function"), "aggregate function") +
+                "(" + (expression.get("argument") == null ? "*" : describeColumn(
+                    map(expression.get("argument"), "aggregate argument"))) + ")";
+            case "unary" -> describeUnary(expression, depth);
+            case "binary" -> "(" + describeExpression(
+                map(expression.get("left"), "left expression"), depth + 1) + " " +
+                displayBinary(string(expression.get("op"), "binary operator")) + " " +
+                describeExpression(map(expression.get("right"), "right expression"),
+                                   depth + 1) + ")";
+            default -> throw new EngineException("InvalidPlan",
+                "unknown expression kind in EXPLAIN: " + kind);
+        };
+    }
+
+    private String describeUnary(Map<String, Object> expression, int depth) {
+        String op = string(expression.get("op"), "unary operator");
+        String operand = describeExpression(map(expression.get("operand"), "unary operand"),
+                                            depth + 1);
+        return switch (op) {
+            case "Negate" -> "(-" + operand + ")";
+            case "Not" -> "(NOT " + operand + ")";
+            case "IsNull" -> "(" + operand + " IS NULL)";
+            case "IsNotNull" -> "(" + operand + " IS NOT NULL)";
+            default -> throw new EngineException("InvalidPlan",
+                "unknown unary operator in EXPLAIN: " + op);
+        };
+    }
+
+    private String displayBinary(String op) {
+        return switch (op) {
+            case "Add" -> "+"; case "Subtract" -> "-";
+            case "Multiply" -> "*"; case "Divide" -> "/";
+            case "Equal" -> "="; case "NotEqual" -> "!=";
+            case "Less" -> "<"; case "LessEqual" -> "<=";
+            case "Greater" -> ">"; case "GreaterEqual" -> ">=";
+            case "And" -> "AND"; case "Or" -> "OR"; case "Like" -> "LIKE";
+            default -> throw new EngineException("InvalidPlan",
+                "unknown binary operator in EXPLAIN: " + op);
+        };
+    }
+
+    private String displayLiteral(Object value) {
+        if (value == null) return "NULL";
+        if (value instanceof String text) return "'" + text.replace("'", "''") + "'";
+        if (value instanceof Boolean truth) return truth ? "TRUE" : "FALSE";
+        return String.valueOf(value);
+    }
+
+    private String joinStrings(List<Object> values, String label) {
+        List<String> result = new ArrayList<>();
+        for (Object value : values) result.add(string(value, label));
+        return String.join(", ", result);
     }
 
     private CommandResult createTable(Map<String, Object> node) {
@@ -476,7 +757,16 @@ public final class DatabaseEngine {
 
     /** Dispatches all relational operators allowed below a statement root. */
     private List<PlanRow> readInput(Map<String, Object> node) {
-        return switch (string(node.get("type"), "input type")) {
+        String type = string(node.get("type"), "input type");
+        if (activeProfiler == null) return readInputRaw(node, type);
+        long started = System.nanoTime();
+        List<PlanRow> result = readInputRaw(node, type);
+        activeProfiler.record(node, result.size(), System.nanoTime() - started);
+        return result;
+    }
+
+    private List<PlanRow> readInputRaw(Map<String, Object> node, String type) {
+        return switch (type) {
             case "SeqScan" -> scan(node);
             case "Filter" -> filter(node);
             case "NestedLoopJoin" -> nestedLoopJoin(node);

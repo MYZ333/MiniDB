@@ -3,6 +3,8 @@
 本模块不调用 C++ 对象。它只读取 `protocolVersion: 1` 的 JSON 执行计划，执行
 CREATE、DROP、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是存储系统
 完成前的替身；后续 Java 页式存储只需实现 `RecordStore`。
+引擎还支持 Explain 计划：普通模式返回算子树，ANALYZE 模式执行目标并采集实际行数、
+包含子算子的耗时和调用次数。
 
 执行器支持 `INT/FLOAT/VARCHAR/BOOL` 和可存储的 `NULL`，并能执行 SeqScan、
 NestedLoopJoin、Filter、GroupBy、Aggregate、Sort、Project。GroupBy 用于纯分组去重，
@@ -39,6 +41,8 @@ bash scripts/check_advanced_execution.sh
 ```
 
 实现讲解见 [高级查询执行器](docs/advanced-query-execution.md)。
+EXPLAIN 的运行时采样与副作用边界见
+[EXPLAIN ANALYZE 实现讲解](../DBcompiler-main/docs/explain-analyze-walkthrough.md)。
 
 ## Web 演示台
 

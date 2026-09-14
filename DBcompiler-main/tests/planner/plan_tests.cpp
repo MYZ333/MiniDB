@@ -379,5 +379,23 @@ int main() {
         check(formatPlan(insert).find("rows=(1, 'Tom''s\\n\\\\book', 20)") != std::string::npos, "string escaping mismatch");
         check(formatPlan(f.compile(DeleteStmt{id("student"), nullptr})).find("Delete[student#1] output=[] row_id=no\n") != std::string::npos, "DELETE print mismatch");
     });
+    suite.run("EXPLAIN wraps a complete target plan and exposes one text column", [] {
+        Fixture f;
+        ExplainStmt statement{SelectStmt{id("student"), std::vector<Identifier>{id("name")},
+            bin(BinaryOp::Greater, col("age"), num(18))}, true};
+        const auto plan = f.compile(std::move(statement));
+        const auto& explain = std::get<ExplainPlan>(plan.root->node);
+        check(explain.analyze && std::holds_alternative<ProjectPlan>(explain.input->node),
+              "EXPLAIN did not retain its query plan");
+        check(plan.root->output.size() == 1 && plan.root->output[0].name == "QUERY PLAN" &&
+              plan.root->output[0].type == DataType::Varchar,
+              "EXPLAIN output contract mismatch");
+        const auto printed = formatPlan(plan);
+        check(printed.find("Explain[ANALYZE] output=[QUERY PLAN:VARCHAR]") != std::string::npos &&
+              printed.find("  Project[student.name]") != std::string::npos,
+              "EXPLAIN printer omitted its wrapped tree");
+        failure(buildPlan(BoundStatement{plan.catalog_version, BoundExplain{nullptr, false}}),
+                ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
+    });
     return suite.finish();
 }

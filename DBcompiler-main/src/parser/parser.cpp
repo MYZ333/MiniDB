@@ -65,6 +65,8 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::From: return "FROM";
     case TokenKind::Where: return "WHERE";
     case TokenKind::Having: return "HAVING";
+    case TokenKind::Explain: return "EXPLAIN";
+    case TokenKind::Analyze: return "ANALYZE";
     case TokenKind::Update: return "UPDATE";
     case TokenKind::Set: return "SET";
     case TokenKind::Delete: return "DELETE";
@@ -351,24 +353,34 @@ private:
                           std::move(message), std::move(span)};
     }
 
+    // 基础语句不消费分号，EXPLAIN 因此能复用同一组完整的语法分支。
+    ExplainTarget baseStatement() {
+        if (match(TokenKind::Create)) {
+            return createStatement();
+        } else if (match(TokenKind::Drop)) {
+            return dropStatement();
+        } else if (match(TokenKind::Insert)) {
+            return insertStatement();
+        } else if (match(TokenKind::Select)) {
+            return selectStatement();
+        } else if (match(TokenKind::Update)) {
+            return updateStatement();
+        } else if (match(TokenKind::Delete)) {
+            return deleteStatement();
+        }
+        throw unexpected({"CREATE", "DROP", "INSERT", "SELECT", "UPDATE", "DELETE"});
+    }
+
     Statement statement() {
         depths_.clear(); // 只需保留正在解析语句的高度元数据。
         const SourceLocation start = locationOf(current());
         Statement result;
-        if (match(TokenKind::Create)) {
-            result.node = createStatement();
-        } else if (match(TokenKind::Drop)) {
-            result.node = dropStatement();
-        } else if (match(TokenKind::Insert)) {
-            result.node = insertStatement();
-        } else if (match(TokenKind::Select)) {
-            result.node = selectStatement();
-        } else if (match(TokenKind::Update)) {
-            result.node = updateStatement();
-        } else if (match(TokenKind::Delete)) {
-            result.node = deleteStatement();
+        if (match(TokenKind::Explain)) {
+            const bool analyze = match(TokenKind::Analyze);
+            result.node = ExplainStmt{baseStatement(), analyze};
         } else {
-            throw unexpected({"CREATE", "DROP", "INSERT", "SELECT", "UPDATE", "DELETE"});
+            auto base = baseStatement();
+            std::visit([&](auto node) { result.node = std::move(node); }, std::move(base));
         }
         const Token& semicolon = consume(TokenKind::Semicolon, "';'");
         result.span = merge(start, locationOf(semicolon));

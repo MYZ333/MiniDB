@@ -14,9 +14,10 @@
 
 每个计划执行前都必须比较 `catalogVersion`。同一输入中，导出器会在 CREATE/DROP 的计划
 导出后模拟 Catalog 变更，因此后续语句看到正确模式；Java 引擎必须采用相同的版本规则。
+`EXPLAIN ANALYZE` 包裹 CREATE/DROP 时也按实际执行处理该变更，普通 EXPLAIN 不改变 Catalog。
 
 节点类型为 `CreateTable`、`DropTable`、`Insert`、`SeqScan`、`NestedLoopJoin`、`Filter`、
-`GroupBy`、`Aggregate`、`Sort`、`Project`、`Update` 和 `Delete`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
+`GroupBy`、`Aggregate`、`Sort`、`Project`、`Update`、`Delete` 和 `Explain`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
 `relationId`、`ordinal`、`type`。表列还可含 `varcharLength`、`primaryKey`、`notNull`、
 `unique`、`defaultValue` 和 `hasDefault`；后一个字段用于区分“没有默认值”和 `DEFAULT NULL`。
 表达式以 `kind: column|literal|unary|binary|aggregate` 表示，运算名称与
@@ -34,10 +35,12 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
   并包含 `ASC`/`DESC` direction。
 - `Project` 可用 `expressions` 计算输出；空数组时沿用 `columns`。它还携带
   `distinct`、`limit` 和 `offset`，执行顺序为投影、去重、分页。
+- `Explain` 使用 `analyze: boolean` 和 `input: <statement-root>`。根节点的 output 固定为
+  `[ {"name":"QUERY PLAN","type":"VARCHAR"} ]`，`carriesRowId` 为 false。
 
 这些字段是协议 1 的向后兼容扩展：旧计划缺少 relationId 时，Java 引擎回退到 tableId。
 当前 Java 引擎已执行全部上述节点，并以 Project.output 或 Aggregate.output 中的名称展示列别名。
-旧引擎不能执行新增 Aggregate 节点；含聚合 SQL 需同步更新编译器和引擎。
+旧引擎不能执行新增 Aggregate/Explain 节点；含聚合或 EXPLAIN SQL 需同步更新编译器和引擎。
 
 `carriesRowId` 为 true 时，Java 存储适配层必须让扫描结果携带稳定 RowId；UPDATE
 和 DELETE 使用该 RowId 定位原记录，不能按业务列值猜测记录身份。
@@ -67,3 +70,18 @@ Unary 表达式的 op 新增 IsNull 和 IsNotNull。两者先求值 operand，�
 UPDATE/DELETE 的表别名在 B 绑定时消解，仍用 relationId=0 传递行身份。
 LIKE 使用 `BinaryOp::Like`，`%` 匹配任意 Unicode 码点序列，`_` 匹配一个码点。
 执行表达式以 JSON/Java null 表示 SQL UNKNOWN；筛选类算子只接受 TRUE。
+
+## Explain 根节点
+
+Java 引擎将 Explain.input 按前序遍历转换为单列文本树。普通 EXPLAIN 只读取节点属性，
+不调用任何目标算子。ANALYZE 模式下，目标根经过原 `executeNode`，关系子节点经过
+原 `readInput`，因此统计反映真实执行路径。每行统计形式为：
+
+```text
+Filter [(student.age > 18)] (actual rows=2 time=0.125 ms loops=1)
+```
+
+- `actual rows` 是该算子累计输出行数；修改根节点使用 affectedRows。
+- `time` 是累计墙钟毫秒，包含调用子算子的时间，保留三位小数。
+- `loops` 是该 JSON 节点对象的调用次数；当前物化子输入实现通常为 1。
+- ANALYZE 执行 DDL/DML 时保留副作用。目标报错时直接返回原 EngineException，不生成不完整报告。

@@ -32,6 +32,8 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::From: return "From";
     case TokenKind::Where: return "Where";
     case TokenKind::Having: return "Having";
+    case TokenKind::Explain: return "Explain";
+    case TokenKind::Analyze: return "Analyze";
     case TokenKind::Update: return "Update";
     case TokenKind::Set: return "Set";
     case TokenKind::Delete: return "Delete";
@@ -319,8 +321,8 @@ void printSelectItem(const SelectItem& item) {
     }, item);
 }
 
-void printStatement(const Statement& statement, int index) {
-    std::cout << "Statement " << index << '\n';
+void printStatement(const Statement& statement, int index, bool print_header = true) {
+    if (print_header) std::cout << "Statement " << index << '\n';
     std::visit([](const auto& stmt) {
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, CreateTableStmt>) {
@@ -466,6 +468,12 @@ void printStatement(const Statement& statement, int index) {
             if (stmt.table_alias) std::cout << " AS " << stmt.table_alias->text;
             std::cout << '\n';
             printWhere(stmt.where, 2);
+        } else if constexpr (std::is_same_v<T, ExplainStmt>) {
+            printIndent(1);
+            std::cout << (stmt.analyze ? "ExplainAnalyze\n" : "Explain\n");
+            std::visit([](const auto& target) {
+                printStatement(Statement{target, {}}, 0, false);
+            }, stmt.target);
         }
     }, statement.node);
 }

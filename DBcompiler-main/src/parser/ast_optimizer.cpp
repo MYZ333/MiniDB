@@ -196,6 +196,15 @@ Statement optimizeAstStatement(const Statement& statement) {
             result.node = std::move(copy);
         } else if constexpr (std::is_same_v<T, DropTableStmt>) {
             result.node = node;
+        } else if constexpr (std::is_same_v<T, ExplainStmt>) {
+            auto copy = node;
+            // 对目标语句使用同一 AST 优化入口，包装层只决定是否执行。
+            std::visit([&](const auto& target) {
+                const auto optimized = optimizeAstStatement(Statement{target, statement.span});
+                using Target = std::decay_t<decltype(target)>;
+                copy.target = std::get<Target>(optimized.node);
+            }, node.target);
+            result.node = std::move(copy);
         }
     }, statement.node);
     return result;

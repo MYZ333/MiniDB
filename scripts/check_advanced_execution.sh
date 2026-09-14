@@ -43,6 +43,9 @@ sources=(
 "$build_dir/minisql_plan_json" \
     < "$engine_dir/src/test/resources/constraint-update.sql" \
     > "$engine_dir/target/constraint-update-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/explain-analyze.sql" \
+    > "$engine_dir/target/explain-analyze-plan.json"
 
 mvn -q -f "$engine_dir/pom.xml" test-compile
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" minidb.EngineTest
@@ -56,3 +59,5 @@ java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     "$engine_dir/target/remaining-features-plan.json" \
     "$engine_dir/target/constraint-unique-plan.json" \
     "$engine_dir/target/constraint-update-plan.json"
+java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
+    minidb.ExplainAnalyzeEngineTest "$engine_dir/target/explain-analyze-plan.json"

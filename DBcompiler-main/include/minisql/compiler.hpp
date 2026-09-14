@@ -1,6 +1,6 @@
 #pragma once
 
-// B 的公共入口。CREATE/DROP/INSERT/SELECT/UPDATE/DELETE 均生成真实绑定和计划。
+// B 的公共入口。DDL/DML/SELECT 及 EXPLAIN [ANALYZE] 均生成真实绑定和计划。
 #include "minisql/ast.hpp"
 #include "minisql/plan.hpp"
 

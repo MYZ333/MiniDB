@@ -10,6 +10,7 @@ enum class TokenKind {
     EndOfInput,
     Identifier, Integer, FloatLiteral, String,
     Create, Table, Drop, If, Exists, Insert, Into, Values, Select, Distinct, From, Where, Having,
+    Explain, Analyze,
     Update, Set, Delete, Join, Inner, Left, Right, Full, Outer, On, Group, Order, By, Asc, Desc, As, Is, Limit, Offset,
     Primary, Key, Unique, Default,
     Int, Varchar, Bool, Float, Null, True, False, And, Or, Not, Like, Between, In,

@@ -122,7 +122,8 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
                              std::is_same_v<T, GroupByPlan> ||
                              std::is_same_v<T, AggregatePlan> ||
                              std::is_same_v<T, SortPlan> ||
-                             std::is_same_v<T, ProjectPlan>) {
+                             std::is_same_v<T, ProjectPlan> ||
+                             std::is_same_v<T, ExplainPlan>) {
             collectRelations(op.input, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             addRelation(relations, op.table, op.relation_id, op.relation_name);
@@ -227,7 +228,9 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 << expression(op.predicate, relations);
         } else {
             input = op.input;
-            if constexpr (std::is_same_v<T, FilterPlan>) {
+            if constexpr (std::is_same_v<T, ExplainPlan>) {
+                out << (op.analyze ? "Explain[ANALYZE" : "Explain[");
+            } else if constexpr (std::is_same_v<T, FilterPlan>) {
                 out << "Filter[" << expression(op.predicate, relations);
             } else if constexpr (std::is_same_v<T, GroupByPlan>) {
                 out << "GroupBy[";
@@ -305,7 +308,7 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                         << expression(op.assignments[i].value, relations);
                 }
                 out << "; values=old-row";
-            } else {
+            } else if constexpr (std::is_same_v<T, DeletePlan>) {
                 out << "Delete[" << tableName(op.table);
             }
         }

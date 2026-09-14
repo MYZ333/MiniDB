@@ -622,6 +622,21 @@ void testAssociativityAndOwnedAst() {
     require(update.table.text == "t", "AST must own text after token stream is destroyed");
 }
 
+void testExplainAnalyze() {
+    const auto statements = parseOk(
+        "EXPLAIN SELECT id FROM student WHERE id>1;"
+        "EXPLAIN ANALYZE UPDATE student SET id=id+1 WHERE id=1;");
+    require(statements.size() == 2, "expected two EXPLAIN statements");
+    const auto& plain = std::get<ExplainStmt>(statements[0].node);
+    require(!plain.analyze && std::holds_alternative<SelectStmt>(plain.target),
+            "plain EXPLAIN target was not retained");
+    const auto& analyzed = std::get<ExplainStmt>(statements[1].node);
+    require(analyzed.analyze && std::holds_alternative<UpdateStmt>(analyzed.target),
+            "EXPLAIN ANALYZE target was not retained");
+    expectSyntaxError("EXPLAIN EXPLAIN SELECT * FROM student;");
+    expectSyntaxError("EXPLAIN ANALYZE;");
+}
+
 } // namespace
 
 int main() {
@@ -655,6 +670,7 @@ int main() {
         testEofContract();
         testDepthLimits();
         testAssociativityAndOwnedAst();
+        testExplainAnalyze();
         std::cout << "Parser tests passed.\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

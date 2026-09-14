@@ -91,7 +91,7 @@ std::optional<Diagnostic> checkExpr(const BoundExprPtr& expr, const Relations& r
 }
 
 std::optional<Diagnostic> validate(const BoundStatement& statement) {
-    return std::visit([](const auto& stmt) -> std::optional<Diagnostic> {
+    return std::visit([&](const auto& stmt) -> std::optional<Diagnostic> {
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, BoundCreateTable>) {
             if (stmt.table_name.empty() || stmt.columns.empty()) return invalid("CREATE requires a name and columns");
@@ -125,6 +125,13 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
             for (const auto& name : stmt.table_names)
                 if (name.empty() || !names.insert(name).second)
                     return invalid("DROP table names must be non-empty and unique");
+        } else if constexpr (std::is_same_v<T, BoundExplain>) {
+            if (!stmt.target) return invalid("EXPLAIN target is missing");
+            if (stmt.target->catalog_version != statement.catalog_version)
+                return invalid("EXPLAIN target CatalogVersion is inconsistent");
+            if (std::holds_alternative<BoundExplain>(stmt.target->node))
+                return invalid("nested EXPLAIN is not supported");
+            return validate(*stmt.target);
         } else if constexpr (std::is_same_v<T, BoundSelect>) {
             if (!stmt.table || stmt.table->columns.empty()) return invalid("base table schema is missing or empty");
             Relations relations{{stmt.table, stmt.relation_id,
@@ -343,6 +350,14 @@ PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
 
 Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
     if (auto error = validate(statement)) return *error;
+    if (const auto* explain = std::get_if<BoundExplain>(&statement.node)) {
+        auto target = buildPlan(*explain->target);
+        if (const auto* error = std::get_if<Diagnostic>(&target)) return *error;
+        auto input = std::get<LogicalPlan>(std::move(target)).root;
+        // EXPLAIN 本身是一个查询根，其单列文本由执行层生成。
+        return LogicalPlan{statement.catalog_version,
+            node(ExplainPlan{std::move(input), explain->analyze}, {{"QUERY PLAN", DataType::Varchar}})};
+    }
     auto root = std::visit([](const auto& stmt) -> PlanPtr {
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, BoundCreateTable>) {
@@ -379,9 +394,9 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
         } else if constexpr (std::is_same_v<T, BoundUpdate>) {
             // 修改操作的输入携带行标识，根只返回影响行数（执行结果，不是业务列）。
             return node(UpdatePlan{stmt.table, stmt.assignments, source(stmt.table, stmt.where, true)});
-        } else {
+        } else if constexpr (std::is_same_v<T, BoundDelete>) {
             return node(DeletePlan{stmt.table, source(stmt.table, stmt.where, true)});
-        }
+        } else return nullptr; // BoundExplain 已在访问 variant 前递归生成。
     }, statement.node);
     return LogicalPlan{statement.catalog_version, std::move(root)};
 }

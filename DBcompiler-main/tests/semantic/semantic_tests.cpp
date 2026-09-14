@@ -72,6 +72,37 @@ int main() {
         check(columns[0].type == DataType::Bool && columns[1].type == DataType::Float,
               "extended CREATE types lost");
     });
+    suite.run("CREATE IF NOT EXISTS and table constraints have explicit DDL boundaries", [] {
+        Fixture f;
+        CreateTableStmt create_if_missing{id("newtable"), {{id("id"), DataType::Int, {}}}};
+        create_if_missing.if_not_exists = true;
+        value(f.analyzeNode(create_if_missing));
+
+        CreateTableStmt create_existing{id("student", span(20, 7)), {{id("id"), DataType::Int, {}}}};
+        create_existing.if_not_exists = true;
+        auto e = failure(f.analyzeNode(create_existing), ErrorCode::UnsupportedFeature);
+        check(e.span->begin.offset == 20 &&
+                  e.message.find("IF NOT EXISTS") != std::string::npos,
+              "CREATE IF NOT EXISTS placeholder diagnostic changed");
+
+        CreateTableStmt constrained{id("constrained"),
+            {{id("id"), DataType::Int, {}}, {id("code"), DataType::Int, {}}}};
+        constrained.table_constraints.push_back(
+            {TableConstraintKind::PrimaryKey, {id("id", span(42, 2))}, span(30, 15)});
+        e = failure(f.analyzeNode(constrained), ErrorCode::UnsupportedFeature);
+        check(e.span->begin.offset == 30 &&
+                  e.message.find("table constraints") != std::string::npos,
+              "table constraint placeholder diagnostic changed");
+    });
+    suite.run("ALTER TABLE is explicitly unsupported for now", [] {
+        Fixture f;
+        AlterTableStmt alter{id("student", span(12, 7)),
+            AlterAddColumn{{id("email"), DataType::Varchar, span(30, 13)}, true}};
+        auto e = failure(f.analyzeNode(std::move(alter)), ErrorCode::UnsupportedFeature);
+        check(e.span->begin.offset == 12 &&
+                  e.message.find("ALTER TABLE") != std::string::npos,
+              "ALTER TABLE placeholder diagnostic changed");
+    });
     suite.run("DROP TABLE is explicitly unsupported for now", [] {
         Fixture f;
         auto e = failure(f.analyzeNode(DropTableStmt{{id("student", span(11, 7))}, false}),
@@ -345,6 +376,71 @@ int main() {
                          ErrorCode::UnsupportedFeature);
         check(e.message.find("aggregate expressions") != std::string::npos,
               "aggregate placeholder diagnostic changed");
+    });
+    suite.run("IN subqueries are explicitly unsupported for now", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), std::vector<Identifier>{id("id")}, nullptr});
+        auto predicate = std::make_shared<const Expr>(Expr{
+            InSubqueryExpr{col("id"), query, false, span(20, 2)}, span(10, 35)});
+        auto e = failure(f.where(predicate), ErrorCode::UnsupportedFeature);
+        check(e.message.find("IN subqueries") != std::string::npos,
+              "IN subquery placeholder diagnostic changed");
+    });
+    suite.run("EXISTS subqueries are explicitly unsupported for now", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), AllColumns{}, nullptr});
+        auto predicate = std::make_shared<const Expr>(Expr{
+            ExistsSubqueryExpr{query, false, span(20, 6)}, span(20, 35)});
+        auto e = failure(f.where(predicate), ErrorCode::UnsupportedFeature);
+        check(e.message.find("EXISTS subqueries") != std::string::npos,
+              "EXISTS subquery placeholder diagnostic changed");
+    });
+    suite.run("derived tables are explicitly unsupported for now", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), std::vector<Identifier>{id("id")}, nullptr});
+        SelectStmt select{id(""), AllColumns{}, nullptr};
+        select.from = TableRef{Identifier{}, query, id("d"), span(14, 35)};
+        auto e = failure(f.analyzeNode(select), ErrorCode::UnsupportedFeature);
+        check(e.message.find("derived tables") != std::string::npos,
+              "derived table placeholder diagnostic changed");
+    });
+    suite.run("scalar subqueries are explicitly unsupported for now", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), std::vector<Identifier>{id("age")}, nullptr});
+        auto predicate = bin(BinaryOp::Greater, col("age"),
+                             std::make_shared<const Expr>(Expr{
+                                 ScalarSubqueryExpr{query, span(20, 30)}, span(20, 30)}));
+        auto e = failure(f.where(predicate), ErrorCode::UnsupportedFeature);
+        check(e.message.find("scalar subqueries") != std::string::npos,
+              "scalar subquery placeholder diagnostic changed");
+    });
+    suite.run("set operations are explicitly unsupported for now", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<Identifier>{id("id")}, nullptr};
+        select.set_operations.push_back(SetOperation{
+            SetOperator::Intersect, true,
+            std::make_shared<const SelectStmt>(
+                SelectStmt{id("student"), std::vector<Identifier>{id("id")}, nullptr}),
+            span(20, 9)});
+        auto e = failure(f.analyzeNode(select), ErrorCode::UnsupportedFeature);
+        check(e.message.find("set operations") != std::string::npos,
+              "set operation placeholder diagnostic changed");
+    });
+    suite.run("CASE expressions are explicitly unsupported for now", [] {
+        Fixture f;
+        auto case_expr = std::make_shared<const Expr>(Expr{
+            CaseExpr{nullptr,
+                     {CaseWhenClause{col("age"), num(1), span(10, 20)}},
+                     num(0),
+                     span(5, 30)},
+            span(5, 30)});
+        auto e = failure(f.where(case_expr), ErrorCode::UnsupportedFeature);
+        check(e.message.find("CASE expressions") != std::string::npos,
+              "CASE expression placeholder diagnostic changed");
     });
     suite.run("semantic analysis checks both logical branches and left error first", [] {
         Fixture f;

@@ -126,8 +126,22 @@ private:
 
     Result<BoundStatement> bindStatement(const CreateTableStmt& stmt) {
         if (catalog_.findTable(normalizeName(stmt.table.text))) {
+            if (stmt.if_not_exists) {
+                // A 已能保存 CREATE TABLE IF NOT EXISTS；B 当前没有 DDL no-op 的 Bound/Plan
+                // 表示，先明确拒绝已存在表场景，避免误报成功但没有可执行动作。
+                return error(ErrorCode::UnsupportedFeature,
+                             "CREATE TABLE IF NOT EXISTS no-op is not supported by semantic analysis yet",
+                             location(stmt.table.span, statement_span_));
+            }
             return error(ErrorCode::TableAlreadyExists, "table '" + stmt.table.text + "' already exists",
                          location(stmt.table.span, statement_span_));
+        }
+        if (!stmt.table_constraints.empty()) {
+            // A 已能保存表级 PRIMARY KEY/UNIQUE；B 当前 ColumnSpec/Catalog 尚无约束结构，
+            // 先明确拒绝，避免静默创建一张丢失约束的表。
+            return error(ErrorCode::UnsupportedFeature,
+                         "table constraints are not supported by semantic analysis yet",
+                         location(stmt.table_constraints.front().span, statement_span_));
         }
         if (stmt.columns.empty()) {
             return error(ErrorCode::EmptyColumnList, "table must have at least one column", statement_span_);
@@ -148,6 +162,14 @@ private:
         }
         // 只有描述，没有注册动作，也不分配数据库 ID。
         return success(BoundCreateTable{normalizeName(stmt.table.text), std::move(columns)});
+    }
+
+    Result<BoundStatement> bindStatement(const AlterTableStmt& stmt) {
+        // A 已能保存 ALTER TABLE ADD/DROP/RENAME；B 当前没有 BoundAlterTable、
+        // AlterPlan 或 Catalog 变更事务，先明确拒绝，避免调用方误以为已修改表结构。
+        return error(ErrorCode::UnsupportedFeature,
+                     "ALTER TABLE is not supported by semantic analysis yet",
+                     location(stmt.table.span, statement_span_));
     }
 
     Result<BoundStatement> bindStatement(const DropTableStmt& stmt) {
@@ -220,30 +242,55 @@ private:
     }
 
     Result<BoundStatement> bindStatement(const SelectStmt& stmt) {
-        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+        if (!stmt.set_operations.empty()) {
+            // A 已能保存 UNION/INTERSECT/EXCEPT；B 当前 BoundSelect/Plan 仍表示单个 SELECT，
+            // 先明确拒绝，避免只绑定左侧 SELECT 而静默丢掉集合运算右侧分支。
+            return error(ErrorCode::UnsupportedFeature,
+                         "set operations are not supported by semantic analysis yet",
+                         location(stmt.set_operations.front().operator_span, statement_span_));
+        }
+        if (stmt.from.subquery) {
+            // A 已能保存 FROM (SELECT ...) 派生表；B 当前没有派生表输出模式、
+            // 子查询作用域或对应计划节点，先明确拒绝，避免把空旧 table 字段当真实表查找。
+            return error(ErrorCode::UnsupportedFeature,
+                         "derived tables are not supported by semantic analysis yet",
+                         location(stmt.from.span, statement_span_));
+        }
+        const Identifier& root_table = stmt.from.table.text.empty() ? stmt.table : stmt.from.table;
+        const auto& root_alias = stmt.from.alias ? stmt.from.alias : stmt.table_alias;
+        if (root_alias && root_alias->text.find('.') != std::string::npos)
             return error(ErrorCode::InvalidAst, "table alias must be a simple identifier",
-                         location(stmt.table_alias->span, statement_span_));
-        auto lookup = findTable(stmt.table);
+                         location(root_alias->span, statement_span_));
+        auto lookup = findTable(root_table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        const std::string relation_name = stmt.table_alias
-            ? normalizeName(stmt.table_alias->text) : table->name;
+        const std::string relation_name = root_alias
+            ? normalizeName(root_alias->text) : table->name;
         BindingScope scope{{table, relation_name, 1}};
         std::vector<BoundJoin> joins;
         for (const auto& join : stmt.joins) {
-            if (join.alias && join.alias->text.find('.') != std::string::npos)
+            if (join.source.subquery) {
+                // A 已能保存 JOIN (SELECT ...) 派生表；B 当前 Join 绑定仍以 Catalog
+                // 真实表为输入，先显式拒绝，后续再接派生表输出列和计划节点。
+                return error(ErrorCode::UnsupportedFeature,
+                             "derived tables are not supported by semantic analysis yet",
+                             location(join.source.span, location(join.span, statement_span_)));
+            }
+            const Identifier& joined_table = join.source.table.text.empty() ? join.table : join.source.table;
+            const auto& joined_alias = join.source.alias ? join.source.alias : join.alias;
+            if (joined_alias && joined_alias->text.find('.') != std::string::npos)
                 return error(ErrorCode::InvalidAst, "JOIN alias must be a simple identifier",
-                             location(join.alias->span, location(join.span, statement_span_)));
-            auto joined_lookup = findTable(join.table);
+                             location(joined_alias->span, location(join.span, statement_span_)));
+            auto joined_lookup = findTable(joined_table);
             if (const auto* failure = std::get_if<Diagnostic>(&joined_lookup)) return *failure;
             auto joined = std::get<std::shared_ptr<const TableSchema>>(joined_lookup);
-            const std::string joined_name = join.alias
-                ? normalizeName(join.alias->text) : joined->name;
+            const std::string joined_name = joined_alias
+                ? normalizeName(joined_alias->text) : joined->name;
             for (const auto& visible : scope) {
                 if (visible.name == joined_name) {
                     return error(ErrorCode::DuplicateTable,
                         "relation name '" + joined_name + "' occurs more than once",
-                        location(join.alias ? join.alias->span : join.table.span,
+                        location(joined_alias ? joined_alias->span : joined_table.span,
                                  location(join.span, statement_span_)));
                 }
             }
@@ -470,6 +517,30 @@ private:
                 // 先明确拒绝，避免把 AggregateCall 误当 BinaryExpr 访问 left/right。
                 return error(ErrorCode::UnsupportedFeature,
                              "aggregate expressions are not supported by semantic analysis yet",
+                             span);
+            } else if constexpr (std::is_same_v<T, InSubqueryExpr>) {
+                // A 已能保存 IN (SELECT ...) 子查询；B 还没有 BoundSubquery 或嵌套作用域计划，
+                // 先明确拒绝，避免把子查询误当字面量 IN 列表处理。
+                return error(ErrorCode::UnsupportedFeature,
+                             "IN subqueries are not supported by semantic analysis yet",
+                             span);
+            } else if constexpr (std::is_same_v<T, ExistsSubqueryExpr>) {
+                // A 已能保存 EXISTS (SELECT ...) 子查询；B 还没有 BoundSubquery 或嵌套作用域计划，
+                // 先明确拒绝，避免把 EXISTS 当作普通布尔字面量处理。
+                return error(ErrorCode::UnsupportedFeature,
+                             "EXISTS subqueries are not supported by semantic analysis yet",
+                             span);
+            } else if constexpr (std::is_same_v<T, ScalarSubqueryExpr>) {
+                // A 已能保存表达式位置的 (SELECT ...) 标量子查询；B 后续需要检查
+                // 单行单列、推导返回类型，并区分相关/非相关子查询计划。
+                return error(ErrorCode::UnsupportedFeature,
+                             "scalar subqueries are not supported by semantic analysis yet",
+                             span);
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                // A 已能保存 CASE WHEN 表达式；B 后续需要检查 WHEN 条件类型、
+                // 简单 CASE 的匹配类型，以及 THEN/ELSE 结果类型合并规则。
+                return error(ErrorCode::UnsupportedFeature,
+                             "CASE expressions are not supported by semantic analysis yet",
                              span);
             } else {
                 const auto op_span = location(node.operator_span, span);

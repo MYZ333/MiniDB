@@ -1,4 +1,4 @@
-# MiniSQL 文法（接口版本 0.21）
+# MiniSQL 文法（接口版本 0.31）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 五类基础语句及 A version2 扩展语法已合入。B 已支持扩展标量类型、限定名、
@@ -18,8 +18,8 @@
   第一阶段不允许字符串跨行。字符串值保持大小写和 UTF-8 字节内容。
 - 跳过空白、`--` 行注释和不嵌套的 `/* ... */` 块注释。
 - 支持运算符 `= != <> < <= > >= + - * /`；不支持 `==`。
-- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、INNER/LEFT/RIGHT/FULL OUTER JOIN、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN 和 COUNT/SUM/AVG/MIN/MAX 关键字。
-- INSERT 值位置不支持 `DEFAULT` 关键字。DROP TABLE、聚合函数、外连接和多行 INSERT 目前由 A 解析为 AST，B 的完整语义、计划和执行适配后续完成。
+- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT、表级 PRIMARY KEY/UNIQUE、CREATE TABLE IF NOT EXISTS、ALTER TABLE ADD/DROP/RENAME、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、INNER/LEFT/RIGHT/FULL OUTER JOIN、FROM/JOIN 派生表、UNION/INTERSECT/EXCEPT 及可选 ALL、CASE WHEN 表达式、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN 字面量列表、IN/NOT IN 子查询、EXISTS/NOT EXISTS 子查询、标量子查询和 COUNT/SUM/AVG/MIN/MAX 关键字。
+- INSERT 值位置不支持 `DEFAULT` 关键字。ALTER TABLE、DROP TABLE、表级约束、派生表、UNION/INTERSECT/EXCEPT、CASE 表达式、IN/EXISTS/标量子查询、聚合函数、外连接和多行 INSERT 目前由 A 解析为 AST，B 的完整语义、计划和执行适配后续完成。
 - 每条语句必须以分号结束；空输入合法；单独的空分号不是语句。
 - 源码位置：字节偏移从 0 开始，行列从 1 开始；列也按字节计算。
   LF、单独 CR 换行，CRLF 作为一个换行，制表符占一列；范围为左闭右开。
@@ -30,24 +30,33 @@
 
 ```ebnf
 program     = { statement } ;
-statement   = (create | drop | insert | select | update | delete), ";" ;
-create      = CREATE, TABLE, name, "(", column_def,
-              { ",", column_def }, ")" ;
+statement   = (create | alter | drop | insert | select | update | delete), ";" ;
+create      = CREATE, TABLE, [IF, NOT, EXISTS], name, "(", create_item,
+              { ",", create_item }, ")" ;
+create_item = column_def | table_constraint ;
 column_def  = name, type, { column_constraint } ;
 column_constraint = PRIMARY, KEY | NOT, NULL | UNIQUE | DEFAULT, literal ;
+table_constraint = PRIMARY, KEY, "(", names, ")" | UNIQUE, "(", names, ")" ;
 type        = INT | VARCHAR, ["(", INTEGER, ")"] | BOOL | FLOAT ;
+alter       = ALTER, TABLE, name, alter_action ;
+alter_action = ADD, [COLUMN], column_def
+             | DROP, [COLUMN], name
+             | RENAME, TO, name
+             | RENAME, COLUMN, name, TO, name ;
 drop        = DROP, TABLE, [IF, EXISTS], names ;
 insert      = INSERT, INTO, name, [ "(", names, ")" ],
               VALUES, value_row, { ",", value_row } ;
 value_row   = "(", literal, { ",", literal }, ")" ;
-select      = SELECT, [DISTINCT], ("*" | select_items), FROM, table_ref,
+select      = select_core, { set_op, [ALL], select_core } ;
+set_op      = UNION | INTERSECT | EXCEPT ;
+select_core = SELECT, [DISTINCT], ("*" | select_items), FROM, table_ref,
               { join }, [where], [group_by], [having], [order_by], [limit] ;
 update      = UPDATE, table_ref, SET, assignment, { ",", assignment }, [where] ;
 delete      = DELETE, FROM, table_ref, [where] ;
 assignment  = name, "=", expr ;
 join        = [join_type], JOIN, table_ref, ON, expr ;
 join_type   = INNER | LEFT, [OUTER] | RIGHT, [OUTER] | FULL, [OUTER] ;
-table_ref   = name, [ alias ] ;
+table_ref   = name, [ alias ] | "(", select, ")", alias ;
 select_items = select_item, { ",", select_item } ;
 select_item = expr, [ alias ] ;
 aggregate_call = aggregate_func, "(", ("*" | name), ")" ;
@@ -63,19 +72,23 @@ names       = name, { ",", name } ;
 expr        = or_expr ;
 or_expr     = and_expr, { OR, and_expr } ;
 and_expr    = not_expr, { AND, not_expr } ;
-not_expr    = NOT, not_expr | comparison ;
+not_expr    = NOT, EXISTS, "(", select, ")" | NOT, not_expr | comparison ;
 comparison  = additive, [ (comp_op, additive) | (LIKE, additive) |
                           (NOT, LIKE, additive) |
                           (BETWEEN, additive, AND, additive) |
                           (NOT, BETWEEN, additive, AND, additive) |
-                          (IN, "(", literal, { ",", literal }, ")") |
-                          (NOT, IN, "(", literal, { ",", literal }, ")") |
+                          (IN, "(", in_rhs, ")") |
+                          (NOT, IN, "(", in_rhs, ")") |
                           (IS, [NOT], NULL) ] ;
+in_rhs      = literal, { ",", literal } | select ;
 comp_op     = "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ;
 additive    = term, { ("+" | "-"), term } ;
 term        = unary, { ("*" | "/"), unary } ;
 unary       = "-", unary | primary ;
-primary     = aggregate_call | name | INTEGER | FLOAT_LITERAL | STRING | TRUE | FALSE | NULL | "(", expr, ")" ;
+primary     = case_expr | scalar_subquery | EXISTS, "(", select, ")" | aggregate_call | name | INTEGER | FLOAT_LITERAL | STRING | TRUE | FALSE | NULL | "(", expr, ")" ;
+case_expr   = CASE, [expr], case_when, { case_when }, [ELSE, expr], END ;
+case_when   = WHEN, expr, THEN, expr ;
+scalar_subquery = "(", select, ")" ;
 literal     = ["-"], (INTEGER | FLOAT_LITERAL) | STRING | TRUE | FALSE | NULL ;
 name        = IDENTIFIER, { ".", IDENTIFIER } ;
 ```
@@ -90,8 +103,9 @@ LiteralExpr；FLOAT_LITERAL 同样可带负号。整数在应用符号后检查�
 例如 `NOT age > 18` 为 `NOT (age > 18)`，`a < b < c` 是语法错误。
 这是对 PPT 第 16 页文法与优先级文字不一致的明确取舍。
 
-递归下降的 statement 分支分别以 CREATE / DROP / INSERT / SELECT / UPDATE /
-DELETE 开始；where 的 FIRST 为 WHERE，FOLLOW 为分号；not_expr 的 FIRST
+递归下降的 statement 分支分别以 CREATE / ALTER / DROP / INSERT / SELECT / UPDATE /
+DELETE 开始；where 的 FIRST 为 WHERE，FOLLOW 为分号；table_ref 的 FIRST 为
+标识符或左括号；not_expr 的 FIRST
 包括 NOT、负号、标识符、整数、浮点数、字符串、TRUE/FALSE、NULL 和左括号。
 SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY → LIMIT/OFFSET。
 
@@ -99,9 +113,16 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 
 - INT 使用 int64_t，FLOAT 使用 double，VARCHAR 使用 std::string，BOOL 使用 bool。
   `VARCHAR(n)` 的 n 必须是正整数；A 在 AST 中保留长度，长度约束由 B/执行层后续决定。
+- `CREATE TABLE IF NOT EXISTS` 由 A 保存到 `CreateTableStmt::if_not_exists`。
+  B 当前在表不存在时按普通 CREATE 处理；表已存在时因还没有 DDL no-op Bound/Plan 表示，显式报 UnsupportedFeature。
 - 列级 PRIMARY KEY、NOT NULL、UNIQUE 和 DEFAULT 由 A 保存在 ColumnDefinition 中；
   A 不检查默认值类型、不维护索引、不修改 Catalog，具体约束语义由 B/Catalog/执行层决定。
+- 表级 PRIMARY KEY/UNIQUE 由 A 保存在 `CreateTableStmt::table_constraints` 中。
+  B/Catalog 适配前，含表级约束的 CREATE TABLE 在语义阶段显式报 UnsupportedFeature，避免静默丢失约束。
 - CREATE 至少一列；表名和列名不得重复；CREATE 编译不修改 Catalog。
+- A 支持 ALTER TABLE ADD [COLUMN] column_def、DROP [COLUMN] name、
+  RENAME TO name 和 RENAME COLUMN old_name TO new_name。新增列可以使用已有列级约束语法。
+  B/Catalog 适配前，ALTER TABLE 在语义阶段显式报 UnsupportedFeature，不会修改 Catalog。
 - A 支持 DROP TABLE，可选 `IF EXISTS`，以及逗号分隔的多个表名。B 适配前，
   DROP TABLE 在语义阶段显式报 UnsupportedFeature，不会修改 Catalog。
 - A 支持 INSERT 单行和多行字面量；`InsertStmt::values` 保留第一行用于兼容旧接口，
@@ -112,14 +133,32 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
   为兼容 B，普通列清单仍保留为旧的 `std::vector<Identifier>` AST 分支；出现表达式项或聚合项时使用 `std::vector<SelectItem>`。
 - SELECT DISTINCT 由 A 保存为 `SelectStmt::distinct`。B 适配前，该标记只保证
   Parser/AST 输出正确；去重计划、NULL 比较和排序稳定性由 B 后续定义。
+- UNION/INTERSECT/EXCEPT 及可选 ALL 由 A 保存为 `SelectStmt::set_operations`。A 不检查左右 SELECT
+  输出列数、输出类型兼容性、重复行保留或去重语义；B 适配前，集合运算在语义阶段显式报 UnsupportedFeature。
 - A 支持记录 INNER/LEFT/RIGHT/FULL 连接类型；B 适配前，外连接只保证 Parser/AST 输出正确。
   JOIN 按书写顺序构造左深树；ON 可引用当前已加入的所有关系实例且
   必须为 BOOL。表声明别名后，限定列必须使用别名；不同别名允许同一物理表自连接。
   可见关系名不得重复，未限定列名命中多个关系实例时报 AmbiguousColumn。
+- A 支持 FROM/JOIN 派生表：`FROM (SELECT ...) AS alias` 和
+  `JOIN (SELECT ...) alias ON ...`。派生表必须有别名，A 将其保存在 `TableRef::subquery`。
+  A 不推导派生表输出模式，不绑定内外层名称作用域；B 适配前，派生表在语义阶段显式报 UnsupportedFeature。
 - A 支持聚合调用表达式：`COUNT(*)`、`COUNT(column)`、`SUM(column)`、
   `AVG(column)`、`MIN(column)`、`MAX(column)`。除 `COUNT(*)` 外，`*` 不能作为聚合参数。
   聚合调用可出现在 SELECT 表达式项和 HAVING 等表达式位置。B 完整适配前，
   这些查询只保证 Lexer/Parser/AST 输出正确，不保证语义分析、计划生成或执行。
+- A 支持 `expr IN (SELECT ...)` 和 `expr NOT IN (SELECT ...)`，并将子查询保存为
+  `InSubqueryExpr`。A 不判断子查询是否相关、不检查子查询输出列数或类型；B 适配前，
+  IN 子查询在语义阶段显式报 UnsupportedFeature。
+- A 支持 `EXISTS (SELECT ...)` 和 `NOT EXISTS (SELECT ...)`，并将子查询保存为
+  `ExistsSubqueryExpr`。A 不判断子查询是否相关，不检查子查询输出列内容；B 适配前，
+  EXISTS 子查询在语义阶段显式报 UnsupportedFeature。
+- A 支持表达式位置的标量子查询：`(SELECT ...)`，并将其保存为 `ScalarSubqueryExpr`。
+  A 不检查子查询是否恰好返回单行单列，不推导返回类型，不判断相关/非相关；B 适配前，
+  标量子查询在语义阶段显式报 UnsupportedFeature。
+- A 支持搜索型和简单型 CASE 表达式：`CASE WHEN cond THEN value ... END` 与
+  `CASE operand WHEN value THEN result ... END`，并将其保存为 `CaseExpr`。
+  A 不检查 WHEN 条件类型、简单 CASE 匹配类型或 THEN/ELSE 结果类型合并；B 适配前，
+  CASE 表达式在语义阶段显式报 UnsupportedFeature。
 - GROUP BY 在 B 完成聚合适配前仍按无聚合分组处理，含义为按键去重。每个非聚合 SELECT 列都
   必须出现在分组键中，分组键不得重复；`SELECT *` 也受同一规则约束。两个 NULL 键归入同一组。
 - HAVING 使用现有表达式文法，A 将其保存在 `SelectStmt::having` 中。B 适配前，
@@ -153,6 +192,11 @@ Parser 在构造 AST 时执行同一高度限制，另限制括号/NOT/负号递
 ```sql
 CREATE TABLE student(id INT, name VARCHAR, age INT);
 CREATE TABLE account(id INT PRIMARY KEY, name VARCHAR(20) NOT NULL UNIQUE DEFAULT 'guest');
+CREATE TABLE IF NOT EXISTS enrollment(student_id INT, course_id INT, PRIMARY KEY(student_id, course_id), UNIQUE(course_id));
+ALTER TABLE student ADD COLUMN email VARCHAR(50) DEFAULT 'unknown';
+ALTER TABLE student DROP COLUMN email;
+ALTER TABLE student RENAME TO pupil;
+ALTER TABLE student RENAME COLUMN name TO full_name;
 DROP TABLE IF EXISTS old_student;
 INSERT INTO student(name, age, id) VALUES ('Alice', 20, 1);
 INSERT INTO student(id, name, age) VALUES (1, 'Alice', 20), (2, 'Bob', 18);
@@ -176,7 +220,15 @@ ORDER BY employee_name;
 SELECT * FROM student ORDER BY id DESC LIMIT 10 OFFSET 20;
 SELECT name FROM metrics ORDER BY score + 1 DESC;
 SELECT DISTINCT active FROM metrics;
+SELECT id FROM student UNION ALL SELECT student_id FROM score;
+SELECT id FROM student INTERSECT SELECT student_id FROM score;
+SELECT id FROM student EXCEPT ALL SELECT student_id FROM score;
+SELECT CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END AS label FROM student;
 SELECT age + 1 AS next_age, score * 1.1 AS adjusted_score FROM metrics;
+SELECT name FROM student WHERE id IN (SELECT student_id FROM score WHERE value > 60);
+SELECT name FROM student WHERE EXISTS (SELECT * FROM score WHERE score.student_id = student.id);
+SELECT d.name FROM (SELECT name, age FROM student WHERE age > 18) AS d WHERE d.age > 20;
+SELECT name FROM student WHERE age > (SELECT AVG(age) FROM student);
 SELECT active, COUNT(*), AVG(score) AS avg_score
 FROM metrics
 GROUP BY active
@@ -209,4 +261,14 @@ HAVING active = TRUE;
 - 0.19：新增 INSERT 多行 VALUES 的 A 侧语法与 AST 字段；B 当前显式返回 UnsupportedFeature，多行插入绑定、计划和执行后续适配。
 - 0.20：新增 DROP TABLE / DROP TABLE IF EXISTS / 多表名 DROP 的 A 侧语法与 AST 字段；B 当前显式返回 UnsupportedFeature，Catalog 删除语义后续适配。
 - 0.21：新增 UPDATE/DELETE 目标表别名的 A 侧语法与 AST 字段；B 侧名称绑定已按单表别名作用域适配。
+- 0.22：新增 CREATE TABLE IF NOT EXISTS 以及表级 PRIMARY KEY/UNIQUE 的 A 侧语法与 AST 字段；B 当前对已存在表 no-op 和表级约束显式返回 UnsupportedFeature。
+- 0.23：新增 ALTER TABLE ADD [COLUMN] 的 A 侧语法与 AST 字段；B 当前显式返回 UnsupportedFeature，Catalog 变更语义后续适配。
+- 0.24：补充 ALTER TABLE DROP [COLUMN]、RENAME TO 和 RENAME COLUMN 的 A 侧语法与 AST 字段；B 仍统一显式返回 UnsupportedFeature。
+- 0.25：新增 IN/NOT IN 子查询的 A 侧语法与 InSubqueryExpr AST 表示；B 当前显式返回 UnsupportedFeature，嵌套查询绑定和计划后续适配。
+- 0.26：新增 EXISTS/NOT EXISTS 子查询的 A 侧语法与 ExistsSubqueryExpr AST 表示；B 当前显式返回 UnsupportedFeature，嵌套查询绑定和计划后续适配。
+- 0.27：新增 FROM/JOIN 派生表的 A 侧语法与 TableRef AST 表示；B 当前显式返回 UnsupportedFeature，派生表输出模式和计划后续适配。
+- 0.28：新增表达式位置标量子查询的 A 侧语法与 ScalarSubqueryExpr AST 表示；B 当前显式返回 UnsupportedFeature，单行单列检查、类型推导和相关子查询计划后续适配。
+- 0.29：新增 UNION/UNION ALL 的 A 侧语法与 SetOperation AST 表示；B 当前显式返回 UnsupportedFeature，列数/类型检查、去重和集合计划后续适配。
+- 0.30：补充 INTERSECT/EXCEPT 及可选 ALL 的 A 侧语法；SetOperation 通过 op 区分集合操作种类，B 当前仍显式返回 UnsupportedFeature。
+- 0.31：新增搜索型和简单型 CASE WHEN 表达式的 A 侧语法与 CaseExpr AST 表示；B 当前显式返回 UnsupportedFeature，条件类型和结果类型合并后续适配。
 - 优化进度：A 提供展示用 AST 优化；B 提供绑定后计划优化，两者接口分离。

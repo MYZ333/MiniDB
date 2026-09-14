@@ -9,7 +9,7 @@
 
 namespace minisql {
 namespace {
-ExprPtr makeExpr(std::variant<IdentifierExpr, LiteralExpr, UnaryExpr, BinaryExpr, AggregateCall> node,
+ExprPtr makeExpr(std::variant<IdentifierExpr, LiteralExpr, UnaryExpr, BinaryExpr, AggregateCall, InSubqueryExpr, ExistsSubqueryExpr, ScalarSubqueryExpr, CaseExpr> node,
                  SourceLocation span) {
     return std::make_shared<const Expr>(Expr{std::move(node), std::move(span)});
 }
@@ -150,6 +150,30 @@ SelectList optimizeSelectList(const SelectList& columns) {
     }
     return SelectList{std::move(items)};
 }
+
+SelectStmt optimizeSelect(const SelectStmt& node) {
+    auto copy = node;
+    copy.columns = optimizeSelectList(node.columns);
+    if (node.from.subquery) {
+        copy.from.subquery = std::make_shared<const SelectStmt>(optimizeSelect(*node.from.subquery));
+    }
+    copy.where = optimizeWhere(node.where);
+    copy.having = optimizeWhere(node.having);
+    for (auto& join : copy.joins) {
+        if (join.source.subquery) {
+            join.source.subquery =
+                std::make_shared<const SelectStmt>(optimizeSelect(*join.source.subquery));
+        }
+        join.on = optimizeAstExpression(join.on);
+    }
+    for (auto& item : copy.order_by) {
+        if (item.expression) item.expression = optimizeAstExpression(item.expression);
+    }
+    for (auto& operation : copy.set_operations) {
+        operation.query = std::make_shared<const SelectStmt>(optimizeSelect(*operation.query));
+    }
+    return copy;
+}
 } // namespace
 
 ExprPtr optimizeAstExpression(const ExprPtr& expression) {
@@ -166,6 +190,28 @@ ExprPtr optimizeAstExpression(const ExprPtr& expression) {
             }
             if (operand == node.operand) return expression;
             return makeExpr(UnaryExpr{node.op, std::move(operand), node.operator_span}, expression->span);
+        } else if constexpr (std::is_same_v<T, InSubqueryExpr>) {
+            InSubqueryExpr copy = node;
+            copy.value = optimizeAstExpression(node.value);
+            copy.query = std::make_shared<const SelectStmt>(optimizeSelect(*node.query));
+            return makeExpr(std::move(copy), expression->span);
+        } else if constexpr (std::is_same_v<T, ExistsSubqueryExpr>) {
+            ExistsSubqueryExpr copy = node;
+            copy.query = std::make_shared<const SelectStmt>(optimizeSelect(*node.query));
+            return makeExpr(std::move(copy), expression->span);
+        } else if constexpr (std::is_same_v<T, ScalarSubqueryExpr>) {
+            ScalarSubqueryExpr copy = node;
+            copy.query = std::make_shared<const SelectStmt>(optimizeSelect(*node.query));
+            return makeExpr(std::move(copy), expression->span);
+        } else if constexpr (std::is_same_v<T, CaseExpr>) {
+            CaseExpr copy = node;
+            copy.operand = optimizeAstExpression(node.operand);
+            for (auto& branch : copy.branches) {
+                branch.condition = optimizeAstExpression(branch.condition);
+                branch.result = optimizeAstExpression(branch.result);
+            }
+            copy.else_result = optimizeAstExpression(node.else_result);
+            return makeExpr(std::move(copy), expression->span);
         } else return optimizeBinary(expression, node);
     }, expression->node);
 }
@@ -175,15 +221,7 @@ Statement optimizeAstStatement(const Statement& statement) {
     std::visit([&](const auto& node) {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, SelectStmt>) {
-            auto copy = node;
-            copy.columns = optimizeSelectList(node.columns);
-            copy.where = optimizeWhere(node.where);
-            copy.having = optimizeWhere(node.having);
-            for (auto& join : copy.joins) join.on = optimizeAstExpression(join.on);
-            for (auto& item : copy.order_by) {
-                if (item.expression) item.expression = optimizeAstExpression(item.expression);
-            }
-            result.node = std::move(copy);
+            result.node = optimizeSelect(node);
         } else if constexpr (std::is_same_v<T, UpdateStmt>) {
             auto copy = node;
             copy.where = optimizeWhere(node.where);
@@ -195,6 +233,8 @@ Statement optimizeAstStatement(const Statement& statement) {
             copy.where = optimizeWhere(node.where);
             result.node = std::move(copy);
         } else if constexpr (std::is_same_v<T, DropTableStmt>) {
+            result.node = node;
+        } else if constexpr (std::is_same_v<T, AlterTableStmt>) {
             result.node = node;
         }
     }, statement.node);

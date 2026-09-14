@@ -1,4 +1,4 @@
-# 模块接口契约 0.14
+# 模块接口契约 0.15
 
 本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、六类基础语句与 EXPLAIN 语义分析、
 逻辑计划生成、规则优化和文本打印已实现；A version2 的扩展 lex/parse 与 AST 展示优化已合入。
@@ -195,6 +195,9 @@ Sort 位于 Project 下方，因此能读取未投影的隐藏列和计算排序
 FALSE 小于 TRUE；模式已固定列类型，因此 Sort 不执行跨类型转换。
 Update/Delete 的输入必须带行标识；根节点业务输出为空。
 RowId 的具体存储格式留给执行/存储层，B 只声明是否需要传递，不假定页号或槽号。
+EmptyResult 是优化器生成的零行关系叶节点。它的 `columns` 与 output 一一对应，保存列身份；
+`relations` 保存这些列原来的表模式、relation_id 和关系名。它不执行已删除的输入，但作为
+外连接一侧时仍能提供 NULL 扩展所需布局。带 RowId 的 EmptyResult 合法，只表示零个可修改行。
 
 执行结果约定：SELECT 返回按 output 排列的记录；CREATE/DROP 返回成功状态；
 INSERT/UPDATE/DELETE 返回影响行数（不作为 PlanNode.output 的业务列）。
@@ -221,7 +224,7 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
 只为改动的表达式及其祖先创建新节点。Catalog 版本、输出列顺序/重复列、
 表列 ID/ordinal、UPDATE 的旧行引用以及修改所需的 RowId 均保留。
 
-当前流水线依次执行安全常量折叠与布尔化简、谓词下推、列裁剪：
+当前流水线依次执行安全常量折叠与布尔化简、谓词下推、空结果传播、列裁剪：
 
 - 常量 INT/FLOAT 算术/比较、字符串和 BOOL 判等、BOOL 逻辑运算可折叠。
   SQL 语法已支持 TRUE/FALSE 字面量；NULL 不参与折叠。
@@ -229,12 +232,19 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
 - AND/OR 遵守左到右短路；FALSE AND x、TRUE OR x 可直接化简。
   TRUE AND x、FALSE OR x、x AND TRUE、x OR FALSE 可替换为 x。
   x AND FALSE、x OR TRUE 保留左侧求值，避免吞掉错误；不重排谓词。
-- Filter 的条件折叠为 TRUE 后用输入节点替换；FALSE Filter 保留。优化器递归穿过
+- Filter 的条件折叠为 TRUE 后用输入节点替换；FALSE Filter 在表达式阶段暂时保留，交给后续
+  空结果规则判断能否安全消除。优化器递归穿过
   GroupBy/Aggregate/Sort 和 Explain 的目标计划，并折叠 NestedLoopJoin 的 ON 表达式，
   但不删除恒真 JOIN 或改变连接顺序。
 - 谓词下推只拆分 WHERE 的 AND 合取项。INNER 可推向任一单侧输入；LEFT 只推左侧，RIGHT
   只推右侧，FULL 不推。常量、跨关系条件留在原位。含算术/取负的条件或 ON 可能报运行期错误，
   优化器保留其求值顺序；危险合取项之后的条件也不提前。
+- 空结果规则将字面 FALSE Filter 和 FALSE INNER JOIN 改成 EmptyResult，并穿过 Sort、GroupBy
+  传播。INNER 任一侧、LEFT 左侧、RIGHT 右侧、FULL 两侧为空时可判定连接为空。消除输入前会
+  检查其中的条件和排序表达式；含算术/取负的路径可能报错，必须保留原执行顺序。
+  Project、Aggregate、Update/Delete 与 Explain 保持语句边界；全局 Aggregate 仍消费零行输入，
+  因而 `COUNT(*)` 返回 0，而不是错误地返回零条结果。
+  `LIMIT 0` 也可把无风险 Project 的输入替换为空；可能报错的投影表达式仍按原执行顺序保留。
 - 列裁剪从根向下传递必需的 `BoundColumnRef`，将投影、Filter、JOIN ON、分组、聚合、HAVING
   和排序依赖合并后，在 SeqScan 按原模式顺序输出唯一列。COUNT(*) 可输出零业务列；DELETE
   仅需条件列和独立 RowId；UPDATE 为旧行复制和最终约束校验保留完整表列。
@@ -286,7 +296,7 @@ AggregatePlan 保存 group_keys/items/order_by/having/input 以及 distinct/limi
 HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
 重复输入行。其 output 保存最终名字和类型，carries_row_id=false。优化器可优化其输入，
 但不能因输入为空而删掉全表 Aggregate：全表空输入仍须输出 COUNT=0 的一行。
-详细类型、NULL、空输入和支持范围以 grammar.md 0.25 为准；JSON 字段见 json-plan-protocol.md。
+详细类型、NULL、空输入和支持范围以 grammar.md 0.26 为准；JSON 字段见 json-plan-protocol.md。
 
 ## 维护责任
 
@@ -321,3 +331,5 @@ HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter �
   ANALYZE 通过 Java 统一分派点执行目标并采集 actual rows、包含子树的 time 和 loops。
 - 0.14：SeqScanPlan 新增可选精确列集合；优化器加入外连接安全的谓词下推和自顶向下列依赖
   裁剪。JSON/Java 保持缺失或 null 表示全列，并支持空数组的零业务列扫描。
+- 0.15：PlanNode 新增 EmptyResultPlan 和 PlanRelation；安全传播恒假结果，同时保留外连接
+  所需的列身份与关系来源。JSON 和 Java 执行层同步支持 EmptyResult。

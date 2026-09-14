@@ -90,6 +90,10 @@ bool relationOccurs(const PlanPtr& plan, const BoundColumnRef& ref,
         if constexpr (std::is_same_v<T, SeqScanPlan>) {
             return op.table && op.table->id.value == ref.table_id.value &&
                    op.relation_id == ref.relation_id;
+        } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
+            for (const auto& column : op.columns)
+                if (sameRef(column, ref)) return true;
+            return false;
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             return relationOccurs(op.left, ref, depth + 1) ||
                    relationOccurs(op.right, ref, depth + 1);
@@ -139,7 +143,8 @@ Result<PlanPtr> pushNode(const PlanPtr& plan, std::size_t depth) {
         if constexpr (std::is_same_v<T, CreateTablePlan> ||
                       std::is_same_v<T, DropTablePlan> ||
                       std::is_same_v<T, InsertPlan> ||
-                      std::is_same_v<T, SeqScanPlan>) return plan;
+                      std::is_same_v<T, SeqScanPlan> ||
+                      std::is_same_v<T, EmptyResultPlan>) return plan;
         else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             auto left_result = pushNode(op.left, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;

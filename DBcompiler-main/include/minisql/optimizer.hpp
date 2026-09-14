@@ -6,7 +6,7 @@
 namespace minisql {
 
 // 前置条件：输入来自成功的语义分析和 buildPlan（或本函数上一次成功输出）。
-// 常量折叠、保守布尔化简、谓词下推和列裁剪；保持模式版本、根输出和行标识。
+// 常量折叠、谓词下推、空结果传播和列裁剪；保持模式版本、根输出和行标识。
 // 不执行 SQL、不访问 Catalog、不改变原树；基本结构错误返回 Plan / InvalidPlan。
 Result<LogicalPlan> optimizePlan(const LogicalPlan& plan);
 

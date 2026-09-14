@@ -5,7 +5,7 @@
 和 EXPLAIN ANALYZE，以及条件和标量表达式。
 已合入团队成员的 A version2，实现扩展 Lexer、Parser、AST 优化展示和前端调试入口；结合本地 B，
 六类基础语句与 EXPLAIN 已通过 **SQL → Token → AST → 语义分析 → 逻辑计划** 联调。
-现已增加 B 的规则优化：安全常量折叠、布尔化简、恒真 Filter 消除、谓词下推和列裁剪，
+现已增加 B 的规则优化：安全常量折叠、布尔化简、谓词下推、空结果传播和列裁剪，
 并提供前后计划对照。
 JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和自连接已完成绑定、计划生成、打印、
 优化遍历及 JSON 导出。本目录不读写数据库记录；仓库相邻的 `minidb-engine` 通过 JSON
@@ -14,7 +14,7 @@ JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和�
 
 已整合 feature-zhangbo：语法与 B 聚合 AST 已统一，新增空值判定和 DML 别名执行。
 [整合说明与阅读顺序](docs/zhangbo-merge-notes.md)解释接口冲突的解决方式；
-[grammar.md 0.25](grammar.md)给出当前完整执行边界。
+[grammar.md 0.26](grammar.md)给出当前完整执行边界。
 
 ## 1. 目录结构
 
@@ -62,9 +62,10 @@ DBcompiler/
 │   └── optimizer/
 │       ├── constant_fold.hpp/.cpp # B：私有安全常量计算
 │       ├── predicate_pushdown.cpp # B：JOIN 安全的 WHERE 合取项下推
+│       ├── empty_result.cpp # B：恒假输入消除和安全空结果传播
 │       ├── column_pruning.cpp # B：反向列依赖收集和精确扫描
-│       ├── plan_rules.hpp   # B：两条计划规则的私有接口
-│       └── optimizer.cpp    # B：表达式化简及三阶段优化流水线
+│       ├── plan_rules.hpp   # B：三条计划规则的私有接口
+│       └── optimizer.cpp    # B：表达式化简及四阶段优化流水线
 ├── app/main.cpp              # A 调试入口：Token、原 AST、优化 AST 展示
 ├── app/plan_json.cpp         # 完整编译流程及 JSON 计划导出入口
 ├── examples/contracts.cpp    # 手工构造基础 AST、绑定结果和计划
@@ -78,7 +79,7 @@ DBcompiler/
 │   ├── semantic/semantic_tests.cpp # B：语义行为用例
 │   ├── test_support.hpp      # 测试断言和手工 AST 辅助，不属于产品 API
 │   ├── planner/plan_tests.cpp # B：23 个计划结构与打印用例
-│   ├── optimizer/            # B：30 组优化测试及独立参考求值器
+│   ├── optimizer/            # B：34 组优化测试及独立参考求值器
 │   └── integration/scaffold_smoke.cpp # 17 组真实 SQL → Plan/诊断兼容用例
 ├── scripts/check.sh          # 无 CMake 时的编译及检查脚本
 └── build/                    # 本地构建产物，已忽略
@@ -98,7 +99,7 @@ DBcompiler/
 | 语法结构 | parse：基础语句、EXPLAIN、聚合调用、别名、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，检查聚合类型与分组约束，生成 ExplainPlan |
 | 名称与类型 | 保留名称原文和源码范围 | Catalog 查询、关系实例/表列绑定、类型检查、INSERT 重排、UPDATE 规则 |
 | 计划生成 | 提供准确的 AST | 构造增删改查及 NestedLoopJoin/GroupBy/Aggregate/Sort 计划 |
-| 规则优化 | 展示用 AST 折叠，维护原始/优化 AST 对照 | 绑定后计划折叠、布尔化简、谓词下推、列裁剪和等价性测试 |
+| 规则优化 | 展示用 AST 折叠，维护原始/优化 AST 对照 | 绑定后计划折叠、谓词下推、空结果传播、列裁剪和等价性测试 |
 | 错误与测试 | 词法/语法诊断，lexer/parser 测试 | 语义/计划诊断，semantic/planner 测试 |
 | 文档 | 文法语法部分、Token 与 AST 接口 | 文法语义部分、Catalog/Bound/Plan 接口；B 汇总维护文档 |
 | 联调 | 与 B 共建 SQL→AST→计划用例，维护 app 和 integration | 与 A 协同，负责向执行层说明计划契约 |
@@ -191,7 +192,7 @@ CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
 联调驱动显式注册 CREATE 模式，不执行数据库 CRUD。
 优化测试另用测试专用参考求值器比较 SELECT/UPDATE/DELETE 的记录结果、影响行数及错误位置，
 包含 49 种确定性表达式组合；INT64 边界使用明确预期用例。参考求值器不是产品执行引擎。
-当前 30 组计划优化测试及其编译链路通过严格警告与 UBSan 检查；复现命令见
+当前 34 组计划优化测试及其编译链路通过严格警告与 UBSan 检查；复现命令见
 [优化测试说明](tests/optimizer/README.md)。
 
 ## 5. 开发与阅读顺序
@@ -208,7 +209,7 @@ CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
    [剩余功能实现讲解](docs/remaining-features-walkthrough.md)。
    EXPLAIN 按 ExplainStmt → BoundExplain → ExplainPlan → Profiler 阅读
    [EXPLAIN ANALYZE 实现讲解](docs/explain-analyze-walkthrough.md)。
-   优化部分按 constant_fold → optimizeNode → predicate_pushdown → column_pruning 阅读
+   优化部分按 constant_fold → optimizeNode → predicate_pushdown → empty_result → column_pruning 阅读
    [优化代码讲解](docs/optimizer-walkthrough.md)。
 4. 新增功能时在所属 tests 目录增加行为测试，显式更新 CMake；若新增源文件，
    同步 scripts/check.sh 的构建清单。
@@ -226,5 +227,5 @@ SELECT 展示扫描→过滤→投影的数据流；INSERT 展示输入列到表
 UPDATE 展示对更新前值的引用，以及修改操作为什么必须携带内部行标识。
 所有新增模块均带中文注释；后续实现继续同步说明代码组织、设计原因和验证结果。
 
-A/B 的基础编译链路已联调；谓词下推和列裁剪已贯通 JSON 与 Java 执行层。
-空结果算子、索引选择、统计信息和代价优化可作为后续进阶功能。
+A/B 的基础编译链路已联调；谓词下推、空结果传播和列裁剪已贯通 JSON 与 Java 执行层。
+索引选择、统计信息和代价优化可作为后续进阶功能。

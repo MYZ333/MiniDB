@@ -288,7 +288,7 @@ PlanPtr node(T op, std::vector<OutputColumn> output = {}, bool row_id = false) {
     return std::make_shared<const PlanNode>(PlanNode{std::move(op), std::move(output), row_id});
 }
 
-// 所有查询/修改共用同一条输入流水线；首版扫描全表列，不做列裁剪。
+// 所有查询/修改共用同一条输入流水线；生成阶段扫描全列，后续优化器再做列裁剪。
 PlanPtr source(const std::shared_ptr<const TableSchema>& table, const BoundExprPtr& where,
                bool row_id) {
     std::vector<OutputColumn> output;

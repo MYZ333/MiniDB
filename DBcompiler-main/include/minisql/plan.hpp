@@ -33,6 +33,16 @@ struct SeqScanPlan {
     // nullopt 兼容旧计划，表示扫描全列；空 vector 表示仅计数而不读取业务列。
     std::optional<std::vector<BoundColumnRef>> columns = std::nullopt;
 };
+// 空结果仍保存物理列身份和关系来源，供上层表达式及外连接 NULL 扩展恢复布局。
+struct PlanRelation {
+    std::shared_ptr<const TableSchema> table;
+    std::uint64_t relation_id = 0;
+    std::string relation_name = {};
+};
+struct EmptyResultPlan {
+    std::vector<BoundColumnRef> columns;
+    std::vector<PlanRelation> relations;
+};
 // 所有连接的输出布局都固定为左输入列后接右输入列；外连接缺失侧填 NULL。
 struct NestedLoopJoinPlan {
     PlanPtr left;
@@ -89,8 +99,8 @@ struct ExplainPlan {
 };
 
 struct PlanNode {
-    std::variant<CreateTablePlan, DropTablePlan, InsertPlan, SeqScanPlan, NestedLoopJoinPlan,
-                 FilterPlan, GroupByPlan, AggregatePlan, SortPlan, ProjectPlan,
+    std::variant<CreateTablePlan, DropTablePlan, InsertPlan, SeqScanPlan, EmptyResultPlan,
+                 NestedLoopJoinPlan, FilterPlan, GroupByPlan, AggregatePlan, SortPlan, ProjectPlan,
                  UpdatePlan, DeletePlan, ExplainPlan> node;
     std::vector<OutputColumn> output; // 有序业务列；修改类根节点为空。
     bool carries_row_id = false; // 内部行标识不占用 output 的业务列。

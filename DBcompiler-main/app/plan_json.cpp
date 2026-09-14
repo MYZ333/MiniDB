@@ -265,6 +265,23 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
                 }
                 out << ']';
             }
+        } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
+            out << "\"type\":\"EmptyResult\",\"columns\":[";
+            for (std::size_t i = 0; i < node.columns.size(); ++i) {
+                if (i) out << ',';
+                refJson(out, node.columns[i]);
+            }
+            out << "],\"relations\":[";
+            for (std::size_t i = 0; i < node.relations.size(); ++i) {
+                if (i) out << ',';
+                out << "{\"table\":";
+                tableJson(out, node.relations[i].table);
+                out << ",\"relationId\":" << node.relations[i].relation_id
+                    << ",\"relationName\":";
+                stringJson(out, node.relations[i].relation_name);
+                out << '}';
+            }
+            out << ']';
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             out << "\"type\":\"NestedLoopJoin\",\"predicate\":";
             exprJson(out, node.predicate, depth + 1);

@@ -105,7 +105,7 @@ public final class DatabaseEngine {
             case "Aggregate" -> aggregate(node);
             case "Update" -> update(node);
             case "Delete" -> delete(node);
-            case "SeqScan", "NestedLoopJoin", "Filter", "GroupBy", "Sort" ->
+            case "SeqScan", "EmptyResult", "NestedLoopJoin", "Filter", "GroupBy", "Sort" ->
                 throw new EngineException("InvalidPlan", type + " cannot be an execution root");
             default -> throw new EngineException("InvalidPlan", "unknown plan node: " + type);
         };
@@ -167,7 +167,7 @@ public final class DatabaseEngine {
             }
             case "Filter", "GroupBy", "Aggregate", "Sort", "Project", "Update", "Delete" ->
                 validateExplainTree(map(node.get("input"), type + " input"), depth + 1);
-            case "CreateTable", "DropTable", "Insert", "SeqScan" -> { }
+            case "CreateTable", "DropTable", "Insert", "SeqScan", "EmptyResult" -> { }
             default -> throw new EngineException("InvalidPlan",
                 "unknown EXPLAIN plan node: " + type);
         }
@@ -220,6 +220,10 @@ public final class DatabaseEngine {
                 yield "SeqScan [" + tableName +
                     (relation.isEmpty() || relation.equals(tableName) ? "" : " AS " + relation) +
                     "; columns=" + describeScanColumns(node) + "]";
+            }
+            case "EmptyResult" -> {
+                emptyLayout(node);
+                yield "EmptyResult [columns=" + describeEmptyColumns(node) + "]";
             }
             case "NestedLoopJoin" -> "NestedLoopJoin [" +
                 (node.get("joinType") == null ? "INNER" :
@@ -299,6 +303,15 @@ public final class DatabaseEngine {
         List<String> names = new ArrayList<>();
         for (Object raw : columns)
             names.add(describeColumn(map(raw, "scan column")));
+        return String.join(", ", names);
+    }
+
+    private String describeEmptyColumns(Map<String, Object> node) {
+        List<Object> columns = list(node.get("columns"), "empty-result columns");
+        if (columns.isEmpty()) return "<none>";
+        List<String> names = new ArrayList<>();
+        for (Object raw : columns)
+            names.add(describeColumn(map(raw, "empty-result column")));
         return String.join(", ", names);
     }
 
@@ -780,6 +793,7 @@ public final class DatabaseEngine {
     private List<PlanRow> readInputRaw(Map<String, Object> node, String type) {
         return switch (type) {
             case "SeqScan" -> scan(node);
+            case "EmptyResult" -> emptyResult(node);
             case "Filter" -> filter(node);
             case "NestedLoopJoin" -> nestedLoopJoin(node);
             case "GroupBy" -> groupBy(node);
@@ -802,6 +816,12 @@ public final class DatabaseEngine {
             result.add(new PlanRow(Map.of(relationId, row.id()), layout, values));
         }
         return result;
+    }
+
+    private List<PlanRow> emptyResult(Map<String, Object> node) {
+        // 即使没有数据行，也要在执行边界验证优化器保留的身份布局。
+        emptyLayout(node);
+        return List.of();
     }
 
     /**
@@ -890,6 +910,7 @@ public final class DatabaseEngine {
 
     private List<ColumnSlot> layoutFor(Map<String, Object> node) {
         String type = string(node.get("type"), "layout node type");
+        if (type.equals("EmptyResult")) return emptyLayout(node);
         if (type.equals("SeqScan")) {
             TableSchema table = resolveTable(map(node.get("table"), "layout table"));
             long relationId = optionalLong(node.get("relationId"), table.id());
@@ -910,6 +931,52 @@ public final class DatabaseEngine {
             return layout;
         }
         throw new EngineException("InvalidPlan", "cannot derive layout for " + type);
+    }
+
+    /** Validates the retained identity layout used when an outer join NULL-extends an empty side. */
+    private List<ColumnSlot> emptyLayout(Map<String, Object> node) {
+        List<ColumnSlot> layout = new ArrayList<>();
+        List<Map<String, Object>> columns = objectList(
+            node.get("columns"), "empty-result columns", "empty-result column");
+        if (columns.size() != list(node.get("output"), "empty-result output").size())
+            throw new EngineException("InvalidPlan",
+                "empty-result columns must match output metadata");
+        List<Map<String, Object>> relations = objectList(
+            node.get("relations"), "empty-result relations", "empty-result relation");
+        if (relations.isEmpty())
+            throw new EngineException("InvalidPlan",
+                "empty-result must retain at least one relation");
+        for (Map<String, Object> relation : relations) {
+            TableSchema table = resolveTable(
+                map(relation.get("table"), "empty-result relation table"));
+            optionalLong(relation.get("relationId"), table.id());
+            if (relation.get("relationName") != null)
+                string(relation.get("relationName"), "empty-result relation name");
+        }
+        for (Map<String, Object> reference : columns) {
+            ColumnSlot slot = slotFromReference(reference);
+            TableSchema table = tablesById.get(slot.tableId());
+            if (table == null || slot.ordinal() < 0 || slot.ordinal() >= table.columns().size())
+                throw new EngineException("InvalidPlan",
+                    "empty-result column does not match catalog");
+            ColumnSchema column = table.columns().get(slot.ordinal());
+            if (slot.columnId() != column.id() || !slot.type().equals(column.type()))
+                throw new EngineException("InvalidPlan",
+                    "empty-result column metadata does not match catalog");
+            boolean knownRelation = relations.stream().anyMatch(relation -> {
+                Map<String, Object> encoded = map(
+                    relation.get("table"), "empty-result relation table");
+                return longValue(encoded.get("id"), "table id") == slot.tableId() &&
+                    optionalLong(relation.get("relationId"), slot.tableId()) == slot.relationId();
+            });
+            if (!knownRelation)
+                throw new EngineException("InvalidPlan",
+                    "empty-result column has no matching relation");
+            if (layout.contains(slot))
+                throw new EngineException("InvalidPlan", "empty-result column is duplicated");
+            layout.add(slot);
+        }
+        return layout;
     }
 
     /** Without aggregates GROUP BY keeps the first row for every distinct key tuple. */

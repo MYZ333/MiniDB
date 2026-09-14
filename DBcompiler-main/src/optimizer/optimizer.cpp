@@ -1,4 +1,4 @@
-// 优化流水线：先自底向上化简表达式，再做谓词下推，最后按依赖裁剪扫描列。
+// 优化流水线：表达式化简、谓词下推、空结果传播，再按依赖裁剪扫描列。
 #include "minisql/optimizer.hpp"
 #include "constant_fold.hpp"
 #include "plan_rules.hpp"
@@ -118,7 +118,8 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, DropTablePlan> ||
-                      std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan>) {
+                      std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan> ||
+                      std::is_same_v<T, EmptyResultPlan>) {
             return plan; // DDL、字面量 INSERT 和扫描没有可折叠的子表达式。
         } else if constexpr (std::is_same_v<T, ExplainPlan>) {
             if (plan->carries_row_id || plan->output.size() != 1 ||
@@ -160,7 +161,7 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
                 auto predicate = std::get<BoundExprPtr>(std::move(expression));
                 const auto value = boolean(predicate);
                 if (value && *value) return input; // TRUE Filter 原样透传，直接用输入替代。
-                // FALSE Filter 仍保留；不新增空结果算子，不移除修改语句的根。
+                // FALSE Filter 暂留给后续空结果规则；该规则还要判断输入能否安全跳过。
                 if (input == op.input && predicate == op.predicate) return plan;
                 return replace(plan, FilterPlan{predicate, input});
             } else if constexpr (std::is_same_v<T, UpdatePlan>) {
@@ -269,7 +270,10 @@ Result<LogicalPlan> optimizePlan(const LogicalPlan& plan) {
     auto pushed = optimizer_detail::pushDownPredicates(
         std::get<PlanPtr>(std::move(simplified)));
     if (const auto* error = std::get_if<Diagnostic>(&pushed)) return *error;
-    auto pruned = optimizer_detail::pruneColumns(std::get<PlanPtr>(std::move(pushed)));
+    auto emptied = optimizer_detail::eliminateEmptyInputs(
+        std::get<PlanPtr>(std::move(pushed)));
+    if (const auto* error = std::get_if<Diagnostic>(&emptied)) return *error;
+    auto pruned = optimizer_detail::pruneColumns(std::get<PlanPtr>(std::move(emptied)));
     if (const auto* error = std::get_if<Diagnostic>(&pruned)) return *error;
     return LogicalPlan{plan.catalog_version, std::get<PlanPtr>(std::move(pruned))};
 }

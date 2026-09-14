@@ -1,4 +1,4 @@
-# MiniSQL 文法（接口版本 0.25）
+# MiniSQL 文法（接口版本 0.26）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 已整合 feature-zhangbo 的语法扩展与 B 的聚合实现。下列 EBNF 描述 A 能解析的范围，
@@ -112,7 +112,7 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 | LIKE/NOT LIKE、VARCHAR(n)、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT | 支持 | 支持 |
 | 多行 INSERT、DROP TABLE（含 IF EXISTS 和多表名） | 支持 | 支持 |
 | EXPLAIN / EXPLAIN ANALYZE | 支持包裹六类基础语句 | 展示优化后计划；ANALYZE 额外执行并采样 |
-| 谓词下推与列裁剪 | 不改变 SQL 文法 | B 改写逻辑计划，Java 按裁剪后的扫描布局执行 |
+| 谓词下推、空结果传播与列裁剪 | 不改变 SQL 文法 | B 改写逻辑计划，Java 执行精简后的算子和扫描布局 |
 
 B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划再把它们传给 Java。
 因此 LIMIT 不会被忽略，外连接不会退化为内连接，多行 INSERT 和建表约束也不会丢失。
@@ -168,6 +168,11 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
 - 列裁剪从最终投影反向加入 Filter、JOIN、GROUP/HAVING、ORDER BY 和表达式依赖；SeqScan
   按原表模式顺序只物化这些列。UPDATE 因整行写回和约束检查保留全列，RowId 独立于业务列；
   DELETE 只保留条件列，COUNT(*) 可使用零业务列扫描。
+- 恒假 Filter 和恒假 INNER JOIN 在其输入不会产生副作用或运行期错误时改写为 EmptyResult。
+  INNER 任一侧为空、LEFT 左侧为空、RIGHT 右侧为空、FULL 两侧均为空时可以继续传播；另一侧
+  可能报错时保持原算子。Project、全局 Aggregate、UPDATE/DELETE 和 Explain 根边界不会删除，
+  从而保留查询列名、空输入 COUNT(*)、修改影响行数和计划展示语义。
+  `LIMIT 0` 的普通查询在输入及投影表达式均不会报错时同样跳过输入。
 
 实现限制：语义分析接受的表达式单条路径最多 256 个 AST 节点（根计为第 1 层），
 超过时报告 Semantic / ExpressionTooDeep，避免递归耗尽调用栈。这是资源限制，
@@ -238,3 +243,5 @@ SELECT * FROM student OFFSET 2; -- OFFSET 当前必须跟在 LIMIT 后
   算子调用路径采集 actual rows/time/loops，并明确 ANALYZE 修改类语句的副作用。
 - 0.25：B 新增保持外连接与运行期错误语义的谓词下推，以及覆盖投影、条件、连接、分组、
   聚合和排序依赖的列裁剪；SeqScan 精确列集合贯通 JSON、Java 执行和 EXPLAIN 展示。
+- 0.26：新增 EmptyResult 逻辑算子和安全空结果传播。空节点保留列身份及关系来源，支持外连接
+  NULL 扩展；Java 可执行并在 EXPLAIN ANALYZE 中显示零行且不访问被消除的扫描。

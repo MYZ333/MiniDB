@@ -90,13 +90,15 @@ int main() {
             expectEquivalent(before, sampleRows());
         }
     });
-    suite.run("false Filter and DML roots remain present", [] {
+    suite.run("false Filter becomes EmptyResult while statement roots remain", [] {
         Fixture f;
         for (const std::string sql : {"SELECT * FROM student WHERE 1=0;", "UPDATE student SET age=1/0 WHERE 1=0;", "DELETE FROM student WHERE 1=0;"}) {
             const auto before = f.compile(sql);
             const auto after = value(optimizePlan(before));
             check(before.root->node.index() == after.root->node.index(), "DML/query root removed");
-            check(formatPlan(after).find("Filter[FALSE]") != std::string::npos, "false Filter removed");
+            check(formatPlan(after).find("EmptyResult") != std::string::npos &&
+                  formatPlan(after).find("SeqScan[") == std::string::npos,
+                  "false Filter did not remove its safe input");
             expectEquivalent(before, sampleRows());
         }
     });
@@ -110,7 +112,7 @@ int main() {
         const auto empty = value(optimizePlan(
             f.compile("SELECT COUNT(*) FROM student WHERE 1=0;")));
         const auto& filtered = std::get<AggregatePlan>(empty.root->node);
-        check(std::holds_alternative<FilterPlan>(filtered.input->node),
+        check(std::holds_alternative<EmptyResultPlan>(filtered.input->node),
               "global aggregate over empty input must retain its result boundary");
     });
     suite.run("UPDATE RHS folds without replacing old-row references", [] {
@@ -162,7 +164,7 @@ int main() {
             check(std::holds_alternative<SeqScanPlan>(std::get<ProjectPlan>(after.root->node).input->node), "true comparison not folded");
         }
         const auto after = value(optimizePlan(f.compile("SELECT * FROM student WHERE 'Alice'='alice';")));
-        check(formatPlan(after).find("Filter[FALSE]") != std::string::npos, "string case changed");
+        check(formatPlan(after).find("EmptyResult") != std::string::npos, "string case changed");
     });
     suite.run("FLOAT and BOOL constants fold after binding", [] {
         MemoryCatalog catalog;
@@ -366,6 +368,60 @@ int main() {
         check(!scanBelow(update.root).columns,
               "UPDATE must retain the complete old row for validation and writeback");
     });
+    suite.run("constant-false JOIN and downstream operators propagate emptiness", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"student_id", DataType::Int},
+                                               {"value", DataType::Int}}));
+        value(f.catalog.createTable("award", {{"student_id", DataType::Int},
+                                               {"title", DataType::Varchar}}));
+        const auto inner = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student JOIN score ON 1=0 ORDER BY student.name;")));
+        const auto& inner_project = std::get<ProjectPlan>(inner.root->node);
+        check(std::holds_alternative<EmptyResultPlan>(inner_project.input->node) &&
+              formatPlan(inner).find("NestedLoopJoin[") == std::string::npos &&
+              formatPlan(inner).find("Sort[") == std::string::npos,
+              "constant-false INNER JOIN did not collapse through Sort");
+        check(value(optimizePlan(inner)).root == inner.root,
+              "EmptyResult optimization did not reach a fixed point");
+
+        const auto outer = value(optimizePlan(f.compile(
+            "SELECT award.title FROM student JOIN score ON 1=0 "
+            "RIGHT JOIN award ON score.student_id=award.student_id;")));
+        const auto& outer_join = std::get<NestedLoopJoinPlan>(
+            std::get<ProjectPlan>(outer.root->node).input->node);
+        const auto& empty_left = std::get<EmptyResultPlan>(outer_join.left->node);
+        check(outer_join.type == JoinType::Right && empty_left.columns.size() == 1 &&
+              empty_left.columns.front().table_id.value == 2 &&
+              !empty_left.relations.empty(),
+              "outer JOIN empty side lost the score key or relation metadata");
+    });
+    suite.run("empty-result elimination does not hide JOIN runtime errors", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"student_id", DataType::Int}}));
+        const auto after = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student JOIN score "
+            "ON student.id/0=score.student_id WHERE 1=0;")));
+        const auto& filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(after.root->node).input->node);
+        check(std::holds_alternative<NestedLoopJoinPlan>(filter.input->node) &&
+              formatPlan(after).find("Filter[FALSE]") != std::string::npos,
+              "EmptyResult skipped an input with an observable arithmetic error");
+    });
+    suite.run("LIMIT zero skips only inputs with safe projection evaluation", [] {
+        Fixture f;
+        const auto safe = value(optimizePlan(
+            f.compile("SELECT name FROM student LIMIT 0;")));
+        check(std::holds_alternative<EmptyResultPlan>(
+                  std::get<ProjectPlan>(safe.root->node).input->node) &&
+              formatPlan(safe).find("SeqScan[") == std::string::npos,
+              "LIMIT 0 retained a safe scan");
+
+        const auto dangerous = value(optimizePlan(
+            f.compile("SELECT 1/age FROM student LIMIT 0;")));
+        check(std::holds_alternative<SeqScanPlan>(
+                  std::get<ProjectPlan>(dangerous.root->node).input->node),
+              "LIMIT 0 hid a projection division error");
+    });
     suite.run("SELECT equivalence on multiple predicates and rows", [] {
         Fixture f;
         for (const std::string predicate : {"1=1 AND age>10+8", "NOT(1=0) AND (id>1 OR 2=3)",
@@ -416,6 +472,20 @@ int main() {
         failure(optimizePlan(LogicalPlan{1, std::make_shared<const PlanNode>(bad)}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
         bad = *project.input; std::get<FilterPlan>(bad.node).predicate = nullptr;
         failure(optimizePlan(LogicalPlan{1, std::make_shared<const PlanNode>(bad)}), ErrorCode::InvalidPlan, DiagnosticStage::Plan);
+    });
+    suite.run("malformed EmptyResult identity layout returns a diagnostic", [] {
+        Fixture f;
+        const auto optimized = value(optimizePlan(
+            f.compile("SELECT name FROM student WHERE 1=0;")));
+        auto root = *optimized.root;
+        const auto& project = std::get<ProjectPlan>(root.node);
+        auto empty = *project.input;
+        std::get<EmptyResultPlan>(empty.node).relations.clear();
+        std::get<ProjectPlan>(root.node).input =
+            std::make_shared<const PlanNode>(std::move(empty));
+        failure(optimizePlan(LogicalPlan{optimized.catalog_version,
+                    std::make_shared<const PlanNode>(std::move(root))}),
+                ErrorCode::InvalidPlan, DiagnosticStage::Plan);
     });
     suite.run("UPDATE missing RHS and missing row identity return diagnostics", [] {
         Fixture f;

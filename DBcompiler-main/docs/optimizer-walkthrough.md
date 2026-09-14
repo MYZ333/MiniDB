@@ -14,6 +14,7 @@
 | src/optimizer/optimizer.cpp | 流水线入口和基础树改写 | optimizeExpr → optimizeNode → optimizePlan |
 | src/optimizer/plan_rules.hpp | 私有规则接口 | 规则不进入公共 API，由入口固定排序 |
 | src/optimizer/predicate_pushdown.cpp | 谓词下推 | 拆 AND、识别关系实例、保护外连接与错误顺序 |
+| src/optimizer/empty_result.cpp | 空结果传播 | 消除安全的恒假输入，保留布局并守住语句根边界 |
 | src/optimizer/column_pruning.cpp | 列裁剪 | 从根反向收集列依赖，重建 SeqScan 输出模式 |
 | examples/optimizer.cpp | 真实 SQL 的完整演示 | 串联 A/B 后保存和打印前后计划 |
 | tests/optimizer/optimizer_tests.cpp | 边界、等价性与接口回归 | 真 SQL 输入；明确算术预期与独立求值对照 |
@@ -41,7 +42,8 @@ Project[name]                     Project[name]
 
 这是简写示意，实际 formatPlan 还会显示列类型、CatalogVersion 和 row_id。
 如果条件只有 `1=1`，optimizeNode 会删除整个 Filter，Project 直接连接 SeqScan。
-如果条件是 `1=0`，则保留 Filter[FALSE]；第一版没有增加 EmptyResult 算子。
+如果条件是 `1=0` 且输入可安全跳过，Filter 和扫描会被一个 EmptyResult 叶节点替换；
+Project 仍保留最终列名，因此查询返回结构正确的零行结果。
 
 ## 3. 常量折叠为什么需要单独一个模块
 
@@ -113,7 +115,33 @@ NULL 扩展行，结果会变化。常量条件没有关系归属，跨表条件
 下推；WHERE 中出现危险合取项后，不再把后续条件提前。这样不会让提前筛选跳过原本可达的
 除零或溢出。例如 `id/0=1 AND score>60` 的右侧条件必须留在错误之后。
 
-## 7. 列裁剪如何组织
+## 7. 空结果为什么不等于简单删除 Filter
+
+`empty_result.cpp` 在谓词下推之后遍历计划。`Filter[FALSE]` 可以确定没有输出行，但执行器原本
+会先执行 Filter 的输入；如果输入 JOIN ON 中存在 `id/0`，直接替换会把应当发生的除零错误隐藏。
+因此 `safeToSkip` 只允许跳过扫描、EmptyResult，以及条件和排序表达式均不会报错的 Filter、
+Join、GroupBy、Sort。算术、一元取负、聚合和修改节点都作为保守边界。
+
+连接按以下规则传播空结果：
+
+| JOIN 类型 | 可以判空的条件 |
+|---|---|
+| INNER | 任一输入为空，或 ON 恒假 |
+| LEFT | 左输入为空 |
+| RIGHT | 右输入为空 |
+| FULL | 两个输入都为空 |
+
+若判空会跳过另一个可能报错的输入，则保留原 JOIN。LEFT 的右侧为空、RIGHT 的左侧为空、FULL
+只有一侧为空时也不能判空，因为保留侧仍会产生 NULL 扩展行。
+
+EmptyResult 是叶节点，却不能只存一个“空”标志。`columns` 保存有序 BoundColumnRef，
+`relations` 保存表模式和关系实例；RIGHT/FULL JOIN 可以据此为已经消失的输入构造类型和身份正确的
+NULL 行。Sort 和纯 GroupBy 可以继续折叠，Project、Aggregate、Update/Delete、Explain 保留：
+Project 提供结果列名，全局 Aggregate 必须产生 `COUNT(*)=0`，修改根必须返回影响行数 0。
+对于 `LIMIT 0`，Project 根仍保留，但无风险输入可直接换成 EmptyResult；若投影含除法等
+可能报错的计算，则继续读取输入并维持当前执行器“先投影、后分页”的顺序。
+
+## 8. 列裁剪如何组织
 
 `pruneNode(plan, required)` 是从根向叶的依赖传递。`required` 保存执行当前节点之后仍需读取的
 `BoundColumnRef`，以 `table_id + relation_id + column_id + ordinal + type` 去重：
@@ -134,7 +162,7 @@ Java 的 `scanLayout` 是这项契约的执行边界。它对每个列引用与�
 按身份找列，不把原表 ordinal 误当成紧凑数组下标。`layoutFor` 复用同一函数，保证外连接构造
 NULL 行时使用完全相同的布局。EXPLAIN 会显示 `columns=<all>`、精确列名或 `<none>`。
 
-## 8. 如何验证等价性
+## 9. 如何验证等价性
 
 测试从 SQL 经真实 lex/parse/analyze/buildPlan 得到输入，再调用 optimizePlan。
 除了比较树结构，还用独立参考求值器在多行和空表上运行前后计划，比较：
@@ -146,7 +174,8 @@ NULL 行时使用完全相同的布局。EXPLAIN 会显示 `columns=<all>`、精
 参考求值器不调用 constant_fold，避免两边共享同一个错误算法。
 它把算术操作数限制在 ±2^30 内，不模拟全范围溢出；INT64 边界通过独立明确的
 预期向量验证。49 种确定性表达式组合额外覆盖列值参与除法及除数为零的情况。
-新增结构测试还覆盖 INNER 双侧下推、LEFT/FULL 边界、危险表达式顺序、查询/DML 裁剪和
-重复优化固定点。根目录的 `scripts/check_advanced_execution.sh` 会从真实 SQL 导出优化 JSON，
+新增结构测试还覆盖 INNER 双侧下推、LEFT/FULL 边界、危险表达式顺序、查询/DML 裁剪、
+恒假 Filter/JOIN 与安全 LIMIT 0 传播、危险表达式保留、EmptyResult 身份校验和重复优化固定点。
+根目录的 `scripts/check_advanced_execution.sh` 会从真实 SQL 导出优化 JSON，
 由 Java 验证下推后的行数、扫描列名、零列 COUNT(*) 和最终查询结果。参考求值器仍主要负责
 单表常量优化；跨表和紧凑运行时布局由这组端到端测试负责。

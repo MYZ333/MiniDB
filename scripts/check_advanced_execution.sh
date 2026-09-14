@@ -22,6 +22,7 @@ sources=(
     "$compiler_dir/src/planner/plan_printer.cpp"
     "$compiler_dir/src/optimizer/constant_fold.cpp"
     "$compiler_dir/src/optimizer/predicate_pushdown.cpp"
+    "$compiler_dir/src/optimizer/empty_result.cpp"
     "$compiler_dir/src/optimizer/column_pruning.cpp"
     "$compiler_dir/src/optimizer/optimizer.cpp"
 )

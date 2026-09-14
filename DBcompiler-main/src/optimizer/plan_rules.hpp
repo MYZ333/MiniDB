@@ -6,6 +6,7 @@
 namespace minisql::optimizer_detail {
 
 Result<PlanPtr> pushDownPredicates(const PlanPtr& plan);
+Result<PlanPtr> eliminateEmptyInputs(const PlanPtr& plan);
 Result<PlanPtr> pruneColumns(const PlanPtr& plan);
 
 } // namespace minisql::optimizer_detail

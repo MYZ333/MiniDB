@@ -16,7 +16,7 @@
 导出后模拟 Catalog 变更，因此后续语句看到正确模式；Java 引擎必须采用相同的版本规则。
 `EXPLAIN ANALYZE` 包裹 CREATE/DROP 时也按实际执行处理该变更，普通 EXPLAIN 不改变 Catalog。
 
-节点类型为 `CreateTable`、`DropTable`、`Insert`、`SeqScan`、`NestedLoopJoin`、`Filter`、
+节点类型为 `CreateTable`、`DropTable`、`Insert`、`SeqScan`、`EmptyResult`、`NestedLoopJoin`、`Filter`、
 `GroupBy`、`Aggregate`、`Sort`、`Project`、`Update`、`Delete` 和 `Explain`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
 `relationId`、`ordinal`、`type`。表列还可含 `varcharLength`、`primaryKey`、`notNull`、
 `unique`、`defaultValue` 和 `hasDefault`；后一个字段用于区分“没有默认值”和 `DEFAULT NULL`。
@@ -33,6 +33,9 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
   `columns` 为扫描要物化的精确列引用：缺失或 JSON null 表示全表列，非空数组表示裁剪后的
   子集，空数组表示只产生行数/RowId 而不读取业务列。数组顺序也是运行时行布局顺序；当前
   优化器按表模式 ordinal 升序导出，执行器会逐项校验 tableId、relationId、columnId、ordinal 和 type。
+- `EmptyResult` 不含可执行子节点，读取它固定返回零行。`columns` 是与节点 output 对齐的
+  列引用数组；`relations` 保存原输入关系的 `table`、`relationId` 和 `relationName`。
+  Java 在返回零行前仍校验这些元数据，并在外连接补 NULL 时从 columns 恢复身份布局。
 - `GroupBy` 使用 `keys` 和 `input`，当前表示按键去重。
 - `Sort` 使用有序 `items` 和 `input`；每项用 `kind` 区分 `column` 或 `expression`，
   并包含 `ASC`/`DESC` direction。
@@ -44,7 +47,7 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
 这些字段是协议 1 的向后兼容扩展：旧计划缺少 relationId 时，Java 引擎回退到 tableId；
 旧计划缺少 columns 时，Java 引擎扫描全列。
 当前 Java 引擎已执行全部上述节点，并以 Project.output 或 Aggregate.output 中的名称展示列别名。
-旧引擎不能执行新增 Aggregate/Explain 节点；含聚合或 EXPLAIN SQL 需同步更新编译器和引擎。
+旧引擎不能执行新增 Aggregate/EmptyResult/Explain 节点；相关 SQL 计划需同步更新编译器和引擎。
 
 `carriesRowId` 为 true 时，Java 存储适配层必须让扫描结果携带稳定 RowId；UPDATE
 和 DELETE 使用该 RowId 定位原记录，不能按业务列值猜测记录身份。

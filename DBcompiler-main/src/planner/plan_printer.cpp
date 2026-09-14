@@ -127,8 +127,13 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
             collectRelations(op.input, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             addRelation(relations, op.table, op.relation_id, op.relation_name);
+        } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
+            for (const auto& relation : op.relations)
+                addRelation(relations, relation.table, relation.relation_id,
+                            relation.relation_name);
         } else if constexpr (!std::is_same_v<T, CreateTablePlan> &&
-                             !std::is_same_v<T, DropTablePlan>) {
+                             !std::is_same_v<T, DropTablePlan> &&
+                             !std::is_same_v<T, EmptyResultPlan>) {
             addRelation(relations, op.table, 0, op.table ? op.table->name : std::string{});
         }
     }, plan->node);
@@ -228,6 +233,13 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                     if (i) out << ", ";
                     out << columnName((*op.columns)[i], relations);
                 }
+            }
+        } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
+            out << "EmptyResult[columns=";
+            if (op.columns.empty()) out << "<none>";
+            for (std::size_t i = 0; i < op.columns.size(); ++i) {
+                if (i) out << ", ";
+                out << columnName(op.columns[i], relations);
             }
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             left = op.left;

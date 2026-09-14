@@ -23,6 +23,7 @@ add_library(minisql_backend STATIC
     src/planner/plan_printer.cpp
     src/optimizer/constant_fold.cpp
     src/optimizer/predicate_pushdown.cpp
+    src/optimizer/empty_result.cpp
     src/optimizer/column_pruning.cpp
     src/optimizer/optimizer.cpp)
 target_link_libraries(minisql_backend PUBLIC minisql_contracts)

@@ -54,6 +54,10 @@ bool relationOccurs(const PlanPtr& plan, const BoundColumnRef& ref,
         if constexpr (std::is_same_v<T, SeqScanPlan>) {
             return op.table && op.table->id.value == ref.table_id.value &&
                    op.relation_id == ref.relation_id;
+        } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
+            for (const auto& column : op.columns)
+                if (sameRef(column, ref)) return true;
+            return false;
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             return relationOccurs(op.left, ref, depth + 1) ||
                    relationOccurs(op.right, ref, depth + 1);
@@ -85,6 +89,13 @@ bool sameSelection(const std::optional<RequiredColumns>& left,
     if (left->size() != right->size()) return false;
     for (std::size_t i = 0; i < left->size(); ++i)
         if (!sameRef((*left)[i], (*right)[i])) return false;
+    return true;
+}
+
+bool sameRefs(const RequiredColumns& left, const RequiredColumns& right) {
+    if (left.size() != right.size()) return false;
+    for (std::size_t i = 0; i < left.size(); ++i)
+        if (!sameRef(left[i], right[i])) return false;
     return true;
 }
 
@@ -138,6 +149,20 @@ Result<PlanPtr> pruneNode(const PlanPtr& plan, RequiredColumns required,
                 return plan;
             return rebuild(plan, SeqScanPlan{op.table, op.relation_id, op.relation_name,
                                              std::move(selection)},
+                           std::move(output), plan->carries_row_id);
+        } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
+            if (op.columns.size() != plan->output.size())
+                return invalid("EmptyResult columns do not match output metadata");
+            RequiredColumns selected;
+            std::vector<OutputColumn> output;
+            for (std::size_t index = 0; index < op.columns.size(); ++index) {
+                if (!contains(required, op.columns[index])) continue;
+                selected.push_back(op.columns[index]);
+                output.push_back(plan->output[index]);
+            }
+            if (sameRefs(op.columns, selected) && sameOutput(plan->output, output))
+                return plan;
+            return rebuild(plan, EmptyResultPlan{std::move(selected), op.relations},
                            std::move(output), plan->carries_row_id);
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             require(required, op.predicate);

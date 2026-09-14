@@ -102,6 +102,7 @@ void printOutline(const PlanNode& plan) {
         else if constexpr (std::is_same_v<T, DropTablePlan>) std::cout << "DropTable";
         else if constexpr (std::is_same_v<T, InsertPlan>) std::cout << "Insert";
         else if constexpr (std::is_same_v<T, SeqScanPlan>) std::cout << "SeqScan";
+        else if constexpr (std::is_same_v<T, EmptyResultPlan>) std::cout << "EmptyResult";
         else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             std::cout << "NestedLoopJoin -> (";
             printOutline(*op.left);

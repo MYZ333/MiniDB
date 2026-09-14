@@ -13,7 +13,7 @@ public final class OptimizerRulesEngineTest {
             throw new IllegalArgumentException("expected optimizer-rules plan path");
         List<DatabaseEngine.ExecutionResult> results = new DatabaseEngine()
             .executeProgramJson(Files.readString(Path.of(args[0])));
-        check(results.size() == 8, "every optimizer demo statement must return a result");
+        check(results.size() == 19, "every optimizer demo statement must return a result");
 
         List<String> joinPlan = explainLines(results.get(4));
         check(operatorCount(joinPlan, "Filter") == 2,
@@ -40,6 +40,38 @@ public final class OptimizerRulesEngineTest {
         check(countScan.contains("columns=<none>") && countScan.contains("actual rows=3"),
             "COUNT(*) did not use a zero-column scan: " + countScan);
         assertRows(results.get(7), List.of(List.of(3L)), "COUNT(*) result");
+
+        List<String> emptyPlan = explainLines(results.get(8));
+        check(operatorCount(emptyPlan, "EmptyResult") == 1 &&
+              operatorCount(emptyPlan, "SeqScan") == 0,
+              "constant-false Filter still scans storage");
+        assertMetric(emptyPlan, "EmptyResult", 0);
+        assertRows(results.get(9), List.of(), "constant-false SELECT result");
+
+        List<String> zeroLimit = explainLines(results.get(10));
+        check(operatorCount(zeroLimit, "EmptyResult") == 1 &&
+              operatorCount(zeroLimit, "SeqScan") == 0,
+              "LIMIT 0 still scans a safe input");
+        assertRows(results.get(11), List.of(), "LIMIT 0 result");
+
+        List<String> emptyAggregate = explainLines(results.get(12));
+        assertMetric(emptyAggregate, "Aggregate", 1);
+        assertMetric(emptyAggregate, "EmptyResult", 0);
+        assertRows(results.get(13), List.of(List.of(0L)),
+            "global aggregate over EmptyResult");
+
+        List<String> outerPlan = explainLines(results.get(14));
+        check(operatorCount(outerPlan, "EmptyResult") == 1 &&
+              operatorCount(outerPlan, "NestedLoopJoin") == 1,
+              "RIGHT JOIN did not retain an EmptyResult input");
+        assertRows(results.get(15), List.of(
+            List.of("Alice"), List.of("Bob"), List.of("Cara")),
+            "outer JOIN NULL extension over EmptyResult");
+        check(results.get(16).equals(new DatabaseEngine.CommandResult("UPDATE", 0)) &&
+              results.get(17).equals(new DatabaseEngine.CommandResult("DELETE", 0)),
+              "empty DML did not preserve its root operation and zero affected rows");
+        assertRows(results.get(18), List.of(List.of(3L)),
+            "empty DML changed stored rows or evaluated an unreachable RHS");
         System.out.println("OptimizerRulesEngineTest passed");
     }
 

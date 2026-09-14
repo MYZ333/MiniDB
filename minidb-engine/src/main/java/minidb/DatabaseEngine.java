@@ -218,7 +218,8 @@ public final class DatabaseEngine {
                 String relation = node.get("relationName") instanceof String
                     ? string(node.get("relationName"), "relation name") : tableName;
                 yield "SeqScan [" + tableName +
-                    (relation.isEmpty() || relation.equals(tableName) ? "" : " AS " + relation) + "]";
+                    (relation.isEmpty() || relation.equals(tableName) ? "" : " AS " + relation) +
+                    "; columns=" + describeScanColumns(node) + "]";
             }
             case "NestedLoopJoin" -> "NestedLoopJoin [" +
                 (node.get("joinType") == null ? "INNER" :
@@ -288,6 +289,17 @@ public final class DatabaseEngine {
         List<String> references = new ArrayList<>();
         for (Object raw : values) references.add(describeColumn(map(raw, label)));
         return references.isEmpty() ? "<all>" : String.join(", ", references);
+    }
+
+    /** Shows the physical scan width so EXPLAIN can demonstrate column pruning. */
+    private String describeScanColumns(Map<String, Object> node) {
+        if (node.get("columns") == null) return "<all>";
+        List<Object> columns = list(node.get("columns"), "scan columns");
+        if (columns.isEmpty()) return "<none>";
+        List<String> names = new ArrayList<>();
+        for (Object raw : columns)
+            names.add(describeColumn(map(raw, "scan column")));
+        return String.join(", ", names);
     }
 
     private String describeColumn(Map<String, Object> reference) {
@@ -779,19 +791,51 @@ public final class DatabaseEngine {
     private List<PlanRow> scan(Map<String, Object> node) {
         TableSchema table = resolveTable(map(node.get("table"), "scan table"));
         long relationId = optionalLong(node.get("relationId"), table.id());
-        List<ColumnSlot> layout = new ArrayList<>();
-        for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
-            ColumnSchema column = table.columns().get(ordinal);
-            layout.add(new ColumnSlot(
-                table.id(), column.id(), relationId, ordinal, column.type()));
-        }
+        List<ColumnSlot> layout = scanLayout(node, table, relationId);
         List<PlanRow> result = new ArrayList<>();
         for (StoredRow row : records.scan(table.id())) {
-            if (row.values().size() != layout.size())
+            if (row.values().size() != table.columns().size())
                 throw new EngineException("StorageFailure", "stored row does not match table schema");
-            result.add(new PlanRow(Map.of(relationId, row.id()), layout, row.values()));
+            // 存储层仍保存完整记录；执行层只物化优化器请求的列。
+            List<Object> values = new ArrayList<>();
+            for (ColumnSlot slot : layout) values.add(row.values().get(slot.ordinal()));
+            result.add(new PlanRow(Map.of(relationId, row.id()), layout, values));
         }
         return result;
+    }
+
+    /**
+     * Converts the optional SeqScan.columns contract into a checked runtime layout.
+     * A missing/null field means all columns for old plans; an empty array is valid.
+     */
+    private List<ColumnSlot> scanLayout(Map<String, Object> node, TableSchema table,
+                                        long relationId) {
+        List<ColumnSlot> layout = new ArrayList<>();
+        Object selected = node.get("columns");
+        if (selected == null) {
+            for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
+                ColumnSchema column = table.columns().get(ordinal);
+                layout.add(new ColumnSlot(table.id(), column.id(), relationId,
+                                          ordinal, column.type()));
+            }
+            return layout;
+        }
+        for (Map<String, Object> reference :
+                objectList(selected, "scan columns", "scan column")) {
+            ColumnSlot slot = slotFromReference(reference);
+            if (slot.tableId() != table.id() || slot.relationId() != relationId
+                || slot.ordinal() < 0 || slot.ordinal() >= table.columns().size())
+                throw new EngineException("InvalidPlan",
+                    "scan column does not belong to the requested relation");
+            ColumnSchema column = table.columns().get(slot.ordinal());
+            if (slot.columnId() != column.id() || !slot.type().equals(column.type()))
+                throw new EngineException("InvalidPlan",
+                    "scan column metadata does not match catalog");
+            if (layout.contains(slot))
+                throw new EngineException("InvalidPlan", "scan column is duplicated");
+            layout.add(slot);
+        }
+        return layout;
     }
 
     private List<PlanRow> filter(Map<String, Object> node) {
@@ -849,13 +893,7 @@ public final class DatabaseEngine {
         if (type.equals("SeqScan")) {
             TableSchema table = resolveTable(map(node.get("table"), "layout table"));
             long relationId = optionalLong(node.get("relationId"), table.id());
-            List<ColumnSlot> layout = new ArrayList<>();
-            for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
-                ColumnSchema column = table.columns().get(ordinal);
-                layout.add(new ColumnSlot(table.id(), column.id(), relationId,
-                                          ordinal, column.type()));
-            }
-            return layout;
+            return scanLayout(node, table, relationId);
         }
         if (type.equals("NestedLoopJoin")) {
             List<ColumnSlot> layout = new ArrayList<>(

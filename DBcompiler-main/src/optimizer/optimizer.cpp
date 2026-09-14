@@ -1,6 +1,7 @@
-// 自底向上优化：先化简表达式，再改写算子。未改变的只读节点直接共享。
+// 优化流水线：先自底向上化简表达式，再做谓词下推，最后按依赖裁剪扫描列。
 #include "minisql/optimizer.hpp"
 #include "constant_fold.hpp"
+#include "plan_rules.hpp"
 
 #include <type_traits>
 #include <utility>
@@ -261,9 +262,16 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
 } // namespace
 
 Result<LogicalPlan> optimizePlan(const LogicalPlan& plan) {
-    auto result = optimizeNode(plan.root);
-    if (const auto* error = std::get_if<Diagnostic>(&result)) return *error;
-    return LogicalPlan{plan.catalog_version, std::get<PlanPtr>(std::move(result))};
+    auto simplified = optimizeNode(plan.root);
+    if (const auto* error = std::get_if<Diagnostic>(&simplified)) return *error;
+
+    // WHERE 合取项先靠近数据源，列裁剪才能同时看到投影、连接和下推条件的依赖。
+    auto pushed = optimizer_detail::pushDownPredicates(
+        std::get<PlanPtr>(std::move(simplified)));
+    if (const auto* error = std::get_if<Diagnostic>(&pushed)) return *error;
+    auto pruned = optimizer_detail::pruneColumns(std::get<PlanPtr>(std::move(pushed)));
+    if (const auto* error = std::get_if<Diagnostic>(&pruned)) return *error;
+    return LogicalPlan{plan.catalog_version, std::get<PlanPtr>(std::move(pruned))};
 }
 
 } // namespace minisql

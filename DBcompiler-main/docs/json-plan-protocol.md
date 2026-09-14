@@ -30,6 +30,9 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
   joinType 为 INNER/LEFT/RIGHT/FULL；旧计划缺失时按 INNER 处理。
 - `SeqScan` 的 `relationId` 和 `relationName` 标识一次 FROM/JOIN 出现。同一物理表
   自连接时 table.id 相同，但 relationId 不同；列引用必须按 relationId 定位关系实例。
+  `columns` 为扫描要物化的精确列引用：缺失或 JSON null 表示全表列，非空数组表示裁剪后的
+  子集，空数组表示只产生行数/RowId 而不读取业务列。数组顺序也是运行时行布局顺序；当前
+  优化器按表模式 ordinal 升序导出，执行器会逐项校验 tableId、relationId、columnId、ordinal 和 type。
 - `GroupBy` 使用 `keys` 和 `input`，当前表示按键去重。
 - `Sort` 使用有序 `items` 和 `input`；每项用 `kind` 区分 `column` 或 `expression`，
   并包含 `ASC`/`DESC` direction。
@@ -38,7 +41,8 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
 - `Explain` 使用 `analyze: boolean` 和 `input: <statement-root>`。根节点的 output 固定为
   `[ {"name":"QUERY PLAN","type":"VARCHAR"} ]`，`carriesRowId` 为 false。
 
-这些字段是协议 1 的向后兼容扩展：旧计划缺少 relationId 时，Java 引擎回退到 tableId。
+这些字段是协议 1 的向后兼容扩展：旧计划缺少 relationId 时，Java 引擎回退到 tableId；
+旧计划缺少 columns 时，Java 引擎扫描全列。
 当前 Java 引擎已执行全部上述节点，并以 Project.output 或 Aggregate.output 中的名称展示列别名。
 旧引擎不能执行新增 Aggregate/Explain 节点；含聚合或 EXPLAIN SQL 需同步更新编译器和引擎。
 

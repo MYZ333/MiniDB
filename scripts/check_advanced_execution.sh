@@ -21,6 +21,8 @@ sources=(
     "$compiler_dir/src/planner/plan_builder.cpp"
     "$compiler_dir/src/planner/plan_printer.cpp"
     "$compiler_dir/src/optimizer/constant_fold.cpp"
+    "$compiler_dir/src/optimizer/predicate_pushdown.cpp"
+    "$compiler_dir/src/optimizer/column_pruning.cpp"
     "$compiler_dir/src/optimizer/optimizer.cpp"
 )
 
@@ -46,6 +48,9 @@ sources=(
 "$build_dir/minisql_plan_json" \
     < "$engine_dir/src/test/resources/explain-analyze.sql" \
     > "$engine_dir/target/explain-analyze-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/optimizer-rules.sql" \
+    > "$engine_dir/target/optimizer-rules-plan.json"
 
 mvn -q -f "$engine_dir/pom.xml" test-compile
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" minidb.EngineTest
@@ -61,3 +66,5 @@ java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     "$engine_dir/target/constraint-update-plan.json"
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     minidb.ExplainAnalyzeEngineTest "$engine_dir/target/explain-analyze-plan.json"
+java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
+    minidb.OptimizerRulesEngineTest "$engine_dir/target/optimizer-rules-plan.json"

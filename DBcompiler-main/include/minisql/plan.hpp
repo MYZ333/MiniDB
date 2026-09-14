@@ -30,6 +30,8 @@ struct SeqScanPlan {
     std::shared_ptr<const TableSchema> table;
     std::uint64_t relation_id = 0;
     std::string relation_name = {};
+    // nullopt 兼容旧计划，表示扫描全列；空 vector 表示仅计数而不读取业务列。
+    std::optional<std::vector<BoundColumnRef>> columns = std::nullopt;
 };
 // 所有连接的输出布局都固定为左输入列后接右输入列；外连接缺失侧填 NULL。
 struct NestedLoopJoinPlan {

@@ -221,6 +221,14 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
             out << "SeqScan[" << tableName(op.table);
             if (op.table && !op.relation_name.empty() && op.relation_name != op.table->name)
                 out << " AS " << op.relation_name;
+            if (op.columns) {
+                out << "; columns=";
+                if (op.columns->empty()) out << "<none>";
+                for (std::size_t i = 0; i < op.columns->size(); ++i) {
+                    if (i) out << ", ";
+                    out << columnName((*op.columns)[i], relations);
+                }
+            }
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             left = op.left;
             right = op.right;

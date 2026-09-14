@@ -14,6 +14,8 @@ Project/Aggregate 处理 DISTINCT 和 LIMIT/OFFSET；NestedLoopJoin 支持四种
 在约束失败时不留下部分结果。
 内部算子通过带列身份的 `PlanRow` 传行，因此 JOIN 后按
 `relationId + tableId + columnId` 精确取列，并支持同一物理表自连接。
+SeqScan 接受编译器导出的精确列集合，只物化投影、筛选、连接、分组和排序真正依赖的列；
+缺失该字段的旧计划仍扫描全列，空集合可为 COUNT(*) 或 DELETE 只产生行数和 RowId。
 
 构建 Java 引擎：
 
@@ -43,6 +45,8 @@ bash scripts/check_advanced_execution.sh
 实现讲解见 [高级查询执行器](docs/advanced-query-execution.md)。
 EXPLAIN 的运行时采样与副作用边界见
 [EXPLAIN ANALYZE 实现讲解](../DBcompiler-main/docs/explain-analyze-walkthrough.md)。
+扫描列契约、谓词下推和列裁剪数据流见
+[规则优化代码讲解](../DBcompiler-main/docs/optimizer-walkthrough.md)。
 
 ## Web 演示台
 

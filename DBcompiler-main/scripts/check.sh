@@ -24,9 +24,11 @@ done
 "$compiler" "${flags[@]}" -c src/planner/plan_builder.cpp -o build/direct/plan_builder.o
 "$compiler" "${flags[@]}" -c src/planner/plan_printer.cpp -o build/direct/plan_printer.o
 "$compiler" "${flags[@]}" -c src/optimizer/constant_fold.cpp -o build/direct/constant_fold.o
+"$compiler" "${flags[@]}" -c src/optimizer/predicate_pushdown.cpp -o build/direct/predicate_pushdown.o
+"$compiler" "${flags[@]}" -c src/optimizer/column_pruning.cpp -o build/direct/column_pruning.o
 "$compiler" "${flags[@]}" -c src/optimizer/optimizer.cpp -o build/direct/optimizer.o
 "$archiver" rcs build/direct/libminisql_frontend.a build/direct/lexer.o build/direct/parser.o build/direct/ast_optimizer.o
-"$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/type_rules.o build/direct/memory_catalog.o build/direct/plan_builder.o build/direct/plan_printer.o build/direct/constant_fold.o build/direct/optimizer.o
+"$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/type_rules.o build/direct/memory_catalog.o build/direct/plan_builder.o build/direct/plan_printer.o build/direct/constant_fold.o build/direct/predicate_pushdown.o build/direct/column_pruning.o build/direct/optimizer.o
 libraries=(build/direct/libminisql_frontend.a build/direct/libminisql_backend.a)
 
 "$compiler" "${flags[@]}" app/main.cpp "${libraries[@]}" -o build/direct/minisql
@@ -58,6 +60,10 @@ printf "CREATE TABLE employee(id INT,manager_id INT); SELECT e.id AS employee_id
 grep -q '"relationName":"e"' build/direct/alias-plan.json
 grep -q '"relationName":"m"' build/direct/alias-plan.json
 grep -q '"name":"employee_id"' build/direct/alias-plan.json
+printf "CREATE TABLE p(id INT,name VARCHAR,unused BOOL); SELECT name FROM p WHERE id=1; SELECT COUNT(*) FROM p;" |
+    ./build/direct/minisql_plan_json > build/direct/pruned-plan.json
+grep -q '"columns":\[' build/direct/pruned-plan.json
+grep -q '"columns":\[\]' build/direct/pruned-plan.json
 ./build/direct/lexer_tests
 ./build/direct/parser_tests
 ./build/direct/ast_optimizer_tests

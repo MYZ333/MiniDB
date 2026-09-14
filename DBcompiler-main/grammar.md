@@ -1,4 +1,4 @@
-# MiniSQL 文法（接口版本 0.24）
+# MiniSQL 文法（接口版本 0.25）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 已整合 feature-zhangbo 的语法扩展与 B 的聚合实现。下列 EBNF 描述 A 能解析的范围，
@@ -112,6 +112,7 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 | LIKE/NOT LIKE、VARCHAR(n)、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT | 支持 | 支持 |
 | 多行 INSERT、DROP TABLE（含 IF EXISTS 和多表名） | 支持 | 支持 |
 | EXPLAIN / EXPLAIN ANALYZE | 支持包裹六类基础语句 | 展示优化后计划；ANALYZE 额外执行并采样 |
+| 谓词下推与列裁剪 | 不改变 SQL 文法 | B 改写逻辑计划，Java 按裁剪后的扫描布局执行 |
 
 B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划再把它们传给 Java。
 因此 LIMIT 不会被忽略，外连接不会退化为内连接，多行 INSERT 和建表约束也不会丢失。
@@ -161,6 +162,12 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
   具有真实副作用；执行失败时返回原执行错误。EXPLAIN 不能嵌套 EXPLAIN。
 - WHERE/ON 必须为 BOOL；AND/OR 从左到右短路。优化不得吞掉可达的除零、溢出或其源码位置。
   整数除法向零截断。聚合 DISTINCT、COUNT(1)、聚合参数算术和嵌套调用仍不在 A 的文法中。
+- 优化器把 WHERE 的 AND 合取项按关系实例拆分。INNER JOIN 可下推左右两侧条件；LEFT 只下推
+  左侧，RIGHT 只下推右侧，FULL 不下推。跨关系条件、常量条件和不满足安全条件的表达式保留原位。
+  含算术/取负的 ON 或合取项视为可能产生运行期错误，不能通过改写改变其原有求值可达性。
+- 列裁剪从最终投影反向加入 Filter、JOIN、GROUP/HAVING、ORDER BY 和表达式依赖；SeqScan
+  按原表模式顺序只物化这些列。UPDATE 因整行写回和约束检查保留全列，RowId 独立于业务列；
+  DELETE 只保留条件列，COUNT(*) 可使用零业务列扫描。
 
 实现限制：语义分析接受的表达式单条路径最多 256 个 AST 节点（根计为第 1 层），
 超过时报告 Semantic / ExpressionTooDeep，避免递归耗尽调用栈。这是资源限制，
@@ -229,3 +236,5 @@ SELECT * FROM student OFFSET 2; -- OFFSET 当前必须跟在 LIMIT 后
   LIKE、外连接、多行 INSERT、DROP TABLE，以及 VARCHAR 长度和列约束；同步扩展 JSON 与 Java 执行层。
 - 0.24：新增 EXPLAIN/EXPLAIN ANALYZE。AST、Bound 和 Plan 使用显式包装节点；Java 按真实
   算子调用路径采集 actual rows/time/loops，并明确 ANALYZE 修改类语句的副作用。
+- 0.25：B 新增保持外连接与运行期错误语义的谓词下推，以及覆盖投影、条件、连接、分组、
+  聚合和排序依赖的列裁剪；SeqScan 精确列集合贯通 JSON、Java 执行和 EXPLAIN 展示。

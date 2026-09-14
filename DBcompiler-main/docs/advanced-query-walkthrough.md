@@ -88,7 +88,8 @@ Project                  最后裁剪并排列 SELECT 输出
 表达式恢复成 `e.id` 形式。`printNode` 对二叉 JOIN 分别打印 left/right，对 GroupBy、Sort 等一元
 节点打印 input。因此打印结果可直接检查真实树形，而不依赖节点地址。
 
-`optimizer.cpp` 会递归优化 JOIN 两侧并折叠 ON 中的常量表达式，也会穿过 GroupBy 和 Sort。
+`optimizer.cpp` 会递归优化 JOIN 两侧并折叠 ON 中的常量表达式，也会穿过 GroupBy 和 Sort；
+后续规则会按外连接语义下推单侧 WHERE 合取项，并裁剪各扫描的无用列。
 它不改变 JOIN 顺序，不删除恒真 JOIN，也不选择物理算法。恒真 WHERE Filter 可以照常删除，
 其上方的 GroupBy、Sort、Project 会用新的只读子节点重建；再次优化会复用整棵树。
 

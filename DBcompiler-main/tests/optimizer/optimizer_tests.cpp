@@ -42,6 +42,26 @@ void expectEquivalent(const LogicalPlan& before, const reference::Rows& rows) {
     check(reference::equivalent(reference::run(before, rows), reference::run(after, rows)),
           "optimized result, effects or runtime error changed");
 }
+
+const SeqScanPlan& scanBelow(const PlanPtr& plan) {
+    const PlanNode* node = plan.get();
+    for (;;) {
+        if (const auto* scan = std::get_if<SeqScanPlan>(&node->node)) return *scan;
+        node = std::visit([](const auto& op) -> const PlanNode* {
+            using T = std::decay_t<decltype(op)>;
+            if constexpr (std::is_same_v<T, FilterPlan> ||
+                          std::is_same_v<T, GroupByPlan> ||
+                          std::is_same_v<T, AggregatePlan> ||
+                          std::is_same_v<T, SortPlan> ||
+                          std::is_same_v<T, ProjectPlan> ||
+                          std::is_same_v<T, UpdatePlan> ||
+                          std::is_same_v<T, DeletePlan> ||
+                          std::is_same_v<T, ExplainPlan>) return op.input.get();
+            else return nullptr;
+        }, node->node);
+        check(node != nullptr, "single-input path did not reach SeqScan");
+    }
+}
 } // namespace
 
 int main() {
@@ -250,6 +270,101 @@ int main() {
               "advanced-node traversal did not simplify predicates");
         const auto again = value(optimizePlan(after));
         check(again.root == after.root, "advanced optimized plan is not idempotent");
+    });
+    suite.run("inner JOIN pushes one-relation WHERE conjuncts to both inputs", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"id", DataType::Int},
+                                               {"student_id", DataType::Int},
+                                               {"value", DataType::Int}}));
+        const auto after = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student JOIN score "
+            "ON student.id=score.student_id "
+            "WHERE student.age>18 AND score.value>=80;")));
+        const auto& project = std::get<ProjectPlan>(after.root->node);
+        const auto& join = std::get<NestedLoopJoinPlan>(project.input->node);
+        check(std::holds_alternative<FilterPlan>(join.left->node) &&
+              std::holds_alternative<FilterPlan>(join.right->node),
+              "INNER JOIN predicates were not pushed to both inputs");
+        check(formatPlan(after).find("Project[student.name]\n  Filter[") ==
+                  std::string::npos,
+              "fully pushed predicates left an unnecessary top Filter");
+        check(value(optimizePlan(after)).root == after.root,
+              "predicate pushdown did not reach a fixed point");
+    });
+    suite.run("outer JOIN pushdown respects the preserved and nullable sides", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"student_id", DataType::Int},
+                                               {"value", DataType::Int}}));
+        const auto left = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student LEFT JOIN score "
+            "ON student.id=score.student_id "
+            "WHERE student.age>18 AND score.value>60;")));
+        const auto& top_filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(left.root->node).input->node);
+        const auto& left_join = std::get<NestedLoopJoinPlan>(top_filter.input->node);
+        check(std::holds_alternative<FilterPlan>(left_join.left->node) &&
+              std::holds_alternative<SeqScanPlan>(left_join.right->node),
+              "LEFT JOIN moved a predicate into its nullable right side");
+
+        const auto full = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student FULL JOIN score "
+            "ON student.id=score.student_id WHERE student.age>18;")));
+        const auto& full_filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(full.root->node).input->node);
+        const auto& full_join = std::get<NestedLoopJoinPlan>(full_filter.input->node);
+        check(std::holds_alternative<SeqScanPlan>(full_join.left->node) &&
+              std::holds_alternative<SeqScanPlan>(full_join.right->node),
+              "FULL JOIN predicate must remain above both nullable inputs");
+    });
+    suite.run("pushdown preserves observable arithmetic error order", [] {
+        Fixture f;
+        value(f.catalog.createTable("score", {{"student_id", DataType::Int},
+                                               {"value", DataType::Int}}));
+        const auto where_error = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student JOIN score "
+            "ON student.id=score.student_id "
+            "WHERE student.id/0=1 AND score.value>60;")));
+        const auto& where_filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(where_error.root->node).input->node);
+        const auto& where_join = std::get<NestedLoopJoinPlan>(where_filter.input->node);
+        check(std::holds_alternative<SeqScanPlan>(where_join.right->node),
+              "predicate after a dangerous conjunct was moved before its error");
+
+        const auto on_error = value(optimizePlan(f.compile(
+            "SELECT student.name FROM student JOIN score "
+            "ON student.id/0=score.student_id WHERE student.age>18;")));
+        const auto& on_filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(on_error.root->node).input->node);
+        check(std::holds_alternative<NestedLoopJoinPlan>(on_filter.input->node),
+              "WHERE predicate bypassed an error-producing JOIN ON expression");
+    });
+    suite.run("column pruning keeps only scan dependencies", [] {
+        Fixture f;
+        const auto selected = value(optimizePlan(
+            f.compile("SELECT name FROM student WHERE age>18;")));
+        const auto& selected_scan = scanBelow(selected.root);
+        check(selected_scan.columns && selected_scan.columns->size() == 2 &&
+              (*selected_scan.columns)[0].ordinal == 1 &&
+              (*selected_scan.columns)[1].ordinal == 2,
+              "projection and Filter dependencies were not pruned in schema order");
+
+        const auto count = value(optimizePlan(f.compile("SELECT COUNT(*) FROM student;")));
+        const auto& count_scan = scanBelow(count.root);
+        check(count_scan.columns && count_scan.columns->empty(),
+              "COUNT(*) should use a zero-business-column scan");
+
+        const auto deletion = value(optimizePlan(
+            f.compile("DELETE FROM student WHERE id=1;")));
+        const auto& delete_scan = scanBelow(deletion.root);
+        check(delete_scan.columns && delete_scan.columns->size() == 1 &&
+              delete_scan.columns->front().ordinal == 0 &&
+              delete_scan.columns->front().column_id.value == 1,
+              "DELETE should retain only predicate columns plus RowId");
+
+        const auto update = value(optimizePlan(
+            f.compile("UPDATE student SET age=age+1 WHERE id=1;")));
+        check(!scanBelow(update.root).columns,
+              "UPDATE must retain the complete old row for validation and writeback");
     });
     suite.run("SELECT equivalence on multiple predicates and rows", [] {
         Fixture f;

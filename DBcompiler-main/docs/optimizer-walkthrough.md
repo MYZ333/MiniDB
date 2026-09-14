@@ -11,7 +11,10 @@
 |---|---|---|
 | include/minisql/optimizer.hpp | 公共入口和前置条件 | 输入是通过语义检查的计划，输出仍是 Result |
 | src/optimizer/constant_fold.hpp/.cpp | 安全计算纯常量 | 不访问树、不修改元数据；失败折叠返回 nullopt |
-| src/optimizer/optimizer.cpp | 表达式与算子树改写 | optimizeExpr → optimizeNode → optimizePlan |
+| src/optimizer/optimizer.cpp | 流水线入口和基础树改写 | optimizeExpr → optimizeNode → optimizePlan |
+| src/optimizer/plan_rules.hpp | 私有规则接口 | 规则不进入公共 API，由入口固定排序 |
+| src/optimizer/predicate_pushdown.cpp | 谓词下推 | 拆 AND、识别关系实例、保护外连接与错误顺序 |
+| src/optimizer/column_pruning.cpp | 列裁剪 | 从根反向收集列依赖，重建 SeqScan 输出模式 |
 | examples/optimizer.cpp | 真实 SQL 的完整演示 | 串联 A/B 后保存和打印前后计划 |
 | tests/optimizer/optimizer_tests.cpp | 边界、等价性与接口回归 | 真 SQL 输入；明确算术预期与独立求值对照 |
 | tests/optimizer/reference_evaluator.hpp | 测试专用求值器 | 小整数计算、短路、旧行赋值和错误位置 |
@@ -33,7 +36,7 @@ optimizeExpr 先优化子表达式：`1=1` 变为内部 TRUE，`10+8` 变为 18�
 之前                              之后
 Project[name]                     Project[name]
   Filter[1=1 AND age>10+8]           Filter[age>18]
-    SeqScan[student]                  SeqScan[student]
+    SeqScan[student]                  SeqScan[student; columns=name,age]
 ```
 
 这是简写示意，实际 formatPlan 还会显示列类型、CatalogVersion 和 row_id。
@@ -87,7 +90,51 @@ CatalogVersion、表模式、列 ID/ordinal、输出顺序和重复投影列均�
 空节点、深度超限等基本结构异常返回 Plan / InvalidPlan，但入口不是完整计划验证器；
 有效的 analyze/buildPlan 输出是必要前置条件。
 
-## 6. 如何验证等价性
+## 6. 谓词下推如何组织
+
+`pushNode` 先递归优化子节点。当它遇到 `Filter → NestedLoopJoin` 时，`flattenAnd`
+按原有从左到右顺序拆出合取项，`collectRefs` 收集每项使用的表和关系实例 ID，
+`relationOccurs` 再判断引用只属于左输入还是右输入。条件被包装成新的 Filter 后继续调用
+`pushNode`，因此多表左深连接中的条件能够逐层靠近自己的 SeqScan。
+
+下推矩阵由连接的 NULL 扩展语义决定：
+
+| JOIN 类型 | 左侧 WHERE 条件 | 右侧 WHERE 条件 |
+|---|---|---|
+| INNER | 下推 | 下推 |
+| LEFT | 下推 | 保留在 JOIN 上方 |
+| RIGHT | 保留在 JOIN 上方 | 下推 |
+| FULL | 保留 | 保留 |
+
+例如 LEFT JOIN 的右侧条件若提前过滤，原本“匹配后被 WHERE 删除”的左行可能变成一条
+NULL 扩展行，结果会变化。常量条件没有关系归属，跨表条件同时引用两侧，它们也留在原位。
+
+`safeToMove` 把含加减乘除、一元取负和聚合的表达式视为可能报错。JOIN ON 可能报错时不做
+下推；WHERE 中出现危险合取项后，不再把后续条件提前。这样不会让提前筛选跳过原本可达的
+除零或溢出。例如 `id/0=1 AND score>60` 的右侧条件必须留在错误之后。
+
+## 7. 列裁剪如何组织
+
+`pruneNode(plan, required)` 是从根向叶的依赖传递。`required` 保存执行当前节点之后仍需读取的
+`BoundColumnRef`，以 `table_id + relation_id + column_id + ordinal + type` 去重：
+
+- Project 从最终列或计算表达式开始收集。
+- Sort、Filter 分别加入排序键和条件引用。
+- Join 加入 ON 引用，再用关系实例把集合分到左右子树。
+- GroupBy 保留全部分组键；Aggregate 加入分组、输出聚合参数、HAVING 和聚合排序依赖。
+- SeqScan 按表模式顺序与 required 求交，重建 `columns` 和 `output`。
+
+`columns=nullopt` 表示全列，便于兼容旧计划；`columns=[]` 表示零业务列。例如
+`SELECT COUNT(*) FROM student` 仍需为每条存储记录产生一个逻辑输入行，但不需要读取任何
+业务值。RowId 不占 `output`，所以无条件 DELETE 同样可以零列扫描。UPDATE 当前要复制未修改列
+并对最终整行检查约束，因此明确请求所有列，避免把优化变成不完整写回。
+
+Java 的 `scanLayout` 是这项契约的执行边界。它对每个列引用与运行时 Catalog 做一致性检查，
+再用原表 ordinal 从完整 StoredRow 取出所需值。表达式求值通过 `ColumnSlot` 在裁剪后的布局中
+按身份找列，不把原表 ordinal 误当成紧凑数组下标。`layoutFor` 复用同一函数，保证外连接构造
+NULL 行时使用完全相同的布局。EXPLAIN 会显示 `columns=<all>`、精确列名或 `<none>`。
+
+## 8. 如何验证等价性
 
 测试从 SQL 经真实 lex/parse/analyze/buildPlan 得到输入，再调用 optimizePlan。
 除了比较树结构，还用独立参考求值器在多行和空表上运行前后计划，比较：
@@ -99,6 +146,7 @@ CatalogVersion、表模式、列 ID/ordinal、输出顺序和重复投影列均�
 参考求值器不调用 constant_fold，避免两边共享同一个错误算法。
 它把算术操作数限制在 ±2^30 内，不模拟全范围溢出；INT64 边界通过独立明确的
 预期向量验证。49 种确定性表达式组合额外覆盖列值参与除法及除数为零的情况。
-这些是编译器的优化正确性测试，不代表存储、事务或真实数据库执行引擎已经实现。
-
-后续可以在保持这些约定的前提下扩展空结果算子、列裁剪，再结合新增语法考虑连接优化。
+新增结构测试还覆盖 INNER 双侧下推、LEFT/FULL 边界、危险表达式顺序、查询/DML 裁剪和
+重复优化固定点。根目录的 `scripts/check_advanced_execution.sh` 会从真实 SQL 导出优化 JSON，
+由 Java 验证下推后的行数、扫描列名、零列 COUNT(*) 和最终查询结果。参考求值器仍主要负责
+单表常量优化；跨表和紧凑运行时布局由这组端到端测试负责。

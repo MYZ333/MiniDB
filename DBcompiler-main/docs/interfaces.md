@@ -1,4 +1,4 @@
-# 模块接口契约 0.13
+# 模块接口契约 0.14
 
 本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、六类基础语句与 EXPLAIN 语义分析、
 逻辑计划生成、规则优化和文本打印已实现；A version2 的扩展 lex/parse 与 AST 展示优化已合入。
@@ -181,7 +181,8 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 | ExplainStmt | 已绑定目标语句、analyze 标志 | Explain → 目标根计划 |
 
 PlanNode 的 output 是有序业务列模式，carries_row_id 是内部行标识属性。
-SeqScan 第一阶段输出全表列，并携带 relation_id/relation_name；Filter 保留子节点的模式和行标识。
+buildPlan 产生的 SeqScan 初始输出全表列，并携带 relation_id/relation_name；优化后还可通过
+`columns` 保存精确扫描列。Filter 保留优化后子节点的模式和行标识。
 Project 输出选择表达式及列别名，可有重复名称，并处理 DISTINCT 和 OFFSET/LIMIT。
 NestedLoopJoin 按 join type 执行 INNER/LEFT/RIGHT/FULL：仅 ON 为 TRUE 的组合行匹配，
 外连接未匹配侧填 NULL；输出业务列始终是左模式后接右模式。多个 JOIN 按 SQL 顺序形成左深树。
@@ -208,8 +209,9 @@ BoundUpdate/UpdatePlan 中每个 RHS 都是对原表列的引用；生成器不�
 表达式使用 SQL 三值逻辑，Filter/Join/HAVING 只保留 TRUE。
 
 当前生成器固定使用上述树结构，SELECT * 也保留 Project；省略对应子句才省略相应算子。
-恒真/恒假条件在 buildPlan 输出中保留，需显式调用 optimizePlan 优化。SeqScan 读取全部列，修改输入行标识通过 Filter
-原样传递；Project 和修改根不暴露内部行标识。
+恒真/恒假条件在 buildPlan 输出中保留，需显式调用 optimizePlan 优化。未优化 SeqScan 读取全部列；
+优化后的 `columns=nullopt` 仍表示全列，有值时表示精确列集合，空集合表示不物化业务列。
+修改输入行标识通过 Filter 原样传递；Project 和修改根不暴露内部行标识。
 
 ## B 内部：规则优化
 
@@ -219,7 +221,7 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
 只为改动的表达式及其祖先创建新节点。Catalog 版本、输出列顺序/重复列、
 表列 ID/ordinal、UPDATE 的旧行引用以及修改所需的 RowId 均保留。
 
-首版包含安全常量折叠、布尔化简和恒真 Filter 消除：
+当前流水线依次执行安全常量折叠与布尔化简、谓词下推、列裁剪：
 
 - 常量 INT/FLOAT 算术/比较、字符串和 BOOL 判等、BOOL 逻辑运算可折叠。
   SQL 语法已支持 TRUE/FALSE 字面量；NULL 不参与折叠。
@@ -230,7 +232,13 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
 - Filter 的条件折叠为 TRUE 后用输入节点替换；FALSE Filter 保留。优化器递归穿过
   GroupBy/Aggregate/Sort 和 Explain 的目标计划，并折叠 NestedLoopJoin 的 ON 表达式，
   但不删除恒真 JOIN 或改变连接顺序。
-  不删除 Update/Delete 根，不进行列裁剪、索引选择或代价优化。
+- 谓词下推只拆分 WHERE 的 AND 合取项。INNER 可推向任一单侧输入；LEFT 只推左侧，RIGHT
+  只推右侧，FULL 不推。常量、跨关系条件留在原位。含算术/取负的条件或 ON 可能报运行期错误，
+  优化器保留其求值顺序；危险合取项之后的条件也不提前。
+- 列裁剪从根向下传递必需的 `BoundColumnRef`，将投影、Filter、JOIN ON、分组、聚合、HAVING
+  和排序依赖合并后，在 SeqScan 按原模式顺序输出唯一列。COUNT(*) 可输出零业务列；DELETE
+  仅需条件列和独立 RowId；UPDATE 为旧行复制和最终约束校验保留完整表列。
+- 不删除 Update/Delete 根，不选择索引，也不基于统计信息改变连接顺序或算法。
 
 入口附加检查空节点、访问路径深度（最多 256 层）、Filter 的 BOOL 条件及输出/RowId
 透传、修改输入的 RowId。失败返回 Plan / InvalidPlan，不返回部分优化结果。
@@ -278,7 +286,7 @@ AggregatePlan 保存 group_keys/items/order_by/having/input 以及 distinct/limi
 HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
 重复输入行。其 output 保存最终名字和类型，carries_row_id=false。优化器可优化其输入，
 但不能因输入为空而删掉全表 Aggregate：全表空输入仍须输出 COUNT=0 的一行。
-详细类型、NULL、空输入和支持范围以 grammar.md 0.24 为准；JSON 字段见 json-plan-protocol.md。
+详细类型、NULL、空输入和支持范围以 grammar.md 0.25 为准；JSON 字段见 json-plan-protocol.md。
 
 ## 维护责任
 
@@ -311,3 +319,5 @@ HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter �
   DISTINCT/分页、外连接类型、约束元数据、多行 INSERT 和 DROP；Java 引擎实现执行与写入原子检查。
 - 0.13：新增 ExplainStmt/BoundExplain/ExplainPlan 端到端契约。普通 EXPLAIN 仅展示优化计划；
   ANALYZE 通过 Java 统一分派点执行目标并采集 actual rows、包含子树的 time 和 loops。
+- 0.14：SeqScanPlan 新增可选精确列集合；优化器加入外连接安全的谓词下推和自顶向下列依赖
+  裁剪。JSON/Java 保持缺失或 null 表示全列，并支持空数组的零业务列扫描。

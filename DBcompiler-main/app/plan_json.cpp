@@ -26,7 +26,15 @@ const char* typeName(DataType type) {
     return "UNKNOWN";
 }
 
-const char* unaryName(UnaryOp op) { return op == UnaryOp::Not ? "Not" : "Negate"; }
+const char* unaryName(UnaryOp op) {
+    switch (op) {
+    case UnaryOp::Negate: return "Negate";
+    case UnaryOp::Not: return "Not";
+    case UnaryOp::IsNull: return "IsNull";
+    case UnaryOp::IsNotNull: return "IsNotNull";
+    }
+    return "Unknown";
+}
 
 const char* aggregateName(AggregateKind kind) {
     switch (kind) {
@@ -53,6 +61,7 @@ const char* binaryName(BinaryOp op) {
     case BinaryOp::GreaterEqual: return "GreaterEqual";
     case BinaryOp::And: return "And";
     case BinaryOp::Or: return "Or";
+    case BinaryOp::Like: return "Like";
     }
     return "Unknown";
 }

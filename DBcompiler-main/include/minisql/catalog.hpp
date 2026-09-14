@@ -17,6 +17,7 @@ struct ColumnSchema {
     ColumnId id;
     std::string name; // 已归一化。
     DataType type;
+    std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
 };
 
 struct TableSchema {

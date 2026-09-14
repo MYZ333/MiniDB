@@ -66,7 +66,11 @@ DELETE FROM student WHERE id = 1;
 - Java 引擎高级查询：内连接、分组聚合、多列排序、隐藏排序列和规定的 NULL 顺序
 - 错误处理：词法/语法/语义错误，以及除零、整数溢出、类型不匹配等执行期错误
 
-暂不支持 HAVING、聚合 DISTINCT、外连接、索引、事务和并发控制。
+已整合 feature-zhangbo 的语法扩展，新增可执行的 IS NULL/IS NOT NULL、<>、BETWEEN、IN、
+INNER JOIN 和 UPDATE/DELETE 表别名。完整边界见 [文法支持表](DBcompiler-main/grammar.md)。
+HAVING、DISTINCT、LIMIT/OFFSET、外连接、计算投影、LIKE、列约束、多行 INSERT 和 DROP TABLE
+目前只支持解析，语义阶段明确返回 UnsupportedFeature。聚合 DISTINCT、索引、事务和并发控制尚不支持。
+整合过程与代码阅读指南见 [A+B 整合说明](DBcompiler-main/docs/zhangbo-merge-notes.md)。
 
 ## 数据与持久化说明
 

@@ -41,16 +41,17 @@ InsertStmt insert() {
         {{std::int64_t{1}, span(30)}, {std::string{"Alice"}, span(33, 7)}, {std::int64_t{20}, span(42, 2)}}};
 }
 
-SelectItem selected(std::string name, std::optional<std::string> alias = std::nullopt) {
-    return {id(std::move(name)), alias ? std::optional<Identifier>{id(*alias)} : std::nullopt, {}};
-}
+// 聚合测试按 A 的新 AST 构造，别名与 SELECT 项平行保存在 column_aliases。
+SelectItem selected(std::string name) { return id(std::move(name)); }
 
-SelectItem aggregate(std::string function, std::optional<std::string> argument,
-                     bool star = false, std::optional<std::string> alias = std::nullopt) {
-    return {AggregateCall{id(std::move(function)),
-                          argument ? std::optional<Identifier>{id(*argument)} : std::nullopt,
-                          star, {}},
-            alias ? std::optional<Identifier>{id(*alias)} : std::nullopt, {}};
+SelectItem aggregate(std::string function, std::optional<std::string> argument, bool star = false) {
+    const auto kind = function == "COUNT" ? AggregateFunction::Count :
+        function == "SUM" ? AggregateFunction::Sum : function == "AVG" ? AggregateFunction::Avg :
+        function == "MIN" ? AggregateFunction::Min : function == "MAX" ? AggregateFunction::Max :
+        static_cast<AggregateFunction>(-1);
+    std::variant<AllColumns, Identifier> parameter = AllColumns{};
+    if (!star && argument) parameter = id(*argument);
+    return AggregateCall{kind, std::move(parameter), {}};
 }
 } // namespace
 
@@ -84,12 +85,32 @@ int main() {
         check(columns[0].type == DataType::Bool && columns[1].type == DataType::Float,
               "extended CREATE types lost");
     });
+    suite.run("DROP TABLE is explicitly unsupported for now", [] {
+        Fixture f;
+        auto e = failure(f.analyzeNode(DropTableStmt{{id("student", span(11, 7))}, false}),
+                         ErrorCode::UnsupportedFeature);
+        check(e.span->begin.offset == 11 &&
+                  e.message.find("DROP TABLE") != std::string::npos,
+              "DROP TABLE placeholder diagnostic changed");
+    });
     suite.run("INSERT omitted list uses schema order", [] {
         Fixture f;
         auto binding = value(f.analyzeNode(insert()));
         const auto& row = std::get<BoundInsert>(binding.node);
         check(std::get<std::int64_t>(row.values[0]) == 1 && std::get<std::string>(row.values[1]) == "Alice", "wrong row mapping");
         check(binding.catalog_version == 1, "missing catalog version");
+    });
+    suite.run("INSERT rows keeps single row compatibility and rejects multiple rows for now", [] {
+        Fixture f;
+        auto ast = insert();
+        ast.rows = {ast.values};
+        value(f.analyzeNode(ast));
+
+        ast.rows.push_back({{std::int64_t{2}, span(50)}, {std::string{"Bob"}, span(53, 5)},
+                            {std::int64_t{18}, span(60, 2)}});
+        auto e = failure(f.analyzeNode(std::move(ast)), ErrorCode::UnsupportedFeature);
+        check(e.message.find("multi-row INSERT") != std::string::npos,
+              "multi-row INSERT placeholder diagnostic changed");
     });
     suite.run("INSERT reorders explicit mixed-case columns", [] {
         Fixture f;
@@ -264,9 +285,10 @@ int main() {
     suite.run("aggregate functions bind result types aliases and post-group ordering", [] {
         MultiTableFixture f;
         SelectStmt select{id("student"), std::vector<SelectItem>{
-            selected("age"), aggregate("COUNT", std::nullopt, true, "rows"),
-            aggregate("SUM", "id", false, "total"), aggregate("AVG", "age"),
+            selected("age"), aggregate("COUNT", std::nullopt, true),
+            aggregate("SUM", "id"), aggregate("AVG", "age"),
             aggregate("MIN", "name"), aggregate("MAX", "name")}, nullptr};
+        select.column_aliases = {std::nullopt, id("rows"), id("total"), std::nullopt, std::nullopt, std::nullopt};
         select.group_by = {id("age")};
         select.order_by = {{id("total"), SortDirection::Desc, {}},
                            {id("age"), SortDirection::Asc, {}}};
@@ -301,15 +323,16 @@ int main() {
         bad_order.order_by = {{id("age"), SortDirection::Asc, {}}};
         failure(f.analyzeNode(std::move(bad_order)), ErrorCode::InvalidGrouping);
         failure(f.analyzeNode(SelectStmt{id("student"), std::vector<SelectItem>{
-            aggregate("COUNT", "age", true)}, nullptr}), ErrorCode::InvalidAst);
+            aggregate("COUNT", "missing")}, nullptr}), ErrorCode::ColumnNotFound);
         SelectStmt ambiguous{id("student"), std::vector<SelectItem>{
-            aggregate("COUNT", std::nullopt, true, "total"),
-            aggregate("SUM", "age", false, "total")}, nullptr};
+            aggregate("COUNT", std::nullopt, true),
+            aggregate("SUM", "age")}, nullptr};
+        ambiguous.column_aliases = {id("total"), id("total")};
         ambiguous.order_by = {{id("total"), SortDirection::Asc, {}}};
         failure(f.analyzeNode(std::move(ambiguous)), ErrorCode::AmbiguousColumn);
         // Rich AST with only columns must retain ordinary SELECT semantics.
         const auto plain = value(f.analyzeNode(SelectStmt{id("student"),
-            std::vector<SelectItem>{selected("name", "label")}, nullptr}));
+            std::vector<SelectItem>{selected("name")}, nullptr}));
         check(std::get<BoundSelect>(plain.node).aggregate_items.empty(),
               "rich plain SELECT was incorrectly treated as global aggregation");
     });
@@ -323,6 +346,15 @@ int main() {
         check(ordered.columns.size() == 1 && ordered.order_by.size() == 2 &&
               ordered.order_by[0].column.ordinal == 2 && ordered.order_by[1].column.ordinal == 0,
               "hidden ORDER BY column or item order was lost");
+    });
+    suite.run("ORDER BY expressions are explicitly unsupported for now", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<Identifier>{id("name")}, nullptr};
+        select.order_by = {{id(""), SortDirection::Desc, span(40, 7),
+                            bin(BinaryOp::Add, col("age"), num(1), span(40, 7))}};
+        auto e = failure(f.analyzeNode(std::move(select)), ErrorCode::UnsupportedFeature);
+        check(e.message.find("ORDER BY expressions") != std::string::npos,
+              "ORDER BY expression placeholder diagnostic changed");
     });
     suite.run("nested expressions receive types without AST mutation", [] {
         Fixture f;
@@ -370,6 +402,16 @@ int main() {
         auto e = failure(f.where(col("age", span(33, 3))), ErrorCode::WhereNotBoolean);
         check(e.span->begin.offset == 33, "WHERE type error location");
         failure(f.where(text("abc")), ErrorCode::WhereNotBoolean);
+    });
+    suite.run("aggregate expressions are explicitly unsupported for now", [] {
+        Fixture f;
+        auto aggregate = std::make_shared<const Expr>(Expr{
+            AggregateCall{AggregateFunction::Count, AllColumns{span(15, 1)}, span(10, 8)},
+            span(10, 8)});
+        auto e = failure(f.where(bin(BinaryOp::Greater, aggregate, num(0), span(19))),
+                         ErrorCode::UnsupportedFeature);
+        check(e.message.find("aggregate expressions") != std::string::npos,
+              "aggregate placeholder diagnostic changed");
     });
     suite.run("semantic analysis checks both logical branches and left error first", [] {
         Fixture f;
@@ -470,6 +512,30 @@ int main() {
         check(std::get<BoundDelete>(result.node).where->type == DataType::Bool, "DELETE compound condition not typed");
         failure(f.analyzeNode(UpdateStmt{id("student"), {{id("id"), num(10), {}}}, col("missing")}), ErrorCode::ColumnNotFound);
         failure(f.analyzeNode(DeleteStmt{id("student"), col("missing")}), ErrorCode::ColumnNotFound);
+    });
+    suite.run("UPDATE and DELETE table aliases qualify the single table scope", [] {
+        Fixture f;
+        UpdateStmt update{id("student"),
+            {{id("s.age"), bin(BinaryOp::Add, col("s.age"), num(1)), {}}},
+            bin(BinaryOp::Equal, col("s.id"), num(1))};
+        update.table_alias = id("s");
+        const auto bound_update = value(f.analyzeNode(update));
+        const auto& updated = std::get<BoundUpdate>(bound_update.node);
+        check(updated.assignments[0].target.ordinal == 2 &&
+                  std::get<BoundBinary>(updated.assignments[0].value->node).left->type == DataType::Int,
+              "UPDATE alias-qualified target or RHS did not bind");
+
+        DeleteStmt deletion{id("student"), bin(BinaryOp::Equal, col("s.id"), num(1))};
+        deletion.table_alias = id("s");
+        value(f.analyzeNode(deletion));
+
+        value(f.analyzeNode(DeleteStmt{id("student"),
+            bin(BinaryOp::Equal, col("student.id"), num(1))}));
+        DeleteStmt hidden_physical{id("student"),
+            bin(BinaryOp::Equal, col("student.id", span(20, 10)), num(1))};
+        hidden_physical.table_alias = id("s");
+        auto e = failure(f.analyzeNode(std::move(hidden_physical)), ErrorCode::ColumnNotFound);
+        check(e.span->begin.offset == 20, "alias should hide physical table qualifier");
     });
     suite.run("UPDATE and DELETE without WHERE mean all rows", [] {
         Fixture f;

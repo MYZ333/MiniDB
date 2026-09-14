@@ -58,9 +58,12 @@ Statement 保存整条语句范围；Identifier 保存原始拼写及精确范�
 一元/二元表达式另存运算符范围，便于把类型错误定位到操作符。
 
 SELECT 使用 `variant<AllColumns, vector<Identifier>, vector<SelectItem>>`。
-旧的纯列清单保留源码兼容；含聚合的清单使用 SelectItem，每项携带列名或 AggregateCall 和可选别名。
-AggregateCall 保存原函数名、参数列、count_star 与源码范围；COUNT(*) 的参数为空且 count_star=true。
-参数列与星号必须且只能选择一种，B 检查函数种类、参数类型和分组约束。
+旧的纯列清单保留源码兼容；SelectItem 统一采用 A 的
+variant<Identifier, AggregateCall, ExprPtr>，所有输出别名平行保存在 column_aliases。
+AggregateCall 使用 AggregateFunction 枚举，argument 为 variant<AllColumns, Identifier>；
+只有 COUNT(*) 使用 AllColumns。B 显式映射为 AggregateKind，不依赖枚举整数或 variant 下标。
+Expr 增加 AggregateCall 分支，顶层 SELECT 中括号包裹的列/聚合先归一化再绑定；
+一般计算表达式和非顶层聚合仍返回 UnsupportedFeature。
 INSERT 使用 optional 列清单区分省略和显式给定，显式清单不得为空。
 SelectStmt 追加 group_by、order_by、joins、FROM 表别名和与选择列平行的 column_aliases，
 并为旧的三字段聚合初始化提供空默认值。JoinClause 可携带右表别名。
@@ -141,7 +144,7 @@ UPDATE/DELETE 与 SELECT 共用布尔条件检查，WHERE 省略合法，存在�
 必需表达式子节点为空时报 InvalidAst；表达式路径超过 256 个节点时报 ExpressionTooDeep。
 绑定只推导类型，不求值，所以类型合法的除零或溢出表达式保留给执行层报告。
 INSERT 的 NULL 允许写入任意类型列，执行层需为记录提供空值表示；NULL 参与表达式时
-因尚无三值逻辑而报 InvalidOperandType。限定名按关系有效名称解析；声明表别名后必须以
+除 IS NULL/IS NOT NULL 外，因尚无三值逻辑而报 InvalidOperandType。限定名按关系有效名称解析；声明表别名后必须以
 别名限定。未限定列名在全部可见关系实例中查找，命中多个实例时返回 AmbiguousColumn。
 同一物理表可用不同别名自连接；重复关系名返回 DuplicateTable。选择列别名决定 Project
 输出名称，并可由 ORDER BY 引用；同名输出别名被引用时返回 AmbiguousColumn。
@@ -263,7 +266,7 @@ AggregatePlan 保存 group_keys/items/order_by/input，是查询根节点，负�
 最终投影及聚合后排序。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
 重复输入行。其 output 保存最终名字和类型，carries_row_id=false。优化器可优化其输入，
 但不能因输入为空而删掉全表 Aggregate：全表空输入仍须输出 COUNT=0 的一行。
-详细类型、NULL、空输入和支持范围以 grammar.md 0.7 为准；JSON 字段见 json-plan-protocol.md。
+详细类型、NULL、空输入和支持范围以 grammar.md 0.22 为准；JSON 字段见 json-plan-protocol.md。
 
 ## 维护责任
 
@@ -289,3 +292,12 @@ AggregatePlan 保存 group_keys/items/order_by/input，是查询根节点，负�
   JSON 协议保持版本 1 并为旧计划保留 tableId 回退。
 
 - 0.10：添加聚合 AST/Bound/AggregatePlan，定义聚合后投影排序和空输入规则。
+
+- 0.11：整合 feature-zhangbo，统一 A 的新 AST 和 B Aggregate；IS NULL/IS NOT NULL 返回 BOOL，
+  UPDATE/DELETE 别名通过单表作用域绑定且 relation_id=0；未实现的 AST 标记显式返回 UnsupportedFeature。
+
+新增 AST 字段包括 SelectStmt 的 distinct/having/limit/offset、JoinClause.type、
+OrderByItem.expression、ColumnDefinition 的长度和约束、InsertStmt.rows、DropTableStmt。
+语义入口逐项检查，执行范围以 grammar.md 0.22 的表格为准。rows 非空时优先使用 rows，
+拒绝多于一行；不会静默依赖 values 而丢失其余行。新增 IsNull/IsNotNull 无需新计划节点，
+由 BoundUnary 贯通打印、JSON 和 Java；B 优化器保持该节点，不擅自改写其 NULL 行为。

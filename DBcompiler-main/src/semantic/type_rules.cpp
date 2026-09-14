@@ -4,6 +4,8 @@
 namespace minisql::semantic_detail {
 
 std::optional<DataType> unaryResult(UnaryOp op, DataType operand) {
+    // 空值判定接受任意已绑定类型，包括 NULL 字面量，始终返回 BOOL。
+    if (op == UnaryOp::IsNull || op == UnaryOp::IsNotNull) return DataType::Bool;
     if (op == UnaryOp::Negate && (operand == DataType::Int || operand == DataType::Float)) return operand;
     if (op == UnaryOp::Not && operand == DataType::Bool) return DataType::Bool;
     return std::nullopt;
@@ -27,6 +29,7 @@ std::optional<DataType> binaryResult(BinaryOp op, DataType left, DataType right)
     case BinaryOp::And: case BinaryOp::Or:
         if (left == DataType::Bool) return DataType::Bool;
         break;
+    case BinaryOp::Like: break; // 语义入口显式拒绝尚未实现的匹配运算。
     }
     return std::nullopt;
 }
@@ -42,7 +45,15 @@ const char* typeName(DataType type) {
     return "UNKNOWN";
 }
 
-const char* operatorName(UnaryOp op) { return op == UnaryOp::Not ? "NOT" : "-"; }
+const char* operatorName(UnaryOp op) {
+    switch (op) {
+    case UnaryOp::Not: return "NOT";
+    case UnaryOp::Negate: return "-";
+    case UnaryOp::IsNull: return "IS NULL";
+    case UnaryOp::IsNotNull: return "IS NOT NULL";
+    }
+    return "UNKNOWN";
+}
 
 const char* operatorName(BinaryOp op) {
     switch (op) {
@@ -58,6 +69,7 @@ const char* operatorName(BinaryOp op) {
     case BinaryOp::GreaterEqual: return ">=";
     case BinaryOp::And: return "AND";
     case BinaryOp::Or: return "OR";
+    case BinaryOp::Like: return "LIKE";
     }
     return "UNKNOWN";
 }

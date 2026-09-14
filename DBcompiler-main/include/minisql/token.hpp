@@ -9,9 +9,11 @@ namespace minisql {
 enum class TokenKind {
     EndOfInput,
     Identifier, Integer, FloatLiteral, String,
-    Create, Table, Insert, Into, Values, Select, From, Where,
-    Update, Set, Delete, Join, On, Group, Order, By, Asc, Desc, As,
-    Int, Varchar, Bool, Float, Null, True, False, And, Or, Not,
+    Create, Table, Drop, If, Exists, Insert, Into, Values, Select, Distinct, From, Where, Having,
+    Update, Set, Delete, Join, Inner, Left, Right, Full, Outer, On, Group, Order, By, Asc, Desc, As, Is, Limit, Offset,
+    Primary, Key, Unique, Default,
+    Int, Varchar, Bool, Float, Null, True, False, And, Or, Not, Like, Between, In,
+    Count, Sum, Avg, Min, Max,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     Plus, Minus, Star, Slash,
     LeftParen, RightParen, Comma, Dot, Semicolon

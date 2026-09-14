@@ -17,7 +17,7 @@ public final class AdvancedQueryEngineTest {
         List<DatabaseEngine.ExecutionResult> results =
             new DatabaseEngine().executeProgramJson(Files.readString(Path.of(args[0])));
 
-        check(results.size() == 21, "every statement must produce one result");
+        check(results.size() == 31, "every statement must produce one result");
         assertRows(results.get(11), List.of(
             List.of(1L, 95.0),
             List.of(2L, 91.0),
@@ -45,6 +45,21 @@ public final class AdvancedQueryEngineTest {
             List.of("CEO", "CEO")), "self JOIN with table and ORDER BY aliases");
         check(aliases.columns().equals(List.of("employee_name", "manager_name")),
             "explicit and implicit column aliases must become output names");
+        check(results.get(21).equals(new DatabaseEngine.CommandResult("UPDATE", 1)) &&
+              results.get(22).equals(new DatabaseEngine.CommandResult("DELETE", 1)),
+              "DML aliases must preserve target row identities");
+        assertRows(results.get(23), List.of(List.of(1L, "CEO"), List.of(2L, "Engineer")),
+            "aliased DML and BETWEEN");
+        assertRows(results.get(24), List.of(List.of(2L)), "IS NULL on nullable FLOAT");
+        assertRows(results.get(25), List.of(List.of(1L)), "IS NOT NULL and NOT BETWEEN");
+        assertRows(results.get(26), List.of(List.of(3L), List.of(4L)), "NOT IN string literals");
+        assertRows(results.get(27), List.of(List.of(1L, 1L), List.of(2L, 1L)), "explicit INNER JOIN");
+        DatabaseEngine.QueryResult aggregate = assertRows(results.get(28),
+            List.of(List.of(3L, 58L)), "A aggregate expression wrappers and B execution");
+        check(aggregate.columns().equals(List.of("rows", "total")), "parallel aggregate aliases lost");
+        assertRows(results.get(29), List.of(List.of(1L), List.of(3L), List.of(4L)),
+            "NULL literal check and <> comparison");
+        assertRows(results.get(30), List.of(), "NULL IS NOT NULL");
 
         System.out.println("AdvancedQueryEngineTest passed");
     }

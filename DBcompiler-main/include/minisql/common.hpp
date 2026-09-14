@@ -42,20 +42,22 @@ inline std::string normalizeName(std::string name) {
     return name;
 }
 
-// NULL 暂用于 INSERT 空值；表达式中的三值逻辑留给后续执行契约。
+// NULL 用于存储、聚合和空值判定；普通运算的三值逻辑留给后续执行契约。
 struct NullValue {};
 inline bool operator==(NullValue, NullValue) noexcept { return true; }
 inline bool operator!=(NullValue, NullValue) noexcept { return false; }
 using LiteralValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
 
-enum class UnaryOp { Negate, Not };
+// IsNull/IsNotNull 接受任意类型，返回非空 BOOL，贯通 A/B 与执行层。
+enum class UnaryOp { Negate, Not, IsNull, IsNotNull };
 enum class SortDirection { Asc, Desc };
 enum class AggregateKind { Count, Sum, Avg, Min, Max };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
-    And, Or
+    And, Or,
+    Like // A 解析 SQL LIKE；B 后续定义字符串匹配语义。
 };
 
 enum class DiagnosticStage { Lexical, Syntax, Semantic, Plan, Execution };
@@ -90,6 +92,7 @@ using Result = std::variant<T, Diagnostic>;
 struct ColumnSpec {
     std::string name; // 已归一化。
     DataType type;
+    std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
 };
 
 } // namespace minisql

@@ -30,9 +30,10 @@ FROM sales GROUP BY dept ORDER BY total DESC;
 | app/plan_json.cpp | C++ 计划 → JSON | B 与执行层的桥接：输出已绑定参数及稳定字段 |
 | ../minidb-engine/src/main/java/minidb/DatabaseEngine.java | JSON → QueryResult | 执行适配：形成分组、计算聚合值、投影、排序 |
 
-旧 vector<Identifier> AST 保持可用。只有含聚合调用的 SQL 使用新的 vector<SelectItem>；
-外部手工构造的纯列 SelectItem 也会转回普通 SELECT 路径。
-COUNT 等函数名仍是普通 Identifier Token，因此无需增加五个关键字。
+旧 vector<Identifier> AST 保持可用。合入 feature-zhangbo 后，SelectItem 是
+variant<Identifier, AggregateCall, ExprPtr>，别名平行存入 column_aliases。
+外部手工构造的纯列 SelectItem 和括号包裹的列/聚合会归一化到已有路径。
+COUNT 等函数名由 A 识别为专用关键字，AggregateFunction 显式映射为 B 的 AggregateKind。
 
 ## 2. B 如何绑定
 
@@ -40,7 +41,7 @@ COUNT 等函数名仍是普通 Identifier Token，因此无需增加五个关键
 列引用保存 table_id、column_id、ordinal、type 和 relation_id。
 relation_id 区分自连接中同一物理表的两次扫描，SUM(l.amount) 和 SUM(r.amount) 不会混淆。
 
-COUNT(*) 的 argument 为空，COUNT(amount) 则保存列引用。这一区别决定是否跳过 NULL。
+A 的 COUNT(*) 参数为 AllColumns，B 绑定后 argument 为空；COUNT(amount) 绑定后保存列引用。这一区别决定是否跳过 NULL。
 BoundSelect.aggregate_items 按最终 SELECT 顺序保存普通分组列或聚合描述；
 output_names 保存 dept、rows、total。ORDER BY total 绑定为输出序号 2，
 执行阶段直接读取第 3 个输出值，无需再次查找字符串名字。
@@ -87,7 +88,7 @@ aggregate 先使用 LinkedHashMap 按分组键列表归类，每个键映射到�
 aggregate-query.sql 覆盖五类函数、NULL、空表、全 NULL、排序和自连接；
 aggregate-overflow.sql 验证整数 SUM 溢出的 SQL 行列。
 
-grammar.md 0.7 定义语言范围，interfaces.md 定义 C++ 接口，
+grammar.md 0.22 定义语言范围，interfaces.md 定义 C++ 接口，
 json-plan-protocol.md 定义跨语言字段。暂不支持 HAVING、聚合 DISTINCT、
 COUNT(1)、函数参数算术、嵌套聚合和直接 ORDER BY SUM(amount)；
 排序聚合结果请使用 SELECT 别名。普通表达式尚未实现 NULL 三值逻辑。

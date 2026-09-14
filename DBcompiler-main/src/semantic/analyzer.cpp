@@ -48,6 +48,11 @@ BindingScope singleTableScope(const std::shared_ptr<const TableSchema>& table) {
     return BindingScope{{table, table->name, 0}};
 }
 
+BindingScope singleTableScope(const std::shared_ptr<const TableSchema>& table,
+                              const std::optional<Identifier>& alias) {
+    return BindingScope{{table, alias ? normalizeName(alias->text) : table->name, 0}};
+}
+
 bool sameColumn(const BoundColumnRef& left, const BoundColumnRef& right) {
     return left.table_id.value == right.table_id.value &&
            left.column_id.value == right.column_id.value &&
@@ -59,12 +64,15 @@ bool containsColumn(const std::vector<BoundColumnRef>& columns, const BoundColum
     return false;
 }
 
-std::optional<AggregateKind> aggregateKind(const std::string& name) {
-    if (name == "count") return AggregateKind::Count;
-    if (name == "sum") return AggregateKind::Sum;
-    if (name == "avg") return AggregateKind::Avg;
-    if (name == "min") return AggregateKind::Min;
-    if (name == "max") return AggregateKind::Max;
+// A 使用语法枚举，B 使用计划枚举；逐项映射，不依赖枚举整数值。
+std::optional<AggregateKind> aggregateKind(AggregateFunction function) {
+    switch (function) {
+    case AggregateFunction::Count: return AggregateKind::Count;
+    case AggregateFunction::Sum: return AggregateKind::Sum;
+    case AggregateFunction::Avg: return AggregateKind::Avg;
+    case AggregateFunction::Min: return AggregateKind::Min;
+    case AggregateFunction::Max: return AggregateKind::Max;
+    }
     return std::nullopt;
 }
 
@@ -150,6 +158,10 @@ private:
         std::unordered_set<std::string> names;
         std::vector<ColumnSpec> columns;
         for (const auto& column : stmt.columns) {
+            if (column.varchar_length || column.primary_key || column.not_null ||
+                column.unique || column.default_value)
+                return error(ErrorCode::UnsupportedFeature,
+                    "column length and constraints are not supported by execution yet", column.span);
             auto normalized = normalizeName(column.name.text);
             if (!names.insert(normalized).second) {
                 return error(ErrorCode::DuplicateColumn, "duplicate column '" + column.name.text + "'",
@@ -165,10 +177,29 @@ private:
         return success(BoundCreateTable{normalizeName(stmt.table.text), std::move(columns)});
     }
 
+    Result<BoundStatement> bindStatement(const DropTableStmt& stmt) {
+        // A 已能保存 DROP TABLE / IF EXISTS / 多表名；B 当前没有 BoundDropTable、
+        // DropPlan 或 Catalog 删除事务，先明确拒绝，避免调用方误以为已删除表。
+        const SourceLocation span = stmt.tables.empty()
+            ? statement_span_
+            : location(stmt.tables.front().span, statement_span_);
+        return error(ErrorCode::UnsupportedFeature,
+                     "DROP TABLE is not supported by semantic analysis yet",
+                     span);
+    }
+
     Result<BoundStatement> bindStatement(const InsertStmt& stmt) {
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        if (stmt.rows.size() > 1) {
+            // A 已能保存 INSERT 多行；B 当前 BoundInsert/InsertPlan 仍是单行结构，
+            // 先明确拒绝，避免只绑定第一行造成静默丢数据。
+            return error(ErrorCode::UnsupportedFeature,
+                         "multi-row INSERT is not supported by semantic analysis yet",
+                         statement_span_);
+        }
+        const auto& input_values = stmt.rows.empty() ? stmt.values : stmt.rows.front();
         std::vector<BoundColumnRef> targets;
         if (stmt.columns) {
             if (stmt.columns->empty()) {
@@ -190,9 +221,9 @@ private:
             for (std::size_t i = 0; i < table->columns.size(); ++i)
                 targets.push_back(columnRef(scope.front(), i));
         }
-        if (targets.size() != stmt.values.size()) {
+        if (targets.size() != input_values.size()) {
             return error(ErrorCode::ValueCountMismatch, "INSERT has " + std::to_string(targets.size()) +
-                " columns but " + std::to_string(stmt.values.size()) + " values", statement_span_);
+                " columns but " + std::to_string(input_values.size()) + " values", statement_span_);
         }
         if (targets.size() != table->columns.size()) {
             return error(ErrorCode::MissingInsertColumn,
@@ -202,36 +233,55 @@ private:
         // 确认完整覆盖后再分配输出，按 ordinal 写入而不是按 SQL 输入顺序追加。
         std::vector<ScalarValue> values(table->columns.size());
         for (std::size_t i = 0; i < targets.size(); ++i) {
-            const auto actual = literalType(stmt.values[i].value);
+            const auto actual = literalType(input_values[i].value);
             // 当前模式统一允许空值；NULL 没有自己的列类型，不参与普通表达式运算。
             if (actual != DataType::Null && targets[i].type != actual) {
                 return error(ErrorCode::TypeMismatch,
                     table->name + "." + table->columns[targets[i].ordinal].name + " expects " +
                     typeName(targets[i].type) + ", but " + typeName(actual) + " found",
-                    location(stmt.values[i].span, statement_span_));
+                    location(input_values[i].span, statement_span_));
             }
-            values[targets[i].ordinal] = scalar(stmt.values[i].value);
+            values[targets[i].ordinal] = scalar(input_values[i].value);
         }
         return success(BoundInsert{std::move(table), std::move(values)});
     }
 
     Result<BoundStatement> bindStatement(const SelectStmt& stmt) {
-        // 外部调用方也可以用 SelectItem 表示纯列查询；统一到原列清单路径。
+        // 括号包裹的单列/聚合在 A 中属于 ExprPtr；先归一化为已有绑定路径。
         if (const auto* items = std::get_if<std::vector<SelectItem>>(&stmt.columns)) {
-            bool has_aggregate = false;
-            for (const auto& item : *items)
-                has_aggregate |= std::holds_alternative<AggregateCall>(item.value);
-            if (!has_aggregate && stmt.column_aliases.empty()) {
-                auto plain = stmt;
-                std::vector<Identifier> names;
-                for (const auto& item : *items) {
-                    names.push_back(std::get<Identifier>(item.value));
-                    plain.column_aliases.push_back(item.alias);
+            auto normalized = *items;
+            bool changed = false;
+            bool all_columns = true;
+            for (auto& item : normalized) {
+                if (const auto* expression = std::get_if<ExprPtr>(&item)) {
+                    if (!*expression)
+                        return error(ErrorCode::InvalidAst, "SELECT expression is missing", statement_span_);
+                    if (const auto* column = std::get_if<IdentifierExpr>(&(*expression)->node)) {
+                        item = column->name;
+                    } else if (const auto* aggregate = std::get_if<AggregateCall>(&(*expression)->node)) {
+                        item = *aggregate;
+                    } else {
+                        return error(ErrorCode::UnsupportedFeature,
+                            "SELECT computed expressions are not supported yet", (*expression)->span);
+                    }
+                    changed = true;
                 }
-                plain.columns = std::move(names);
-                return bindStatement(plain);
+                all_columns &= std::holds_alternative<Identifier>(item);
+            }
+            if (all_columns || changed) {
+                auto query = stmt;
+                if (all_columns) {
+                    std::vector<Identifier> names;
+                    for (const auto& item : normalized) names.push_back(std::get<Identifier>(item));
+                    query.columns = std::move(names);
+                } else query.columns = std::move(normalized);
+                return bindStatement(query);
             }
         }
+        // 不能丢弃 A 新增而执行层尚未实现的标记，否则会悄悄改变 SQL 含义。
+        if (stmt.distinct || stmt.having || stmt.limit || stmt.offset)
+            return error(ErrorCode::UnsupportedFeature,
+                "DISTINCT, HAVING and LIMIT/OFFSET are not supported by execution yet", statement_span_);
         if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
             return error(ErrorCode::InvalidAst, "table alias must be a simple identifier",
                          location(stmt.table_alias->span, statement_span_));
@@ -243,6 +293,8 @@ private:
         BindingScope scope{{table, relation_name, 1}};
         std::vector<BoundJoin> joins;
         for (const auto& join : stmt.joins) {
+            if (join.type != JoinType::Inner)
+                return error(ErrorCode::UnsupportedFeature, "outer JOIN is not supported yet", join.span);
             if (join.alias && join.alias->text.find('.') != std::string::npos)
                 return error(ErrorCode::InvalidAst, "JOIN alias must be a simple identifier",
                              location(join.alias->span, location(join.span, statement_span_)));
@@ -311,13 +363,13 @@ private:
             const auto& items = std::get<std::vector<SelectItem>>(stmt.columns);
             if (items.empty())
                 return error(ErrorCode::EmptyColumnList, "SELECT column list must not be empty", statement_span_);
-            if (!stmt.column_aliases.empty())
+            if (!stmt.column_aliases.empty() && stmt.column_aliases.size() != items.size())
                 return error(ErrorCode::InvalidAst,
-                             "rich SELECT items carry their aliases directly", statement_span_);
+                             "SELECT aliases must match selected items", statement_span_);
             for (const auto& item : items) {
                 const std::size_t output_ordinal = aggregate_items.size();
                 std::string default_name;
-                if (const auto* name = std::get_if<Identifier>(&item.value)) {
+                if (const auto* name = std::get_if<Identifier>(&item)) {
                     auto resolved = resolveColumn(*name, scope, statement_span_);
                     if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
                     auto ref = std::get<BoundColumnRef>(resolved);
@@ -325,31 +377,23 @@ private:
                     aggregate_items.push_back({ref});
                     default_name = scope[ref.relation_id - 1].table->columns[ref.ordinal].name;
                 } else {
-                    const auto& call = std::get<AggregateCall>(item.value);
-                    const auto kind = aggregateKind(normalizeName(call.function.text));
+                    const auto& call = std::get<AggregateCall>(item);
+                    const auto kind = aggregateKind(call.function);
                     if (!kind) {
                         return error(ErrorCode::UnsupportedFeature,
-                            "unsupported aggregate function '" + call.function.text + "'",
-                            location(call.function.span, location(call.span, statement_span_)));
+                            "unsupported aggregate function", location(call.span, statement_span_));
                     }
                     std::optional<BoundColumnRef> argument;
-                    if (call.count_star == call.argument.has_value())
-                        return error(ErrorCode::InvalidAst,
-                            "aggregate requires exactly one column argument or '*'",
-                            location(call.span, statement_span_));
-                    if (call.argument) {
-                        auto resolved = resolveColumn(*call.argument, scope, call.span);
+                    const auto* argument_name = std::get_if<Identifier>(&call.argument);
+                    const bool count_star = !argument_name;
+                    if (argument_name) {
+                        auto resolved = resolveColumn(*argument_name, scope, call.span);
                         if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
                         argument = std::get<BoundColumnRef>(resolved);
                     }
-                    if (call.count_star && *kind != AggregateKind::Count) {
+                    if (count_star && *kind != AggregateKind::Count)
                         return error(ErrorCode::InvalidOperandType,
                             aggregateName(*kind) + " does not accept '*'", location(call.span, statement_span_));
-                    }
-                    if (!call.count_star && !argument) {
-                        return error(ErrorCode::InvalidAst, "aggregate argument is missing",
-                                     location(call.span, statement_span_));
-                    }
                     DataType result_type = DataType::Int;
                     if (*kind == AggregateKind::Avg) result_type = DataType::Float;
                     else if (*kind != AggregateKind::Count) result_type = argument->type;
@@ -357,18 +401,20 @@ private:
                         argument->type != DataType::Int && argument->type != DataType::Float) {
                         return error(ErrorCode::InvalidOperandType,
                             aggregateName(*kind) + " expects an INT or FLOAT column",
-                            location(call.argument->span, location(call.span, statement_span_)));
+                            location(argument_name->span, location(call.span, statement_span_)));
                     }
                     aggregate_items.push_back({BoundAggregate{*kind, argument, result_type,
                                                               location(call.span, statement_span_)}});
                     default_name = aggregateName(*kind) + "(" +
-                        (call.count_star ? "*" : normalizeName(call.argument->text)) + ")";
+                        (count_star ? "*" : normalizeName(argument_name->text)) + ")";
                 }
-                if (item.alias) {
-                    if (item.alias->text.find('.') != std::string::npos)
+                const auto alias_name = stmt.column_aliases.empty()
+                    ? std::optional<Identifier>{} : stmt.column_aliases[output_ordinal];
+                if (alias_name) {
+                    if (alias_name->text.find('.') != std::string::npos)
                         return error(ErrorCode::InvalidAst, "column alias must be a simple identifier",
-                                     location(item.alias->span, statement_span_));
-                    auto alias = normalizeName(item.alias->text);
+                                     location(alias_name->span, statement_span_));
+                    auto alias = normalizeName(alias_name->text);
                     output_names.push_back(alias);
                     aggregate_aliases.push_back({std::move(alias), output_ordinal});
                 } else output_names.push_back(std::move(default_name));
@@ -411,6 +457,13 @@ private:
         std::vector<BoundOrderBy> order_by;
         std::vector<BoundAggregateOrder> aggregate_order_by;
         for (const auto& item : stmt.order_by) {
+            if (item.expression) {
+                // A 已能保存 ORDER BY 表达式；B 当前 SortPlan 只接受 BoundColumnRef，
+                // 先明确拒绝，避免继续按旧 column 字段绑定出误导性错误。
+                return error(ErrorCode::UnsupportedFeature,
+                             "ORDER BY expressions are not supported by semantic analysis yet",
+                             location(item.expression->span, item.span));
+            }
             if (!aggregate_items.empty()) {
                 std::optional<std::size_t> alias_match;
                 const auto order_name = normalizeName(item.column.text);
@@ -479,6 +532,11 @@ private:
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+            return error(ErrorCode::InvalidAst, "UPDATE table alias must be a simple identifier",
+                         location(stmt.table_alias->span, statement_span_));
+        // A 支持 UPDATE 目标表别名；B 在单表作用域中用别名替代物理表名做限定名解析。
+        const auto scope = singleTableScope(table, stmt.table_alias);
         if (stmt.assignments.empty()) {
             return error(ErrorCode::InvalidAst, "UPDATE requires at least one assignment", statement_span_);
         }
@@ -486,7 +544,7 @@ private:
         std::vector<BoundAssignment> assignments;
         for (const auto& assignment : stmt.assignments) {
             const auto span = location(assignment.span, statement_span_);
-            auto resolved = resolveColumn(assignment.target, singleTableScope(table), span);
+            auto resolved = resolveColumn(assignment.target, scope, span);
             if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
             auto target = std::get<BoundColumnRef>(resolved);
             if (!targets.insert(target.ordinal).second) {
@@ -495,7 +553,7 @@ private:
                     location(assignment.target.span, span));
             }
             // 始终绑定到同一份原表模式，不用先前赋值替换 RHS 中的列引用。
-            auto expression = bindExpr(assignment.value, singleTableScope(table), 0, span);
+            auto expression = bindExpr(assignment.value, scope, 0, span);
             if (const auto* failure = std::get_if<Diagnostic>(&expression)) return *failure;
             auto rhs = std::get<BoundExprPtr>(std::move(expression));
             if (rhs->type != target.type) {
@@ -505,7 +563,7 @@ private:
             }
             assignments.push_back({target, std::move(rhs)});
         }
-        auto predicate = bindWhere(stmt.where, singleTableScope(table));
+        auto predicate = bindWhere(stmt.where, scope);
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
         return success(BoundUpdate{std::move(table), std::move(assignments),
                                    std::get<BoundExprPtr>(std::move(predicate))});
@@ -515,7 +573,12 @@ private:
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        auto predicate = bindWhere(stmt.where, singleTableScope(table));
+        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+            return error(ErrorCode::InvalidAst, "DELETE table alias must be a simple identifier",
+                         location(stmt.table_alias->span, statement_span_));
+        // A 支持 DELETE 目标表别名；WHERE 中的限定列使用该单表作用域解析。
+        const auto scope = singleTableScope(table, stmt.table_alias);
+        auto predicate = bindWhere(stmt.where, scope);
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
         return success(BoundDelete{std::move(table), std::get<BoundExprPtr>(std::move(predicate))});
     }
@@ -567,7 +630,16 @@ private:
                     std::string("operator '") + operatorName(node.op) + "' cannot be applied to " + typeName(child->type), op_span);
                 return std::make_shared<const BoundExpr>(BoundExpr{
                     BoundUnary{node.op, child, op_span}, *type, span});
+            } else if constexpr (std::is_same_v<T, AggregateCall>) {
+                // B 支持 SELECT 顶层聚合；普通表达式中的聚合仍需单独的表达式计划，
+                // 先明确拒绝，避免把 AggregateCall 误当 BinaryExpr 访问 left/right。
+                return error(ErrorCode::UnsupportedFeature,
+                             "aggregate expressions are not supported by semantic analysis yet",
+                             span);
             } else {
+                if (node.op == BinaryOp::Like)
+                    return error(ErrorCode::UnsupportedFeature, "LIKE is not supported by execution yet",
+                                 location(node.operator_span, span));
                 const auto op_span = location(node.operator_span, span);
                 auto left = bindExpr(node.left, scope, depth + 1, op_span);
                 if (const auto* failure = std::get_if<Diagnostic>(&left)) return *failure;

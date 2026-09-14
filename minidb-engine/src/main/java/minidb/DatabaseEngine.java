@@ -490,6 +490,9 @@ public final class DatabaseEngine {
     private Object unary(String op, Object value, Map<String, Object> expression) {
         return switch (op) {
             case "Not" -> !bool(value, expression);
+            // 空值判定不触发布尔/数字强制转换，适用于所有列类型。
+            case "IsNull" -> value == null;
+            case "IsNotNull" -> value != null;
             case "Negate" -> negate(value, expression);
             default -> throw error("InvalidPlan", "unknown unary operator", expression);
         };

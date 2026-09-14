@@ -28,3 +28,15 @@ INSERT INTO employee VALUES (3, 'Intern', 2);
 SELECT e.name AS employee_name, m.name manager_name
 FROM employee AS e JOIN employee m ON e.manager_id = m.id
 ORDER BY employee_name DESC;
+
+-- feature-zhangbo: DML aliases and scalar syntax must work through the real bridge.
+UPDATE employee e SET e.name = 'Engineer' WHERE e.id = 2;
+DELETE FROM employee AS e WHERE e.id IN (3);
+SELECT id, name FROM employee WHERE id BETWEEN 1 AND 2 ORDER BY id;
+SELECT id FROM student WHERE gpa IS NULL ORDER BY id;
+SELECT id FROM student WHERE age IS NOT NULL AND id NOT BETWEEN 2 AND 3 ORDER BY id;
+SELECT id FROM student WHERE name NOT IN ('Alice', 'Bob') ORDER BY id;
+SELECT e.id, m.id FROM employee e INNER JOIN employee m ON e.manager_id=m.id ORDER BY e.id;
+SELECT (COUNT(*)) AS rows, (SUM(age)) AS total FROM student WHERE age IS NOT NULL;
+SELECT id FROM student WHERE NULL IS NULL AND id <> 2 ORDER BY id;
+SELECT id FROM student WHERE NULL IS NOT NULL;

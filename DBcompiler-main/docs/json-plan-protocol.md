@@ -49,3 +49,10 @@ Java 按 groupKeys 组建分组，按 items 计算结果，再执行 orderBy。�
 必须保留一个空分组；COUNT 为 0，其余为 null。分组空输入返回零行。所有带参数聚合忽略 null。
 MIN/MAX 沿用排序类型规则；整数 SUM 溢出报 IntegerOverflow，浮点累加非有限值报 FloatOverflow，
 错误位置使用聚合项 span。NULL 排序保持 ASC 最后、DESC 最前。
+
+## 空值判定与 A 新语法
+
+Unary 表达式的 op 新增 IsNull 和 IsNotNull。两者先求值 operand，再检查其值是否为 null，
+返回 BOOL，适用于任何已绑定类型。<>、BETWEEN、IN 使用既有二元比较/逻辑 JSON 节点；
+UPDATE/DELETE 的表别名在 B 绑定时消解，仍用 relationId=0 传递行身份。
+本次没有为 DISTINCT/HAVING/LIMIT/外连接等增加执行节点，这些语法在 B 处返回 UnsupportedFeature。

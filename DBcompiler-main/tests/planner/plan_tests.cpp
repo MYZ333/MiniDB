@@ -44,14 +44,17 @@ UpdateStmt increment(ExprPtr where = nullptr) {
     return {id("student"), {{id("age"), bin(BinaryOp::Add, col("age"), num(1)), {}}}, std::move(where)};
 }
 
-SelectItem selected(std::string name) { return {id(std::move(name)), std::nullopt, {}}; }
+// 聚合测试按 A 的新 AST 构造，别名与 SELECT 项平行保存在 column_aliases。
+SelectItem selected(std::string name) { return id(std::move(name)); }
 
-SelectItem aggregate(std::string function, std::optional<std::string> argument,
-                     bool star = false, std::optional<std::string> alias = std::nullopt) {
-    return {AggregateCall{id(std::move(function)),
-                          argument ? std::optional<Identifier>{id(*argument)} : std::nullopt,
-                          star, {}},
-            alias ? std::optional<Identifier>{id(*alias)} : std::nullopt, {}};
+SelectItem aggregate(std::string function, std::optional<std::string> argument, bool star = false) {
+    const auto kind = function == "COUNT" ? AggregateFunction::Count :
+        function == "SUM" ? AggregateFunction::Sum : function == "AVG" ? AggregateFunction::Avg :
+        function == "MIN" ? AggregateFunction::Min : function == "MAX" ? AggregateFunction::Max :
+        static_cast<AggregateFunction>(-1);
+    std::variant<AllColumns, Identifier> parameter = AllColumns{};
+    if (!star && argument) parameter = id(*argument);
+    return AggregateCall{kind, std::move(parameter), {}};
 }
 
 // 检查 Filter 保留完整输入模式和 RowId；两者对修改计划都很关键。
@@ -128,9 +131,10 @@ int main() {
     suite.run("aggregate query produces one typed root above filtered detail rows", [] {
         Fixture f;
         SelectStmt select{id("student"), std::vector<SelectItem>{
-            selected("age"), aggregate("COUNT", std::nullopt, true, "rows"),
-            aggregate("SUM", "id", false, "total"), aggregate("AVG", "age")},
+            selected("age"), aggregate("COUNT", std::nullopt, true),
+            aggregate("SUM", "id"), aggregate("AVG", "age")},
             bin(BinaryOp::Greater, col("id"), num(0))};
+        select.column_aliases = {std::nullopt, id("rows"), id("total"), std::nullopt};
         select.group_by = {id("age")};
         select.order_by = {{id("total"), SortDirection::Desc, {}}};
         const auto plan = f.compile(std::move(select));
@@ -253,7 +257,7 @@ int main() {
     suite.run("planner rejects malformed aggregate output and result types", [] {
         Fixture f;
         auto bound = f.bind(SelectStmt{id("student"), std::vector<SelectItem>{
-            aggregate("COUNT", std::nullopt, true, "rows")}, nullptr});
+            aggregate("COUNT", std::nullopt, true)}, nullptr});
         auto& select = std::get<BoundSelect>(bound.node);
         select.output_names.clear();
         failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);

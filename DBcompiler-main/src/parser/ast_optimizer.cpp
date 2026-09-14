@@ -9,7 +9,7 @@
 
 namespace minisql {
 namespace {
-ExprPtr makeExpr(std::variant<IdentifierExpr, LiteralExpr, UnaryExpr, BinaryExpr> node,
+ExprPtr makeExpr(std::variant<IdentifierExpr, LiteralExpr, UnaryExpr, BinaryExpr, AggregateCall> node,
                  SourceLocation span) {
     return std::make_shared<const Expr>(Expr{std::move(node), std::move(span)});
 }
@@ -55,6 +55,10 @@ std::optional<std::int64_t> integerBinary(BinaryOp op, std::int64_t a, std::int6
 std::optional<LiteralValue> foldUnary(UnaryOp op, const LiteralValue& value) {
     if (op == UnaryOp::Not) {
         if (const auto* item = std::get_if<bool>(&value)) return LiteralValue{!*item};
+    } else if (op == UnaryOp::IsNull) {
+        return LiteralValue{std::holds_alternative<NullValue>(value)};
+    } else if (op == UnaryOp::IsNotNull) {
+        return LiteralValue{!std::holds_alternative<NullValue>(value)};
     } else if (const auto* item = std::get_if<std::int64_t>(&value)) {
         if (*item != std::numeric_limits<std::int64_t>::min()) return LiteralValue{-*item};
     } else if (const auto* item = std::get_if<double>(&value)) {
@@ -135,13 +139,25 @@ ExprPtr optimizeWhere(const ExprPtr& where) {
     ExprPtr result = optimizeAstExpression(where);
     return boolean(result) == true ? nullptr : result;
 }
+
+SelectList optimizeSelectList(const SelectList& columns) {
+    if (!std::holds_alternative<std::vector<SelectItem>>(columns)) return columns;
+    auto items = std::get<std::vector<SelectItem>>(columns);
+    for (auto& item : items) {
+        if (auto* expr = std::get_if<ExprPtr>(&item)) {
+            *expr = optimizeAstExpression(*expr);
+        }
+    }
+    return SelectList{std::move(items)};
+}
 } // namespace
 
 ExprPtr optimizeAstExpression(const ExprPtr& expression) {
     if (!expression) return nullptr;
     return std::visit([&](const auto& node) -> ExprPtr {
         using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr>) {
+        if constexpr (std::is_same_v<T, IdentifierExpr> || std::is_same_v<T, LiteralExpr> ||
+                      std::is_same_v<T, AggregateCall>) {
             return expression;
         } else if constexpr (std::is_same_v<T, UnaryExpr>) {
             ExprPtr operand = optimizeAstExpression(node.operand);
@@ -160,8 +176,13 @@ Statement optimizeAstStatement(const Statement& statement) {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, SelectStmt>) {
             auto copy = node;
+            copy.columns = optimizeSelectList(node.columns);
             copy.where = optimizeWhere(node.where);
+            copy.having = optimizeWhere(node.having);
             for (auto& join : copy.joins) join.on = optimizeAstExpression(join.on);
+            for (auto& item : copy.order_by) {
+                if (item.expression) item.expression = optimizeAstExpression(item.expression);
+            }
             result.node = std::move(copy);
         } else if constexpr (std::is_same_v<T, UpdateStmt>) {
             auto copy = node;
@@ -173,6 +194,8 @@ Statement optimizeAstStatement(const Statement& statement) {
             auto copy = node;
             copy.where = optimizeWhere(node.where);
             result.node = std::move(copy);
+        } else if constexpr (std::is_same_v<T, DropTableStmt>) {
+            result.node = node;
         }
     }, statement.node);
     return result;

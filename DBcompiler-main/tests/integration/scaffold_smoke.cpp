@@ -37,6 +37,62 @@ void at(const Diagnostic& error, const std::string& sql, const std::string& lexe
 
 int main() {
     Suite suite;
+    suite.run("new A aggregate AST still reaches B aggregate plans", [] {
+        Fixture f;
+        const auto plan = f.compile(
+            "SELECT (age) AS years, (COUNT(*)) AS rows, SUM(id) AS total "
+            "FROM student GROUP BY age ORDER BY total DESC;");
+        const auto& aggregate = std::get<AggregatePlan>(plan.root->node);
+        check(aggregate.items.size() == 3 && plan.root->output[1].name == "rows" &&
+              std::get<std::size_t>(aggregate.order_by[0].key) == 2,
+              "A expression wrappers or parallel aliases broke B aggregation");
+    });
+    suite.run("parser-only extensions fail explicitly instead of being ignored", [] {
+        Fixture f;
+        for (const std::string sql : {
+            "SELECT DISTINCT name FROM student;",
+            "SELECT * FROM student LIMIT 0;",
+            "SELECT * FROM student LIMIT 1 OFFSET 0;",
+            "SELECT age, COUNT(*) FROM student GROUP BY age HAVING COUNT(*) > 1;",
+            "SELECT * FROM student s LEFT JOIN student t ON s.id=t.id;",
+            "SELECT * FROM student s RIGHT JOIN student t ON s.id=t.id;",
+            "SELECT * FROM student s FULL JOIN student t ON s.id=t.id;",
+            "SELECT age+1 FROM student;",
+            "SELECT COUNT(*)+1 FROM student;",
+            "SELECT name FROM student ORDER BY age+1;",
+            "SELECT COUNT(*) FROM student ORDER BY COUNT(*);",
+            "SELECT * FROM student WHERE name LIKE 'A%';",
+            "SELECT * FROM student WHERE name NOT LIKE 'A%';",
+            "INSERT INTO student VALUES(1,'a',2),(2,'b',3);",
+            "DROP TABLE IF EXISTS student;",
+            "CREATE TABLE constrained(id INT PRIMARY KEY);",
+            "CREATE TABLE constrained(id INT NOT NULL);",
+            "CREATE TABLE constrained(id INT UNIQUE);",
+            "CREATE TABLE constrained(id INT DEFAULT 1);",
+            "CREATE TABLE constrained(name VARCHAR(20));"
+        }) {
+            const auto error = failure(f.bind(sql), ErrorCode::UnsupportedFeature);
+            check(error.span.has_value(), "unsupported feature must preserve source location");
+        }
+        check(f.catalog.snapshot()->version() == 1 &&
+              f.catalog.snapshot()->findTable("student"), "rejected syntax modified the catalog");
+    });
+    suite.run("new scalar syntax and DML aliases bind through existing contracts", [] {
+        Fixture f;
+        for (const std::string sql : {
+            "SELECT * FROM student WHERE id <> 1;",
+            "SELECT * FROM student WHERE age BETWEEN 18 AND 30;",
+            "SELECT * FROM student WHERE id NOT IN (1,2);",
+            "SELECT * FROM student WHERE name IS NULL;",
+            "SELECT * FROM student WHERE age IS NOT NULL;",
+            "SELECT * FROM student WHERE NULL IS NULL;",
+            "UPDATE student s SET s.age=s.age+1 WHERE s.id=1;",
+            "DELETE FROM student AS s WHERE s.name IS NULL;",
+            "SELECT s.id FROM student s INNER JOIN student t ON s.id=t.id;"
+        }) f.compile(sql);
+        failure(f.bind("UPDATE student s SET student.age=1;"), ErrorCode::ColumnNotFound);
+        failure(f.bind("DELETE FROM student s WHERE student.id=1;"), ErrorCode::ColumnNotFound);
+    });
     suite.run("SQL five-statement pipeline with explicit catalog registration", [] {
         const auto parsed = statements(
             "CREATE TABLE Student(id INT,name VARCHAR,age INT);"

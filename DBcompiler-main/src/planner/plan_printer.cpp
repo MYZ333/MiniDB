@@ -33,6 +33,7 @@ const char* opName(BinaryOp op) {
     case BinaryOp::GreaterEqual: return ">=";
     case BinaryOp::And: return "AND";
     case BinaryOp::Or: return "OR";
+    case BinaryOp::Like: return "LIKE";
     }
     return "UNKNOWN";
 }
@@ -130,10 +131,13 @@ std::string expression(const BoundExprPtr& expr, const Relations& relations,
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, BoundColumnRef>) return columnName(node, relations);
         else if constexpr (std::is_same_v<T, BoundLiteral>) return literal(node.value);
-        else if constexpr (std::is_same_v<T, BoundUnary>)
+        else if constexpr (std::is_same_v<T, BoundUnary>) {
+            if (node.op == UnaryOp::IsNull || node.op == UnaryOp::IsNotNull)
+                return "(" + expression(node.operand, relations, depth + 1) +
+                    (node.op == UnaryOp::IsNull ? " IS NULL)" : " IS NOT NULL)");
             return std::string("(") + (node.op == UnaryOp::Not ? "NOT " : "-") +
                    expression(node.operand, relations, depth + 1) + ")";
-        else
+        } else
             return "(" + expression(node.left, relations, depth + 1) + " " + opName(node.op) + " " +
                    expression(node.right, relations, depth + 1) + ")";
     }, expr->node);

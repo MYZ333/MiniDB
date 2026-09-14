@@ -10,6 +10,10 @@ JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和�
 消费增删改查与高级查询计划。两次合并范围见
 [A 第一版合并说明](docs/a-merge-notes.md)和 [A version2 合并说明](docs/a-version2-merge-notes.md)。
 
+已整合 feature-zhangbo：语法与 B 聚合 AST 已统一，新增空值判定和 DML 别名执行。
+[整合说明与阅读顺序](docs/zhangbo-merge-notes.md)解释接口冲突的解决方式；
+[grammar.md 0.22](grammar.md)区分完整执行与仅解析支持。
+
 ## 1. 目录结构
 
 ```text
@@ -62,13 +66,13 @@ DBcompiler/
 ├── examples/optimizer.cpp    # 真实 SQL 编译 → 优化前后计划对照
 ├── tests/
 │   ├── lexer/lexer_tests.cpp # A：词法及扩展 Token 回归
-│   ├── parser/               # A：语法与 4 组 AST 优化测试
+│   ├── parser/               # A：语法与 9 组 AST 优化测试
 │   ├── catalog/catalog_tests.cpp # B：5 个模式/快照行为用例
-│   ├── semantic/semantic_tests.cpp # B：41 个语义行为用例
+│   ├── semantic/semantic_tests.cpp # B：46 个语义行为用例
 │   ├── test_support.hpp      # 测试断言和手工 AST 辅助，不属于产品 API
 │   ├── planner/plan_tests.cpp # B：23 个计划结构与打印用例
 │   ├── optimizer/            # B：25 组优化测试及独立参考求值器
-│   └── integration/scaffold_smoke.cpp # 14 个真实 SQL → Plan/诊断兼容用例
+│   └── integration/scaffold_smoke.cpp # 17 组真实 SQL → Plan/诊断兼容用例
 ├── scripts/check.sh          # 无 CMake 时的编译及检查脚本
 └── build/                    # 本地构建产物，已忽略
 ```

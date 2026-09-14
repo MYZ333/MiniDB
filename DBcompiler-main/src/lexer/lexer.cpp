@@ -29,19 +29,33 @@ std::string asciiLower(std::string text) {
 TokenKind keywordOrIdentifier(const std::string& lexeme) {
     static const std::unordered_map<std::string, TokenKind> keywords{
         {"create", TokenKind::Create}, {"table", TokenKind::Table},
+        {"drop", TokenKind::Drop}, {"if", TokenKind::If}, {"exists", TokenKind::Exists},
         {"insert", TokenKind::Insert}, {"into", TokenKind::Into},
         {"values", TokenKind::Values}, {"select", TokenKind::Select},
+        {"distinct", TokenKind::Distinct},
         {"from", TokenKind::From}, {"where", TokenKind::Where},
+        {"having", TokenKind::Having},
         {"update", TokenKind::Update}, {"set", TokenKind::Set},
         {"delete", TokenKind::Delete}, {"join", TokenKind::Join},
+        {"inner", TokenKind::Inner}, {"left", TokenKind::Left},
+        {"right", TokenKind::Right}, {"full", TokenKind::Full}, {"outer", TokenKind::Outer},
         {"on", TokenKind::On}, {"group", TokenKind::Group},
         {"order", TokenKind::Order}, {"by", TokenKind::By},
         {"asc", TokenKind::Asc}, {"desc", TokenKind::Desc}, {"as", TokenKind::As},
+        {"is", TokenKind::Is},
+        {"primary", TokenKind::Primary}, {"key", TokenKind::Key},
+        {"unique", TokenKind::Unique}, {"default", TokenKind::Default},
         {"int", TokenKind::Int}, {"varchar", TokenKind::Varchar},
         {"bool", TokenKind::Bool}, {"float", TokenKind::Float},
         {"null", TokenKind::Null}, {"true", TokenKind::True},
         {"false", TokenKind::False}, {"and", TokenKind::And},
         {"or", TokenKind::Or}, {"not", TokenKind::Not},
+        {"like", TokenKind::Like},
+        {"between", TokenKind::Between},
+        {"in", TokenKind::In},
+        {"count", TokenKind::Count}, {"sum", TokenKind::Sum},
+        {"avg", TokenKind::Avg}, {"min", TokenKind::Min}, {"max", TokenKind::Max},
+        {"limit", TokenKind::Limit}, {"offset", TokenKind::Offset},
     };
     const auto found = keywords.find(asciiLower(lexeme));
     return found == keywords.end() ? TokenKind::Identifier : found->second;
@@ -236,7 +250,7 @@ private:
                 return Token{TokenKind::LessEqual, textFrom(begin), spanFrom(start)};
             }
             if (match('>')) {
-                return diagnostic(ErrorCode::InvalidCharacter, "'<>' is not supported", start);
+                return Token{TokenKind::NotEqual, textFrom(begin), spanFrom(start)};
             }
             return Token{TokenKind::Less, textFrom(begin), spanFrom(start)};
         case '>':

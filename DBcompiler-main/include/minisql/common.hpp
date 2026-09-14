@@ -49,12 +49,14 @@ inline bool operator!=(NullValue, NullValue) noexcept { return false; }
 using LiteralValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
 using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
 
-enum class UnaryOp { Negate, Not };
+// IsNull/IsNotNull 由 A 解析 IS NULL / IS NOT NULL；B 后续决定具体 NULL 语义。
+enum class UnaryOp { Negate, Not, IsNull, IsNotNull };
 enum class SortDirection { Asc, Desc };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
-    And, Or
+    And, Or,
+    Like // A 解析 SQL LIKE；B 后续定义字符串匹配语义。
 };
 
 enum class DiagnosticStage { Lexical, Syntax, Semantic, Plan, Execution };
@@ -89,6 +91,7 @@ using Result = std::variant<T, Diagnostic>;
 struct ColumnSpec {
     std::string name; // 已归一化。
     DataType type;
+    std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
 };
 
 } // namespace minisql

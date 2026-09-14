@@ -48,6 +48,11 @@ BindingScope singleTableScope(const std::shared_ptr<const TableSchema>& table) {
     return BindingScope{{table, table->name, 0}};
 }
 
+BindingScope singleTableScope(const std::shared_ptr<const TableSchema>& table,
+                              const std::optional<Identifier>& alias) {
+    return BindingScope{{table, alias ? normalizeName(alias->text) : table->name, 0}};
+}
+
 bool sameColumn(const BoundColumnRef& left, const BoundColumnRef& right) {
     return left.table_id.value == right.table_id.value &&
            left.column_id.value == right.column_id.value &&
@@ -145,10 +150,29 @@ private:
         return success(BoundCreateTable{normalizeName(stmt.table.text), std::move(columns)});
     }
 
+    Result<BoundStatement> bindStatement(const DropTableStmt& stmt) {
+        // A 已能保存 DROP TABLE / IF EXISTS / 多表名；B 当前没有 BoundDropTable、
+        // DropPlan 或 Catalog 删除事务，先明确拒绝，避免调用方误以为已删除表。
+        const SourceLocation span = stmt.tables.empty()
+            ? statement_span_
+            : location(stmt.tables.front().span, statement_span_);
+        return error(ErrorCode::UnsupportedFeature,
+                     "DROP TABLE is not supported by semantic analysis yet",
+                     span);
+    }
+
     Result<BoundStatement> bindStatement(const InsertStmt& stmt) {
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        if (stmt.rows.size() > 1) {
+            // A 已能保存 INSERT 多行；B 当前 BoundInsert/InsertPlan 仍是单行结构，
+            // 先明确拒绝，避免只绑定第一行造成静默丢数据。
+            return error(ErrorCode::UnsupportedFeature,
+                         "multi-row INSERT is not supported by semantic analysis yet",
+                         statement_span_);
+        }
+        const auto& input_values = stmt.rows.empty() ? stmt.values : stmt.rows.front();
         std::vector<BoundColumnRef> targets;
         if (stmt.columns) {
             if (stmt.columns->empty()) {
@@ -170,9 +194,9 @@ private:
             for (std::size_t i = 0; i < table->columns.size(); ++i)
                 targets.push_back(columnRef(scope.front(), i));
         }
-        if (targets.size() != stmt.values.size()) {
+        if (targets.size() != input_values.size()) {
             return error(ErrorCode::ValueCountMismatch, "INSERT has " + std::to_string(targets.size()) +
-                " columns but " + std::to_string(stmt.values.size()) + " values", statement_span_);
+                " columns but " + std::to_string(input_values.size()) + " values", statement_span_);
         }
         if (targets.size() != table->columns.size()) {
             return error(ErrorCode::MissingInsertColumn,
@@ -182,15 +206,15 @@ private:
         // 确认完整覆盖后再分配输出，按 ordinal 写入而不是按 SQL 输入顺序追加。
         std::vector<ScalarValue> values(table->columns.size());
         for (std::size_t i = 0; i < targets.size(); ++i) {
-            const auto actual = literalType(stmt.values[i].value);
+            const auto actual = literalType(input_values[i].value);
             // 当前模式统一允许空值；NULL 没有自己的列类型，不参与普通表达式运算。
             if (actual != DataType::Null && targets[i].type != actual) {
                 return error(ErrorCode::TypeMismatch,
                     table->name + "." + table->columns[targets[i].ordinal].name + " expects " +
                     typeName(targets[i].type) + ", but " + typeName(actual) + " found",
-                    location(stmt.values[i].span, statement_span_));
+                    location(input_values[i].span, statement_span_));
             }
-            values[targets[i].ordinal] = scalar(stmt.values[i].value);
+            values[targets[i].ordinal] = scalar(input_values[i].value);
         }
         return success(BoundInsert{std::move(table), std::move(values)});
     }
@@ -298,6 +322,13 @@ private:
 
         std::vector<BoundOrderBy> order_by;
         for (const auto& item : stmt.order_by) {
+            if (item.expression) {
+                // A 已能保存 ORDER BY 表达式；B 当前 SortPlan 只接受 BoundColumnRef，
+                // 先明确拒绝，避免继续按旧 column 字段绑定出误导性错误。
+                return error(ErrorCode::UnsupportedFeature,
+                             "ORDER BY expressions are not supported by semantic analysis yet",
+                             location(item.expression->span, item.span));
+            }
             std::optional<BoundColumnRef> alias_match;
             const auto order_name = normalizeName(item.column.text);
             if (order_name.find('.') == std::string::npos) {
@@ -336,6 +367,11 @@ private:
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+            return error(ErrorCode::InvalidAst, "UPDATE table alias must be a simple identifier",
+                         location(stmt.table_alias->span, statement_span_));
+        // A 支持 UPDATE 目标表别名；B 在单表作用域中用别名替代物理表名做限定名解析。
+        const auto scope = singleTableScope(table, stmt.table_alias);
         if (stmt.assignments.empty()) {
             return error(ErrorCode::InvalidAst, "UPDATE requires at least one assignment", statement_span_);
         }
@@ -343,7 +379,7 @@ private:
         std::vector<BoundAssignment> assignments;
         for (const auto& assignment : stmt.assignments) {
             const auto span = location(assignment.span, statement_span_);
-            auto resolved = resolveColumn(assignment.target, singleTableScope(table), span);
+            auto resolved = resolveColumn(assignment.target, scope, span);
             if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
             auto target = std::get<BoundColumnRef>(resolved);
             if (!targets.insert(target.ordinal).second) {
@@ -352,7 +388,7 @@ private:
                     location(assignment.target.span, span));
             }
             // 始终绑定到同一份原表模式，不用先前赋值替换 RHS 中的列引用。
-            auto expression = bindExpr(assignment.value, singleTableScope(table), 0, span);
+            auto expression = bindExpr(assignment.value, scope, 0, span);
             if (const auto* failure = std::get_if<Diagnostic>(&expression)) return *failure;
             auto rhs = std::get<BoundExprPtr>(std::move(expression));
             if (rhs->type != target.type) {
@@ -362,7 +398,7 @@ private:
             }
             assignments.push_back({target, std::move(rhs)});
         }
-        auto predicate = bindWhere(stmt.where, singleTableScope(table));
+        auto predicate = bindWhere(stmt.where, scope);
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
         return success(BoundUpdate{std::move(table), std::move(assignments),
                                    std::get<BoundExprPtr>(std::move(predicate))});
@@ -372,7 +408,12 @@ private:
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        auto predicate = bindWhere(stmt.where, singleTableScope(table));
+        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+            return error(ErrorCode::InvalidAst, "DELETE table alias must be a simple identifier",
+                         location(stmt.table_alias->span, statement_span_));
+        // A 支持 DELETE 目标表别名；WHERE 中的限定列使用该单表作用域解析。
+        const auto scope = singleTableScope(table, stmt.table_alias);
+        auto predicate = bindWhere(stmt.where, scope);
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
         return success(BoundDelete{std::move(table), std::get<BoundExprPtr>(std::move(predicate))});
     }
@@ -424,6 +465,12 @@ private:
                     std::string("operator '") + operatorName(node.op) + "' cannot be applied to " + typeName(child->type), op_span);
                 return std::make_shared<const BoundExpr>(BoundExpr{
                     BoundUnary{node.op, child, op_span}, *type, span});
+            } else if constexpr (std::is_same_v<T, AggregateCall>) {
+                // A 已能把聚合调用放进普通表达式；B 还没有 BoundAggregate/聚合计划，
+                // 先明确拒绝，避免把 AggregateCall 误当 BinaryExpr 访问 left/right。
+                return error(ErrorCode::UnsupportedFeature,
+                             "aggregate expressions are not supported by semantic analysis yet",
+                             span);
             } else {
                 const auto op_span = location(node.operator_span, span);
                 auto left = bindExpr(node.left, scope, depth + 1, op_span);

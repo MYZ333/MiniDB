@@ -60,12 +60,12 @@ void testTriviaAndPositions() {
 }
 
 void testSingleCharacterTokens() {
-    const auto tokens = lexOk("()+-*/,. ;= < > <= >= !=");
+    const auto tokens = lexOk("()+-*/,. ;= < > <= >= != <>");
     const std::vector<TokenKind> expected{
         TokenKind::LeftParen, TokenKind::RightParen, TokenKind::Plus, TokenKind::Minus,
         TokenKind::Star, TokenKind::Slash, TokenKind::Comma, TokenKind::Dot, TokenKind::Semicolon,
         TokenKind::Equal, TokenKind::Less, TokenKind::Greater, TokenKind::LessEqual,
-        TokenKind::GreaterEqual, TokenKind::NotEqual, TokenKind::EndOfInput};
+        TokenKind::GreaterEqual, TokenKind::NotEqual, TokenKind::NotEqual, TokenKind::EndOfInput};
     require(tokens.size() == expected.size(), "unexpected operator token count");
     for (std::size_t i = 0; i < expected.size(); ++i) {
         require(tokens[i].kind == expected[i], "unexpected operator token");
@@ -77,10 +77,26 @@ void testExtendedTokens() {
         "SELECT student.id AS student_id FROM student s JOIN score AS x ON s.id=x.id "
         "GROUP BY student.id ORDER BY score.value DESC;"
         "CREATE TABLE metrics(active BOOL, value FLOAT);"
-        "INSERT INTO metrics VALUES(TRUE,3.14,NULL,FALSE);");
+        "CREATE TABLE constrained(id INT PRIMARY KEY, name VARCHAR(20) NOT NULL UNIQUE DEFAULT 'x');"
+        "INSERT INTO metrics VALUES(TRUE,3.14,NULL,FALSE);"
+        "SELECT * FROM metrics WHERE value IS NOT NULL LIMIT 10 OFFSET 20;"
+        "SELECT * FROM metrics WHERE note LIKE 'A%';"
+        "SELECT COUNT(*),SUM(value),AVG(value),MIN(value),MAX(value) FROM metrics HAVING COUNT(*)>0;"
+        "SELECT DISTINCT value FROM metrics;"
+        "SELECT * FROM metrics WHERE value BETWEEN 10 AND 20;"
+        "SELECT * FROM metrics WHERE value IN (1,2,3);"
+        "DROP TABLE IF EXISTS old_student;"
+        "SELECT * FROM a INNER JOIN b ON a.id=b.id LEFT OUTER JOIN c ON a.id=c.id "
+        "RIGHT JOIN d ON a.id=d.id FULL OUTER JOIN e ON a.id=e.id;");
     const std::vector<TokenKind> required{TokenKind::Dot, TokenKind::Join, TokenKind::On,
         TokenKind::Group, TokenKind::Order, TokenKind::By, TokenKind::Desc, TokenKind::As, TokenKind::Bool,
-        TokenKind::Float, TokenKind::True, TokenKind::FloatLiteral, TokenKind::Null, TokenKind::False};
+        TokenKind::Float, TokenKind::True, TokenKind::FloatLiteral, TokenKind::Null, TokenKind::False,
+        TokenKind::Is, TokenKind::Limit, TokenKind::Offset, TokenKind::Like,
+        TokenKind::Between, TokenKind::In, TokenKind::Count, TokenKind::Sum, TokenKind::Avg, TokenKind::Min, TokenKind::Max,
+        TokenKind::Primary, TokenKind::Key, TokenKind::Unique, TokenKind::Default,
+        TokenKind::Drop, TokenKind::If, TokenKind::Exists,
+        TokenKind::Having, TokenKind::Distinct, TokenKind::Inner, TokenKind::Left,
+        TokenKind::Right, TokenKind::Full, TokenKind::Outer};
     for (const auto kind : required) {
         bool found = false;
         for (const auto& token : tokens) found = found || token.kind == kind;
@@ -93,7 +109,6 @@ void testErrors() {
     expectError("'abc", ErrorCode::UnterminatedString);
     expectError("/* abc", ErrorCode::UnterminatedComment);
     expectError("a == b", ErrorCode::InvalidCharacter);
-    expectError("a <> b", ErrorCode::InvalidCharacter);
 }
 
 void testClosedCommentAtEof() {

@@ -72,12 +72,32 @@ int main() {
         check(columns[0].type == DataType::Bool && columns[1].type == DataType::Float,
               "extended CREATE types lost");
     });
+    suite.run("DROP TABLE is explicitly unsupported for now", [] {
+        Fixture f;
+        auto e = failure(f.analyzeNode(DropTableStmt{{id("student", span(11, 7))}, false}),
+                         ErrorCode::UnsupportedFeature);
+        check(e.span->begin.offset == 11 &&
+                  e.message.find("DROP TABLE") != std::string::npos,
+              "DROP TABLE placeholder diagnostic changed");
+    });
     suite.run("INSERT omitted list uses schema order", [] {
         Fixture f;
         auto binding = value(f.analyzeNode(insert()));
         const auto& row = std::get<BoundInsert>(binding.node);
         check(std::get<std::int64_t>(row.values[0]) == 1 && std::get<std::string>(row.values[1]) == "Alice", "wrong row mapping");
         check(binding.catalog_version == 1, "missing catalog version");
+    });
+    suite.run("INSERT rows keeps single row compatibility and rejects multiple rows for now", [] {
+        Fixture f;
+        auto ast = insert();
+        ast.rows = {ast.values};
+        value(f.analyzeNode(ast));
+
+        ast.rows.push_back({{std::int64_t{2}, span(50)}, {std::string{"Bob"}, span(53, 5)},
+                            {std::int64_t{18}, span(60, 2)}});
+        auto e = failure(f.analyzeNode(std::move(ast)), ErrorCode::UnsupportedFeature);
+        check(e.message.find("multi-row INSERT") != std::string::npos,
+              "multi-row INSERT placeholder diagnostic changed");
     });
     suite.run("INSERT reorders explicit mixed-case columns", [] {
         Fixture f;
@@ -260,6 +280,15 @@ int main() {
               ordered.order_by[0].column.ordinal == 2 && ordered.order_by[1].column.ordinal == 0,
               "hidden ORDER BY column or item order was lost");
     });
+    suite.run("ORDER BY expressions are explicitly unsupported for now", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<Identifier>{id("name")}, nullptr};
+        select.order_by = {{id(""), SortDirection::Desc, span(40, 7),
+                            bin(BinaryOp::Add, col("age"), num(1), span(40, 7))}};
+        auto e = failure(f.analyzeNode(std::move(select)), ErrorCode::UnsupportedFeature);
+        check(e.message.find("ORDER BY expressions") != std::string::npos,
+              "ORDER BY expression placeholder diagnostic changed");
+    });
     suite.run("nested expressions receive types without AST mutation", [] {
         Fixture f;
         auto sum = bin(BinaryOp::Add, col("AGE"), num(1));
@@ -306,6 +335,16 @@ int main() {
         auto e = failure(f.where(col("age", span(33, 3))), ErrorCode::WhereNotBoolean);
         check(e.span->begin.offset == 33, "WHERE type error location");
         failure(f.where(text("abc")), ErrorCode::WhereNotBoolean);
+    });
+    suite.run("aggregate expressions are explicitly unsupported for now", [] {
+        Fixture f;
+        auto aggregate = std::make_shared<const Expr>(Expr{
+            AggregateCall{AggregateFunction::Count, AllColumns{span(15, 1)}, span(10, 8)},
+            span(10, 8)});
+        auto e = failure(f.where(bin(BinaryOp::Greater, aggregate, num(0), span(19))),
+                         ErrorCode::UnsupportedFeature);
+        check(e.message.find("aggregate expressions") != std::string::npos,
+              "aggregate placeholder diagnostic changed");
     });
     suite.run("semantic analysis checks both logical branches and left error first", [] {
         Fixture f;
@@ -406,6 +445,30 @@ int main() {
         check(std::get<BoundDelete>(result.node).where->type == DataType::Bool, "DELETE compound condition not typed");
         failure(f.analyzeNode(UpdateStmt{id("student"), {{id("id"), num(10), {}}}, col("missing")}), ErrorCode::ColumnNotFound);
         failure(f.analyzeNode(DeleteStmt{id("student"), col("missing")}), ErrorCode::ColumnNotFound);
+    });
+    suite.run("UPDATE and DELETE table aliases qualify the single table scope", [] {
+        Fixture f;
+        UpdateStmt update{id("student"),
+            {{id("s.age"), bin(BinaryOp::Add, col("s.age"), num(1)), {}}},
+            bin(BinaryOp::Equal, col("s.id"), num(1))};
+        update.table_alias = id("s");
+        const auto bound_update = value(f.analyzeNode(update));
+        const auto& updated = std::get<BoundUpdate>(bound_update.node);
+        check(updated.assignments[0].target.ordinal == 2 &&
+                  std::get<BoundBinary>(updated.assignments[0].value->node).left->type == DataType::Int,
+              "UPDATE alias-qualified target or RHS did not bind");
+
+        DeleteStmt deletion{id("student"), bin(BinaryOp::Equal, col("s.id"), num(1))};
+        deletion.table_alias = id("s");
+        value(f.analyzeNode(deletion));
+
+        value(f.analyzeNode(DeleteStmt{id("student"),
+            bin(BinaryOp::Equal, col("student.id"), num(1))}));
+        DeleteStmt hidden_physical{id("student"),
+            bin(BinaryOp::Equal, col("student.id", span(20, 10)), num(1))};
+        hidden_physical.table_alias = id("s");
+        auto e = failure(f.analyzeNode(std::move(hidden_physical)), ErrorCode::ColumnNotFound);
+        check(e.span->begin.offset == 20, "alias should hide physical table qualifier");
     });
     suite.run("UPDATE and DELETE without WHERE mean all rows", [] {
         Fixture f;

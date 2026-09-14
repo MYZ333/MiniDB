@@ -61,5 +61,45 @@ int main() {
                   "AST optimizer guessed semantic conversion or NULL behavior");
         }
     });
+    suite.run("AST optimizer folds literal IS NULL checks", [] {
+        auto after = optimizeAstStatement(parsed("SELECT * FROM t WHERE NULL IS NULL;"));
+        check(selected(after).where == nullptr, "TRUE IS NULL result should remove WHERE");
+        after = optimizeAstStatement(parsed("SELECT * FROM t WHERE 1 IS NULL;"));
+        check(std::get<bool>(std::get<LiteralExpr>(selected(after).where->node).value) == false,
+              "non-null literal IS NULL did not fold to FALSE");
+        after = optimizeAstStatement(parsed("SELECT * FROM t WHERE 'x' IS NOT NULL;"));
+        check(selected(after).where == nullptr, "literal IS NOT NULL TRUE should remove WHERE");
+    });
+    suite.run("AST optimizer leaves LIKE semantics to B", [] {
+        const auto after = optimizeAstStatement(parsed("SELECT * FROM t WHERE 'Alice' LIKE 'A%';"));
+        check(std::get<BinaryExpr>(selected(after).where->node).op == BinaryOp::Like,
+              "LIKE was folded before B defines pattern semantics");
+    });
+    suite.run("AST optimizer traverses HAVING", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT active FROM t GROUP BY active HAVING TRUE AND active = TRUE;"));
+        const auto& having = selected(after).having;
+        check(having != nullptr && std::get<BinaryExpr>(having->node).op == BinaryOp::Equal,
+              "HAVING constant identity was not folded");
+    });
+    suite.run("AST optimizer traverses SELECT expression items without folding aggregates", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT 10 + 8 AS folded, COUNT(*) + 1 AS count_plus_one FROM t;"));
+        const auto& items = std::get<std::vector<SelectItem>>(selected(after).columns);
+        const auto& folded = std::get<ExprPtr>(items[0]);
+        check(std::get<std::int64_t>(std::get<LiteralExpr>(folded->node).value) == 18,
+              "SELECT expression item was not folded");
+        const auto& aggregate_add = std::get<BinaryExpr>(std::get<ExprPtr>(items[1])->node);
+        check(std::holds_alternative<AggregateCall>(aggregate_add.left->node),
+              "aggregate expression was lost during optimization");
+    });
+    suite.run("AST optimizer traverses ORDER BY expressions", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT id FROM t ORDER BY 10 + 8 DESC;"));
+        const auto& order = selected(after).order_by[0];
+        check(order.expression &&
+                  std::get<std::int64_t>(std::get<LiteralExpr>(order.expression->node).value) == 18,
+              "ORDER BY expression was not folded");
+    });
     return suite.finish();
 }

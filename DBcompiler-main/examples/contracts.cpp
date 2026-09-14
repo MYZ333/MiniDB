@@ -99,6 +99,7 @@ void printOutline(const PlanNode& plan) {
     std::visit([](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan>) std::cout << "CreateTable";
+        else if constexpr (std::is_same_v<T, DropTablePlan>) std::cout << "DropTable";
         else if constexpr (std::is_same_v<T, InsertPlan>) std::cout << "Insert";
         else if constexpr (std::is_same_v<T, SeqScanPlan>) std::cout << "SeqScan";
         else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {

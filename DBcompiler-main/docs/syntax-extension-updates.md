@@ -1,6 +1,7 @@
 # MiniSQL 语法扩展更新记录
 
-> 本文保留 A 分支交付时的设计与历史记录。整合后的支持状态以 [grammar.md 0.22](../grammar.md) 和 [本次整合说明](zhangbo-merge-notes.md) 为准；顶层聚合已接通 B，部分扩展仍明确拒绝执行。
+> 本文保留 A 分支交付时的设计与历史记录。B 侧适配现已完成；当前状态以
+> [grammar.md 0.23](../grammar.md) 和 [实现讲解](remaining-features-walkthrough.md) 为准。
 
 本文档记录合并版 0.6 之后的语法扩展。后续每完成一项扩展，都只追加到这一份文档中。
 

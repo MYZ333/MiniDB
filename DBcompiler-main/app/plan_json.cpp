@@ -47,6 +47,16 @@ const char* aggregateName(AggregateKind kind) {
     return "UNKNOWN";
 }
 
+const char* joinName(JoinType type) {
+    switch (type) {
+    case JoinType::Inner: return "INNER";
+    case JoinType::Left: return "LEFT";
+    case JoinType::Right: return "RIGHT";
+    case JoinType::Full: return "FULL";
+    }
+    return "UNKNOWN";
+}
+
 const char* binaryName(BinaryOp op) {
     switch (op) {
     case BinaryOp::Add: return "Add";
@@ -117,6 +127,14 @@ void tableJson(std::ostream& out, const std::shared_ptr<const TableSchema>& tabl
         stringJson(out, column.name);
         out << ",\"type\":";
         stringJson(out, typeName(column.type));
+        out << ",\"varcharLength\":";
+        if (column.varchar_length) out << *column.varchar_length; else out << "null";
+        out << ",\"primaryKey\":" << (column.primary_key ? "true" : "false")
+            << ",\"notNull\":" << (column.not_null ? "true" : "false")
+            << ",\"unique\":" << (column.unique ? "true" : "false")
+            << ",\"defaultValue\":";
+        if (column.default_value) scalarJson(out, *column.default_value); else out << "null";
+        out << ",\"hasDefault\":" << (column.default_value ? "true" : "false");
         out << '}';
     }
     out << "]}";
@@ -149,13 +167,18 @@ void exprJson(std::ostream& out, const BoundExprPtr& expr, std::size_t depth = 0
             stringJson(out, unaryName(node.op));
             out << ",\"operand\":";
             exprJson(out, node.operand, depth + 1);
-        } else {
+        } else if constexpr (std::is_same_v<T, BoundBinary>) {
             out << ",\"kind\":\"binary\",\"op\":";
             stringJson(out, binaryName(node.op));
             out << ",\"left\":";
             exprJson(out, node.left, depth + 1);
             out << ",\"right\":";
             exprJson(out, node.right, depth + 1);
+        } else {
+            out << ",\"kind\":\"aggregate\",\"function\":";
+            stringJson(out, aggregateName(node.kind));
+            out << ",\"argument\":";
+            if (node.argument) refJson(out, *node.argument); else out << "null";
         }
     }, expr->node);
     out << '}';
@@ -189,14 +212,43 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
                 stringJson(out, node.columns[i].name);
                 out << ",\"type\":";
                 stringJson(out, typeName(node.columns[i].type));
+                out << ",\"varcharLength\":";
+                if (node.columns[i].varchar_length) out << *node.columns[i].varchar_length;
+                else out << "null";
+                out << ",\"primaryKey\":" << (node.columns[i].primary_key ? "true" : "false")
+                    << ",\"notNull\":" << (node.columns[i].not_null ? "true" : "false")
+                    << ",\"unique\":" << (node.columns[i].unique ? "true" : "false")
+                    << ",\"defaultValue\":";
+                if (node.columns[i].default_value) scalarJson(out, *node.columns[i].default_value);
+                else out << "null";
+                out << ",\"hasDefault\":" << (node.columns[i].default_value ? "true" : "false");
                 out << '}';
             }
             out << ']';
+        } else if constexpr (std::is_same_v<T, DropTablePlan>) {
+            out << "\"type\":\"DropTable\",\"tableNames\":[";
+            for (std::size_t i = 0; i < node.table_names.size(); ++i) {
+                if (i) out << ',';
+                stringJson(out, node.table_names[i]);
+            }
+            out << "],\"ifExists\":" << (node.if_exists ? "true" : "false");
         } else if constexpr (std::is_same_v<T, InsertPlan>) {
             out << "\"type\":\"Insert\",\"table\":";
             tableJson(out, node.table);
             out << ",\"values\":[";
             for (std::size_t i = 0; i < node.values.size(); ++i) { if (i) out << ','; scalarJson(out, node.values[i]); }
+            out << "],\"rows\":[";
+            const auto rows = node.rows.empty()
+                ? std::vector<std::vector<ScalarValue>>{node.values} : node.rows;
+            for (std::size_t row = 0; row < rows.size(); ++row) {
+                if (row) out << ',';
+                out << '[';
+                for (std::size_t i = 0; i < rows[row].size(); ++i) {
+                    if (i) out << ',';
+                    scalarJson(out, rows[row][i]);
+                }
+                out << ']';
+            }
             out << ']';
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             out << "\"type\":\"SeqScan\",\"table\":";
@@ -206,6 +258,8 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             out << "\"type\":\"NestedLoopJoin\",\"predicate\":";
             exprJson(out, node.predicate, depth + 1);
+            out << ",\"joinType\":";
+            stringJson(out, joinName(node.type));
             out << ",\"left\":";
             nodeJson(out, node.left, depth + 1);
             out << ",\"right\":";
@@ -238,7 +292,7 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
                         out << "{\"kind\":\"column\",\"column\":";
                         refJson(out, item);
                         out << '}';
-                    } else {
+                    } else if constexpr (std::is_same_v<I, BoundAggregate>) {
                         out << "{\"kind\":\"aggregate\",\"function\":";
                         stringJson(out, aggregateName(item.kind));
                         out << ",\"argument\":";
@@ -247,6 +301,10 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
                         stringJson(out, typeName(item.type));
                         out << ",\"span\":";
                         spanJson(out, item.span);
+                        out << '}';
+                    } else {
+                        out << "{\"kind\":\"expression\",\"expression\":";
+                        exprJson(out, item, depth + 1);
                         out << '}';
                     }
                 }, node.items[i].value);
@@ -257,32 +315,62 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
                 out << '{';
                 if (const auto* ordinal = std::get_if<std::size_t>(&node.order_by[i].key)) {
                     out << "\"kind\":\"output\",\"ordinal\":" << *ordinal;
-                } else {
+                } else if (const auto* ref = std::get_if<BoundColumnRef>(&node.order_by[i].key)) {
                     out << "\"kind\":\"group\",\"column\":";
-                    refJson(out, std::get<BoundColumnRef>(node.order_by[i].key));
+                    refJson(out, *ref);
+                } else {
+                    out << "\"kind\":\"expression\",\"expression\":";
+                    exprJson(out, std::get<BoundExprPtr>(node.order_by[i].key), depth + 1);
                 }
                 out << ",\"direction\":\""
                     << (node.order_by[i].direction == SortDirection::Asc ? "ASC" : "DESC")
                     << "\"}";
             }
-            out << "],\"input\":";
+            out << "],\"having\":";
+            if (node.having) exprJson(out, node.having, depth + 1); else out << "null";
+            out << ",\"distinct\":" << (node.distinct ? "true" : "false")
+                << ",\"limit\":";
+            if (node.limit) out << *node.limit; else out << "null";
+            out << ",\"offset\":" << node.offset << ",\"input\":";
             nodeJson(out, node.input, depth + 1);
         } else if constexpr (std::is_same_v<T, SortPlan>) {
             out << "\"type\":\"Sort\",\"items\":[";
             for (std::size_t i = 0; i < node.items.size(); ++i) {
                 if (i) out << ',';
-                out << "{\"column\":";
+                out << "{\"kind\":\"column\",\"column\":";
                 refJson(out, node.items[i].column);
                 out << ",\"direction\":\""
                     << (node.items[i].direction == SortDirection::Asc ? "ASC" : "DESC")
                     << "\"}";
+            }
+            for (std::size_t i = 0; i < node.expression_items.size(); ++i) {
+                if (i || !node.items.empty()) out << ',';
+                const auto& item = node.expression_items[i];
+                out << '{';
+                if (const auto* ref = std::get_if<BoundColumnRef>(&item.key)) {
+                    out << "\"kind\":\"column\",\"column\":";
+                    refJson(out, *ref);
+                } else {
+                    out << "\"kind\":\"expression\",\"expression\":";
+                    exprJson(out, std::get<BoundExprPtr>(item.key), depth + 1);
+                }
+                out << ",\"direction\":\""
+                    << (item.direction == SortDirection::Asc ? "ASC" : "DESC") << "\"}";
             }
             out << "],\"input\":";
             nodeJson(out, node.input, depth + 1);
         } else if constexpr (std::is_same_v<T, ProjectPlan>) {
             out << "\"type\":\"Project\",\"columns\":[";
             for (std::size_t i = 0; i < node.columns.size(); ++i) { if (i) out << ','; refJson(out, node.columns[i]); }
-            out << "],\"input\":";
+            out << "],\"expressions\":[";
+            for (std::size_t i = 0; i < node.expressions.size(); ++i) {
+                if (i) out << ',';
+                exprJson(out, node.expressions[i], depth + 1);
+            }
+            out << "],\"distinct\":" << (node.distinct ? "true" : "false")
+                << ",\"limit\":";
+            if (node.limit) out << *node.limit; else out << "null";
+            out << ",\"offset\":" << node.offset << ",\"input\":";
             nodeJson(out, node.input, depth + 1);
         } else if constexpr (std::is_same_v<T, UpdatePlan>) {
             out << "\"type\":\"Update\",\"table\":";
@@ -346,6 +434,9 @@ int main() {
         if (const auto* create = std::get_if<BoundCreateTable>(&std::get<BoundStatement>(bound).node)) {
             auto registered = catalog.createTable(create->table_name, create->columns);
             if (const auto* error = std::get_if<Diagnostic>(&registered)) { printDiagnostic(*error); return 1; }
+        } else if (const auto* drop = std::get_if<BoundDropTable>(&std::get<BoundStatement>(bound).node)) {
+            auto removed = catalog.dropTables(drop->table_names, drop->if_exists);
+            if (const auto* error = std::get_if<Diagnostic>(&removed)) { printDiagnostic(*error); return 1; }
         }
     }
     std::cout << "]}" << '\n';

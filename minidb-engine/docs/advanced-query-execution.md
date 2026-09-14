@@ -1,6 +1,6 @@
 # Java 高级查询执行器代码讲解
 
-这一部分接收 B 计划生成器导出的 JSON，执行 JOIN、GROUP BY 和 ORDER BY。主调用链是：
+这一部分接收 B 计划生成器导出的 JSON，执行 JOIN、GROUP BY、HAVING 和 ORDER BY。主调用链是：
 
 ```text
 executeProgramJson
@@ -31,6 +31,7 @@ executeProgramJson
 - `scan` 把 `StoredRow` 转成 `PlanRow`，保留目标表 RowId；
 - `filter` 对每行求 BOOL 谓词，只保留 TRUE；
 - `nestedLoopJoin` 以左行为外层、右行为内层，拼接候选行后计算 ON；
+  LEFT/RIGHT/FULL 对未匹配侧按计划布局补 NULL；
 - `groupBy` 用有序 Map 按键元组去重，并只输出分组键；
 - `sort` 依次比较 ORDER BY 项，支持每项独立 ASC/DESC。
 
@@ -50,19 +51,20 @@ JSON 读取器支持整数、小数和指数形式。JSON 本身不会保留 SQL
 `95.0` 可能由导出器写成 `95`。执行器根据列模式或表达式的 `type` 字段，将 FLOAT
 统一归一化为 Java `Double`，INT 保持 `Long`。
 
-表达式求值支持 INT/FLOAT 同类型算术和数值比较、字符串/布尔判等、NOT、AND、OR。
+表达式求值支持 INT/FLOAT 同类型算术和数值比较、字符串/布尔判等、LIKE、NOT、AND、OR。
 AND/OR 保留短路求值；INT 运算检查溢出，INT/FLOAT 除法检查除零，非有限浮点结果返回
-`FloatOverflow`。NULL 可写入任何列，但当前不会参与表达式三值逻辑。
+`FloatOverflow`。NULL 用 Java null 表示 UNKNOWN，普通运算传播 NULL，逻辑运算采用三值规则。
 
 ## 4. UPDATE/DELETE 为什么仍然可用
 
-`PlanRow.rowIds` 按 tableId 保存源行标识，Filter 会原样传递它。Update/Delete 从中取得
+`PlanRow.rowIds` 按 relationId 保存源行标识，Filter 会原样传递它；旧协议仍回退到 tableId。Update/Delete 从中取得
 目标表 RowId 后调用 `RecordStore.replace/erase`。Update 的所有右值表达式都读取旧行，
-最后一次性写回，因此 `SET a=b,b=a` 可以正确交换。
+最后一次性写回，因此 `SET a=b,b=a` 可以正确交换。写入先针对最终表状态检查 VARCHAR 长度、
+NOT NULL、PRIMARY KEY 和 UNIQUE；批量 INSERT/UPDATE 失败时不写入部分结果。
 
 ## 5. 测试
 
 `src/test/resources/advanced-query.sql` 是固定 SQL 场景，
-`AdvancedQueryEngineTest` 检查最终记录。仓库根目录
+`AdvancedQueryEngineTest` 和 `RemainingFeaturesEngineTest` 检查最终记录与约束原子性。仓库根目录
 `scripts/check_advanced_execution.sh` 会编译真实 C++ 导出器、生成 JSON，再运行 Java
 基础测试和高级查询测试，避免手写 JSON 掩盖跨模块接口不一致。

@@ -1,6 +1,6 @@
-# 模块接口契约 0.8
+# 模块接口契约 0.12
 
-本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、五类语句语义分析、
+本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、六类语句语义分析、
 逻辑计划生成、规则优化和文本打印已实现；A version2 的扩展 lex/parse 与 AST 展示优化已合入。
 本仓库通过 `app/plan_json.cpp` 把计划交给相邻 Java 引擎，具体协议见 json-plan-protocol.md。
 
@@ -53,7 +53,7 @@ NOT/负号/括号的递归嵌套最多 256 层，生成 AST 的单条路径最�
 
 ## A → B：AST
 
-`ast.hpp` 定义 CreateTableStmt、InsertStmt、SelectStmt、UpdateStmt、DeleteStmt。
+`ast.hpp` 定义 CreateTableStmt、DropTableStmt、InsertStmt、SelectStmt、UpdateStmt、DeleteStmt。
 Statement 保存整条语句范围；Identifier 保存原始拼写及精确范围。
 一元/二元表达式另存运算符范围，便于把类型错误定位到操作符。
 
@@ -62,8 +62,8 @@ SELECT 使用 `variant<AllColumns, vector<Identifier>, vector<SelectItem>>`。
 variant<Identifier, AggregateCall, ExprPtr>，所有输出别名平行保存在 column_aliases。
 AggregateCall 使用 AggregateFunction 枚举，argument 为 variant<AllColumns, Identifier>；
 只有 COUNT(*) 使用 AllColumns。B 显式映射为 AggregateKind，不依赖枚举整数或 variant 下标。
-Expr 增加 AggregateCall 分支，顶层 SELECT 中括号包裹的列/聚合先归一化再绑定；
-一般计算表达式和非顶层聚合仍返回 UnsupportedFeature。
+Expr 增加 AggregateCall 分支；B 允许它出现在 SELECT、HAVING 和 ORDER BY 表达式中。
+WHERE 和 JOIN ON 中的聚合调用返回 InvalidGrouping。
 INSERT 使用 optional 列清单区分省略和显式给定，显式清单不得为空。
 SelectStmt 追加 group_by、order_by、joins、FROM 表别名和与选择列平行的 column_aliases，
 并为旧的三字段聚合初始化提供空默认值。JoinClause 可携带右表别名。
@@ -101,15 +101,19 @@ B 把 version 写入绑定结果，再由计划生成传入 LogicalPlan。
 ```cpp
 Result<std::shared_ptr<const TableSchema>> createTable(
     std::string table_name, const std::vector<ColumnSpec>& columns);
+Result<std::size_t> dropTables(
+    const std::vector<std::string>& table_names, bool if_exists);
 std::shared_ptr<const CatalogSnapshot> snapshot() const;
 ```
 
 createTable 要求名称符合 grammar.md 的基本标识符规则；它统一大小写、检查重复表/列、
-空列定义和非法列类型，失败不修改模式、不消耗 ID。显式注册无源码来源，失败使用
+空列定义、非法类型、VARCHAR 长度和默认值约束，失败不修改模式、不消耗 ID。显式注册无源码来源，失败使用
 Execution 阶段诊断及空范围；这不代表完整执行引擎已经实现。
 成功注册分配表 ID（从 1 开始）、表内列 ID（从 1 开始）并递增模式版本。
 snapshot 复制名称索引并共享只读模式，旧快照不会看到新注册表，也可以比容器活得更久。
 版本仅在同一 Catalog 实例的历史中比较；该内存容器供第一阶段单线程使用。
+dropTables 在无 IF EXISTS 时先验证全部名字再修改，IF EXISTS 忽略缺失表；实际删除非空时
+版本只递增一次。快照共享的旧 TableSchema 仍可被既有只读计划安全持有。
 
 CREATE 产生建表描述，不预分配表列 ID，不调用 createTable。
 成功执行后，由执行层负责修改真实 Catalog 并递增版本。
@@ -126,33 +130,33 @@ std::string formatPlan(const LogicalPlan&); // 声明于 plan_printer.hpp。
 
 Result 为 `variant<T, Diagnostic>`，错误时不返回半成品；使用 `get_if` 或
 `holds_alternative` 检查结果。首版每条语句仅报告首个语义错误。
-NotImplemented 保留为后续开发状态错误码，当前五类语句的四个入口不再返回占位结果。
-五类基础语句的 analyze/buildPlan 均返回真实结果或诊断；表达式支持 INT/FLOAT 同类型
-算术与比较、VARCHAR/BOOL 判等，以及 AND/OR/NOT。
+NotImplemented 保留为后续开发状态错误码，当前六类语句的四个入口不再返回占位结果。
+六类语句的 analyze/buildPlan 均返回真实结果或诊断；表达式支持 INT/FLOAT 同类型
+算术与比较、VARCHAR/BOOL 判等、LIKE、空值判定以及 AND/OR/NOT。
 Diagnostic 包含阶段、稳定错误码、可读消息、SourceSpan。
 范围按字节、从 1 开始的行列、左闭右开定义；未知范围用 optional 表示，
 禁止把未知范围伪装成第 1 行。正常 A 输入必须提供真实范围。
 
 诊断按确定顺序返回：先检查表，再按 SQL 顺序检查列；INSERT 再检查值数、
-完整列覆盖、逐值类型；SELECT 最后检查 WHERE。表达式按左子树、右子树、
+默认值/必填列和逐值类型；SELECT 继续检查 WHERE、GROUP/HAVING/ORDER。表达式按左子树、右子树、
 当前操作符的顺序检查；静态检查不会因为 AND/OR 的运行时短路而跳过某一子树。
 UPDATE 先查表，再按赋值顺序检查目标列、重复目标、RHS 表达式及类型，最后检查 WHERE；
 DELETE 查表后检查 WHERE。空赋值列表/空 RHS 属于外部 AST 结构错误，报 InvalidAst。
-SELECT 按 FROM、各 JOIN 表和 ON、投影、WHERE、GROUP BY、ORDER BY 的顺序绑定。
+SELECT 按 FROM、各 JOIN 表和 ON、投影、WHERE、GROUP BY、HAVING、ORDER BY 的顺序绑定。
 UPDATE/DELETE 与 SELECT 共用布尔条件检查，WHERE 省略合法，存在时必须为 BOOL。
 优先使用名称/操作符/值自身范围，缺失时回退到表达式或语句范围，最终仍可为空。
 必需表达式子节点为空时报 InvalidAst；表达式路径超过 256 个节点时报 ExpressionTooDeep。
 绑定只推导类型，不求值，所以类型合法的除零或溢出表达式保留给执行层报告。
-INSERT 的 NULL 允许写入任意类型列，执行层需为记录提供空值表示；NULL 参与表达式时
-除 IS NULL/IS NOT NULL 外，因尚无三值逻辑而报 InvalidOperandType。限定名按关系有效名称解析；声明表别名后必须以
+INSERT 的 NULL 仅受列 NOT NULL/PRIMARY KEY 约束；执行层以 null 表示 SQL UNKNOWN 并执行三值逻辑。
+NULL 字面量直接参与需要两个同类型操作数的表达式仍会报 InvalidOperandType。限定名按关系有效名称解析；声明表别名后必须以
 别名限定。未限定列名在全部可见关系实例中查找，命中多个实例时返回 AmbiguousColumn。
 同一物理表可用不同别名自连接；重复关系名返回 DuplicateTable。选择列别名决定 Project
 输出名称，并可由 ORDER BY 引用；同名输出别名被引用时返回 AmbiguousColumn。
-JOIN ON 必须为 BOOL，否则返回 JoinConditionNotBoolean。无聚合 GROUP BY 要求所有投影列
-和排序列都属于分组键，重复键或不满足约束返回 InvalidGrouping。
+JOIN ON 必须为 BOOL，否则返回 JoinConditionNotBoolean。聚合外的 SELECT/HAVING/ORDER 列
+必须属于分组键，重复键或不满足约束返回 InvalidGrouping。
 
 绑定结果约束：全部列引用已解析；WHERE/JOIN ON 为 BOOL；运算符合法；INSERT 值按
-表列顺序重排；SELECT 的星号已按可见表顺序展开；JOIN 表保持 SQL 顺序；GROUP/ORDER
+表列顺序重排并补齐 DEFAULT/NULL；SELECT 的星号已按可见表顺序展开；JOIN 表保持 SQL 顺序；GROUP/ORDER
 键保存稳定的关系实例 ID、表 ID、列 ID、ordinal 和类型；UPDATE 目标唯一且赋值类型匹配。
 buildPlan 只接受符合这些约束的结果，不再按名字查询 Catalog。
 
@@ -167,7 +171,8 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 | AST | 绑定结果 | 计划结构 |
 |---|---|---|
 | CreateTableStmt | 规范化名称、列定义 | CreateTable |
-| InsertStmt | 表模式、按模式顺序的值 | Insert |
+| DropTableStmt | 规范化表名、IF EXISTS | DropTable |
+| InsertStmt | 表模式、按模式顺序的多行值 | Insert |
 | SelectStmt | 展开列、JOIN/WHERE/GROUP/ORDER | Project → [Sort] → [GroupBy] → [Filter] → {NestedLoopJoin} → SeqScan |
 | SelectStmt（含聚合） | 分组键、聚合项、最终输出名、聚合后排序 | Aggregate → [Filter] → {NestedLoopJoin} → SeqScan |
 | UpdateStmt | 目标列、已定型 RHS、可选 BOOL 条件 | Update → [Filter] → SeqScan |
@@ -175,27 +180,28 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 
 PlanNode 的 output 是有序业务列模式，carries_row_id 是内部行标识属性。
 SeqScan 第一阶段输出全表列，并携带 relation_id/relation_name；Filter 保留子节点的模式和行标识。
-Project 输出选择列及列别名，可有重复名称，丢弃内部行标识。
-NestedLoopJoin 执行内连接：对左输入的每行依次扫描右输入，仅输出 ON 为 TRUE 的组合行；
-输出业务列是左模式后接右模式。多个 JOIN 按 SQL 顺序形成左深树，当前不选择其他连接算法。
+Project 输出选择表达式及列别名，可有重复名称，并处理 DISTINCT 和 OFFSET/LIMIT。
+NestedLoopJoin 按 join type 执行 INNER/LEFT/RIGHT/FULL：仅 ON 为 TRUE 的组合行匹配，
+外连接未匹配侧填 NULL；输出业务列始终是左模式后接右模式。多个 JOIN 按 SQL 顺序形成左深树。
 自连接的多个扫描共享 table_id，但 relation_id 不同；执行层按 relation_id 和 column_id 定位值。
 GroupBy 用于没有聚合调用的查询，按 keys 去重，输出恰好为分组键顺序；分组比较中两个 NULL
 属于同一组。Sort 保留输入模式，按 items 顺序比较，ASC/DESC 分别表示升/降序；ASC 把
 NULL 放在非 NULL 之后，DESC 把 NULL 放在非 NULL 之前，相同键之间的最终顺序未定义。
-Sort 位于 Project 下方，因此能读取未投影的隐藏排序列。
+Sort 位于 Project 下方，因此能读取未投影的隐藏列和计算排序表达式。
 非空值只在同一列类型内比较：INT/FLOAT 按数值，VARCHAR 按原始字节字典序，BOOL 按
 FALSE 小于 TRUE；模式已固定列类型，因此 Sort 不执行跨类型转换。
 Update/Delete 的输入必须带行标识；根节点业务输出为空。
 RowId 的具体存储格式留给执行/存储层，B 只声明是否需要传递，不假定页号或槽号。
 
-执行结果约定：SELECT 返回按 output 排列的记录；CREATE 返回成功状态；
+执行结果约定：SELECT 返回按 output 排列的记录；CREATE/DROP 返回成功状态；
 INSERT/UPDATE/DELETE 返回影响行数（不作为 PlanNode.output 的业务列）。
-INSERT 单行；UPDATE/DELETE 按唯一行标识定位目标记录。
+INSERT 可多行；UPDATE/DELETE 按唯一行标识定位目标记录。
 UPDATE 全部 RHS 在写入前求值，例如 SET a=b,b=a 交换旧值。
 BoundUpdate/UpdatePlan 中每个 RHS 都是对原表列的引用；生成器不会把前一个赋值
 替换进后一个 RHS。执行层必须先对旧记录计算全部新值，再一次性写回。
 表达式按左子节点先求值；AND/OR 从左向右短路。执行层检查整数溢出、INT/FLOAT 除零；
-字符串按原始字节判等。记录层需要保存 INSERT NULL，但表达式暂不存在三值逻辑。
+字符串按值判等；LIKE 中 `%` 匹配任意码点序列、`_` 匹配一个码点。
+表达式使用 SQL 三值逻辑，Filter/Join/HAVING 只保留 TRUE。
 
 当前生成器固定使用上述树结构，SELECT * 也保留 Project；省略对应子句才省略相应算子。
 恒真/恒假条件在 buildPlan 输出中保留，需显式调用 optimizePlan 优化。SeqScan 读取全部列，修改输入行标识通过 Filter
@@ -234,7 +240,7 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
 字符串引号翻倍，换行/制表符/反斜杠显示为转义文本。
 该格式用于阅读和测试，不是 SQL 源码或可反序列化协议；也不是 SQL EXPLAIN 语法支持。
 
-## 五类示例及限制
+## 示例及限制
 
 `examples/contracts.cpp` 手工创建五组 AST、绑定结果和计划，对结构约束做检查，
 打印每类的对接摘要。它没有调用 analyze/buildPlan，不是编译器或执行器。
@@ -244,7 +250,7 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
 `examples/semantic.cpp` 则调用真实 analyze：分析 CREATE → 显式注册模式 →
 分析 INSERT/SELECT。演示产生绑定结果，不构造计划、不写入或查询数据记录。
 
-`examples/plans.cpp` 贯通五类手工 AST → analyze → buildPlan → formatPlan，
+`examples/plans.cpp` 贯通基础手工 AST → analyze → buildPlan → formatPlan，
 仅在 CREATE 之后显式注册测试模式。INSERT/UPDATE/DELETE 不修改记录，SELECT 不返回数据行。
 
 `examples/optimizer.cpp` 使用真实 SQL 串联 lex/parse/analyze/buildPlan/optimizePlan，
@@ -256,17 +262,17 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
 
 ## 聚合绑定和计划补充
 
-BoundSelect.aggregate_items 非空表示聚合查询，按最终 SELECT 顺序保存 BoundColumnRef 或
-BoundAggregate。后者保存 AggregateKind、可选参数列、结果类型和调用源码范围。
-aggregate_order_by 的 key 为输出序号（别名）或分组列引用（可以不出现在 SELECT 中）。
+BoundSelect.aggregate_items 非空表示聚合查询，按最终 SELECT 顺序保存 BoundColumnRef、
+BoundAggregate 或 BoundExprPtr。后者让 `SUM(id)+1` 这类表达式保留完整树。
+aggregate_order_by 的 key 为输出序号（别名）、分组列引用或聚合表达式。
 output_names 必须与 aggregate_items 等长；旧 columns 只保留该查询中的普通列引用，
 不再用作聚合查询的输出布局。普通查询继续使用 columns/order_by。
 
-AggregatePlan 保存 group_keys/items/order_by/input，是查询根节点，负责分组、聚合、
-最终投影及聚合后排序。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
+AggregatePlan 保存 group_keys/items/order_by/having/input 以及 distinct/limit/offset，是查询根节点，负责分组、聚合、
+HAVING、最终投影、排序、去重及分页。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
 重复输入行。其 output 保存最终名字和类型，carries_row_id=false。优化器可优化其输入，
 但不能因输入为空而删掉全表 Aggregate：全表空输入仍须输出 COUNT=0 的一行。
-详细类型、NULL、空输入和支持范围以 grammar.md 0.22 为准；JSON 字段见 json-plan-protocol.md。
+详细类型、NULL、空输入和支持范围以 grammar.md 0.23 为准；JSON 字段见 json-plan-protocol.md。
 
 ## 维护责任
 
@@ -295,9 +301,5 @@ AggregatePlan 保存 group_keys/items/order_by/input，是查询根节点，负�
 
 - 0.11：整合 feature-zhangbo，统一 A 的新 AST 和 B Aggregate；IS NULL/IS NOT NULL 返回 BOOL，
   UPDATE/DELETE 别名通过单表作用域绑定且 relation_id=0；未实现的 AST 标记显式返回 UnsupportedFeature。
-
-新增 AST 字段包括 SelectStmt 的 distinct/having/limit/offset、JoinClause.type、
-OrderByItem.expression、ColumnDefinition 的长度和约束、InsertStmt.rows、DropTableStmt。
-语义入口逐项检查，执行范围以 grammar.md 0.22 的表格为准。rows 非空时优先使用 rows，
-拒绝多于一行；不会静默依赖 values 而丢失其余行。新增 IsNull/IsNotNull 无需新计划节点，
-由 BoundUnary 贯通打印、JSON 和 Java；B 优化器保持该节点，不擅自改写其 NULL 行为。
+- 0.12：完成上述 A 扩展的 B 侧实现。Bound/Plan/JSON 保存 SELECT/HAVING/ORDER 表达式、
+  DISTINCT/分页、外连接类型、约束元数据、多行 INSERT 和 DROP；Java 引擎实现执行与写入原子检查。

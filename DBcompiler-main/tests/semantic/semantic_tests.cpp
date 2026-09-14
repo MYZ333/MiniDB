@@ -85,13 +85,14 @@ int main() {
         check(columns[0].type == DataType::Bool && columns[1].type == DataType::Float,
               "extended CREATE types lost");
     });
-    suite.run("DROP TABLE is explicitly unsupported for now", [] {
+    suite.run("DROP TABLE binds names and IF EXISTS policy", [] {
         Fixture f;
-        auto e = failure(f.analyzeNode(DropTableStmt{{id("student", span(11, 7))}, false}),
-                         ErrorCode::UnsupportedFeature);
-        check(e.span->begin.offset == 11 &&
-                  e.message.find("DROP TABLE") != std::string::npos,
-              "DROP TABLE placeholder diagnostic changed");
+        const auto bound = value(f.analyzeNode(
+            DropTableStmt{{id("STUDENT", span(11, 7)), id("missing")}, true}));
+        const auto& drop = std::get<BoundDropTable>(bound.node);
+        check(drop.if_exists && drop.table_names == std::vector<std::string>({"student", "missing"}),
+              "DROP names or IF EXISTS flag were lost");
+        failure(f.analyzeNode(DropTableStmt{{id("missing")}, false}), ErrorCode::TableNotFound);
     });
     suite.run("INSERT omitted list uses schema order", [] {
         Fixture f;
@@ -100,7 +101,7 @@ int main() {
         check(std::get<std::int64_t>(row.values[0]) == 1 && std::get<std::string>(row.values[1]) == "Alice", "wrong row mapping");
         check(binding.catalog_version == 1, "missing catalog version");
     });
-    suite.run("INSERT rows keeps single row compatibility and rejects multiple rows for now", [] {
+    suite.run("INSERT rows keeps compatibility and binds every row", [] {
         Fixture f;
         auto ast = insert();
         ast.rows = {ast.values};
@@ -108,9 +109,10 @@ int main() {
 
         ast.rows.push_back({{std::int64_t{2}, span(50)}, {std::string{"Bob"}, span(53, 5)},
                             {std::int64_t{18}, span(60, 2)}});
-        auto e = failure(f.analyzeNode(std::move(ast)), ErrorCode::UnsupportedFeature);
-        check(e.message.find("multi-row INSERT") != std::string::npos,
-              "multi-row INSERT placeholder diagnostic changed");
+        const auto bound = value(f.analyzeNode(std::move(ast)));
+        const auto& insert = std::get<BoundInsert>(bound.node);
+        check(insert.rows.size() == 2 && std::get<std::int64_t>(insert.rows[1][0]) == 2,
+              "multi-row INSERT payload was lost");
     });
     suite.run("INSERT reorders explicit mixed-case columns", [] {
         Fixture f;
@@ -138,14 +140,16 @@ int main() {
         auto e = failure(f.analyzeNode(ast), ErrorCode::DuplicateColumn);
         check(e.span->begin.offset == 22, "duplicate INSERT column location");
     });
-    suite.run("INSERT distinguishes empty list, count mismatch and missing coverage", [] {
+    suite.run("INSERT distinguishes empty list and fills omitted nullable columns", [] {
         Fixture f; auto ast = insert();
         ast.columns = std::vector<Identifier>{};
         failure(f.analyzeNode(ast), ErrorCode::EmptyColumnList);
         ast.columns = std::nullopt; ast.values.pop_back();
         failure(f.analyzeNode(ast), ErrorCode::ValueCountMismatch);
         ast.columns = std::vector<Identifier>{id("id"), id("name")};
-        failure(f.analyzeNode(ast), ErrorCode::MissingInsertColumn);
+        const auto bound = value(f.analyzeNode(ast));
+        check(std::holds_alternative<NullValue>(std::get<BoundInsert>(bound.node).values[2]),
+              "omitted nullable column must be filled with NULL");
     });
     suite.run("INSERT type error points to value after reordering", [] {
         Fixture f; auto ast = insert();
@@ -347,14 +351,16 @@ int main() {
               ordered.order_by[0].column.ordinal == 2 && ordered.order_by[1].column.ordinal == 0,
               "hidden ORDER BY column or item order was lost");
     });
-    suite.run("ORDER BY expressions are explicitly unsupported for now", [] {
+    suite.run("ORDER BY expressions bind as typed sort keys", [] {
         Fixture f;
         SelectStmt select{id("student"), std::vector<Identifier>{id("name")}, nullptr};
         select.order_by = {{id(""), SortDirection::Desc, span(40, 7),
                             bin(BinaryOp::Add, col("age"), num(1), span(40, 7))}};
-        auto e = failure(f.analyzeNode(std::move(select)), ErrorCode::UnsupportedFeature);
-        check(e.message.find("ORDER BY expressions") != std::string::npos,
-              "ORDER BY expression placeholder diagnostic changed");
+        const auto bound = value(f.analyzeNode(std::move(select)));
+        const auto& query = std::get<BoundSelect>(bound.node);
+        check(query.order_by.empty() && query.expression_order_by.size() == 1 &&
+              std::get<BoundExprPtr>(query.expression_order_by[0].key)->type == DataType::Int,
+              "ORDER BY expression type or direction was lost");
     });
     suite.run("nested expressions receive types without AST mutation", [] {
         Fixture f;
@@ -380,9 +386,10 @@ int main() {
             value(f.where(bin(op, un(UnaryOp::Negate, col("age")), num(0))));
         }
     });
-    suite.run("VARCHAR only supports equality and inequality", [] {
+    suite.run("VARCHAR supports equality and LIKE but not ordering or arithmetic", [] {
         Fixture f;
-        for (auto op : {BinaryOp::Equal, BinaryOp::NotEqual}) value(f.where(bin(op, col("name"), text("Alice"))));
+        for (auto op : {BinaryOp::Equal, BinaryOp::NotEqual, BinaryOp::Like})
+            value(f.where(bin(op, col("name"), text("Alice"))));
         for (auto op : {BinaryOp::Less, BinaryOp::Add, BinaryOp::Divide}) {
             failure(f.where(bin(op, col("name"), text("x"))), ErrorCode::InvalidOperandType);
         }
@@ -403,15 +410,15 @@ int main() {
         check(e.span->begin.offset == 33, "WHERE type error location");
         failure(f.where(text("abc")), ErrorCode::WhereNotBoolean);
     });
-    suite.run("aggregate expressions are explicitly unsupported for now", [] {
+    suite.run("aggregate expressions remain forbidden in WHERE", [] {
         Fixture f;
         auto aggregate = std::make_shared<const Expr>(Expr{
             AggregateCall{AggregateFunction::Count, AllColumns{span(15, 1)}, span(10, 8)},
             span(10, 8)});
         auto e = failure(f.where(bin(BinaryOp::Greater, aggregate, num(0), span(19))),
-                         ErrorCode::UnsupportedFeature);
-        check(e.message.find("aggregate expressions") != std::string::npos,
-              "aggregate placeholder diagnostic changed");
+                         ErrorCode::InvalidGrouping);
+        check(e.message.find("only allowed") != std::string::npos,
+              "aggregate clause diagnostic changed");
     });
     suite.run("semantic analysis checks both logical branches and left error first", [] {
         Fixture f;
@@ -495,6 +502,10 @@ int main() {
         auto e = failure(f.analyzeNode(UpdateStmt{id("student"), {{id("age"), lit(std::string{"abc"}, span(25, 5)), {}}}, nullptr}), ErrorCode::TypeMismatch);
         check(e.span->begin.offset == 25 && e.message.find("student.age expects INT") != std::string::npos, "assignment type diagnostic");
         failure(f.analyzeNode(UpdateStmt{id("student"), {{id("age"), truth(), {}}}, nullptr}), ErrorCode::TypeMismatch);
+        const auto nullable = value(f.analyzeNode(
+            UpdateStmt{id("student"), {{id("name"), lit(NullValue{}), {}}}, nullptr}));
+        check(std::get<BoundUpdate>(nullable.node).assignments[0].value->type == DataType::Null,
+              "nullable UPDATE should retain the NULL literal");
     });
     suite.run("UPDATE and DELETE share boolean WHERE checking", [] {
         Fixture f;

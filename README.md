@@ -22,8 +22,9 @@ C++ SQL 编译器 ── JSON 逻辑执行计划 ──► Java 数据库引擎
 ```
 
 - C++ 编译器负责 SQL 的词法、语法、语义、逻辑计划和基础优化，并输出 JSON 计划；
-  编译侧已支持 BOOL/FLOAT/NULL、表/列别名、自连接、JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX 和多列 ORDER BY。
-- Java 执行引擎负责 CreateTable、Insert、SeqScan、NestedLoopJoin、Filter、GroupBy、
+  编译侧支持约束 DDL、多行 INSERT、计算与聚合表达式、内外连接、分组、HAVING、
+  DISTINCT、表达式排序和 LIMIT/OFFSET。
+- Java 执行引擎负责 CreateTable、DropTable、Insert、SeqScan、NestedLoopJoin、Filter、GroupBy、
   Aggregate、Sort、Project、Update、Delete 的实际执行、表达式求值、运行期错误和结果集生成。
 - `RecordStore` 是执行层与存储层的边界；后续页式存储只需实现该接口，不需改动执行器。
 - Web 演示台负责 SQL 编辑、结果表格、错误定位、执行历史和 JSON 计划展示。
@@ -59,17 +60,16 @@ UPDATE student SET age = age + 1 WHERE id = 1;
 DELETE FROM student WHERE id = 1;
 ```
 
-- 编译器数据类型：`INT`、`VARCHAR`、`BOOL`、`FLOAT`，INSERT 支持 `NULL`
-- 编译器表达式：同类型数值运算和比较、字符串/布尔判等、`NOT` / `AND` / `OR`
-- 编译器查询：表/列别名、自连接、内连接 JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY ASC/DESC
+- 编译器数据类型：`INT`、`VARCHAR(n)`、`BOOL`、`FLOAT`，INSERT 支持 `NULL` 和多行 VALUES
+- 编译器表达式：同类型数值运算和比较、字符串/布尔判等、LIKE、空值判定和三值逻辑
+- 编译器查询：表/列别名、内外连接、GROUP BY/HAVING、五类聚合、DISTINCT、表达式排序与分页
 - Java 引擎执行类型：`INT`、`FLOAT`、`VARCHAR`、`BOOL`，记录可保存 `NULL`
-- Java 引擎高级查询：内连接、分组聚合、多列排序、隐藏排序列和规定的 NULL 顺序
+- Java 引擎高级查询：内外连接、分组/HAVING、计算投影、多列排序、DISTINCT、分页和规定的 NULL 顺序
 - 错误处理：词法/语法/语义错误，以及除零、整数溢出、类型不匹配等执行期错误
 
-已整合 feature-zhangbo 的语法扩展，新增可执行的 IS NULL/IS NOT NULL、<>、BETWEEN、IN、
-INNER JOIN 和 UPDATE/DELETE 表别名。完整边界见 [文法支持表](DBcompiler-main/grammar.md)。
-HAVING、DISTINCT、LIMIT/OFFSET、外连接、计算投影、LIKE、列约束、多行 INSERT 和 DROP TABLE
-目前只支持解析，语义阶段明确返回 UnsupportedFeature。聚合 DISTINCT、索引、事务和并发控制尚不支持。
+feature-zhangbo 提供的扩展语法已接通 B 和 Java 执行层，包括 HAVING、DISTINCT、
+LIMIT/OFFSET、外连接、计算投影、LIKE、列约束、多行 INSERT 和 DROP TABLE。
+完整边界见 [文法支持表](DBcompiler-main/grammar.md)。聚合函数内部 DISTINCT、索引、事务和并发控制尚不支持。
 整合过程与代码阅读指南见 [A+B 整合说明](DBcompiler-main/docs/zhangbo-merge-notes.md)。
 
 ## 数据与持久化说明
@@ -116,7 +116,7 @@ bash scripts/check_advanced_execution.sh
 ```
 
 该脚本用真实 SQL 构建 C++ JSON 计划，再由 Java 测试检查 JOIN、GROUP BY、ORDER BY、
-FLOAT、BOOL、NULL、五类聚合、空输入和聚合溢出的执行结果。
+FLOAT、BOOL、NULL、五类聚合、HAVING、DISTINCT、分页、LIKE、DDL 约束、多行写入和失败原子性。
 
 聚合代码的阅读顺序和答辩示例见 [聚合实现讲解](DBcompiler-main/docs/aggregate-walkthrough.md)。
 
@@ -125,4 +125,4 @@ FLOAT、BOOL、NULL、五类聚合、空输入和聚合溢出的执行结果。
 1. 接入 Java 页式存储系统，实现页分配、读写与 Row/Page 映射。
 2. 将系统目录持久化为特殊表，使表定义能够跨重启恢复。
 3. 接入缓冲池与 LRU/FIFO 替换策略，补齐命中统计和页替换日志。
-4. 添加 HAVING、聚合 DISTINCT，并为连接和分组增加可替换的物理执行算法。
+4. 添加聚合函数内部 DISTINCT，并为连接和分组增加可替换的物理执行算法。

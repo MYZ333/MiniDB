@@ -18,6 +18,10 @@ struct ColumnSchema {
     std::string name; // 已归一化。
     DataType type;
     std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
+    bool primary_key = false;
+    bool not_null = false;
+    bool unique = false;
+    std::optional<ScalarValue> default_value = {};
 };
 
 struct TableSchema {

@@ -1,9 +1,9 @@
 # MiniSQL 编译器项目骨架（A + B）
 
 本项目采用 **C++17 + CMake**，按照 `grammar.md` 和接口契约组织两人的开发。
-语言目标为 CREATE TABLE、INSERT、SELECT、UPDATE、DELETE，以及条件和标量表达式。
+语言目标为 CREATE TABLE、DROP TABLE、INSERT、SELECT、UPDATE、DELETE，以及条件和标量表达式。
 已合入团队成员的 A version2，实现扩展 Lexer、Parser、AST 优化展示和前端调试入口；结合本地 B，
-五类语句已通过 **SQL → Token → AST → 语义分析 → 逻辑计划** 联调。
+六类语句已通过 **SQL → Token → AST → 语义分析 → 逻辑计划** 联调。
 现已增加 B 的规则优化：安全常量折叠、布尔化简、恒真 Filter 消除，并提供前后计划对照。
 JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和自连接已完成绑定、计划生成、打印、
 优化遍历及 JSON 导出。本目录不读写数据库记录；仓库相邻的 `minidb-engine` 通过 JSON
@@ -12,7 +12,7 @@ JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和�
 
 已整合 feature-zhangbo：语法与 B 聚合 AST 已统一，新增空值判定和 DML 别名执行。
 [整合说明与阅读顺序](docs/zhangbo-merge-notes.md)解释接口冲突的解决方式；
-[grammar.md 0.22](grammar.md)区分完整执行与仅解析支持。
+[grammar.md 0.23](grammar.md)给出当前完整执行边界。
 
 ## 1. 目录结构
 
@@ -26,6 +26,7 @@ DBcompiler/
 │   ├── planner-walkthrough.md # UPDATE/DELETE、计划生成与打印讲解
 │   ├── advanced-query-walkthrough.md # JOIN/GROUP/ORDER 的绑定与计划讲解
 │   ├── aggregate-walkthrough.md # 第三部分：聚合函数的数据流、空输入和执行讲解
+│   ├── remaining-features-walkthrough.md # A 扩展在 B/JSON/Java 中的完整数据流
 │   ├── optimizer-walkthrough.md # 安全常量计算、树改写与等价性验证讲解
 │   ├── json-plan-protocol.md # C++ 到 Java 的 JSON 计划字段约定
 │   └── a-merge-notes.md      # A 来源、兼容修复、测试结果与阅读顺序
@@ -50,7 +51,7 @@ DBcompiler/
 │   │   └── ast_optimizer.cpp # A：语义分析前的展示用 AST 改写
 │   ├── catalog/memory_catalog.cpp # B：模式校验、ID 分配、快照实现
 │   ├── semantic/
-│   │   ├── analyzer.cpp     # B：五类语句绑定和检查，共享 WHERE 分析
+│   │   ├── analyzer.cpp     # B：六类语句绑定、名称解析和类型/分组检查
 │   │   └── type_rules.hpp/.cpp # B：私有表达式类型规则
 │   ├── planner/
 │   │   ├── plan_builder.cpp # B：绑定结果检查、构造逻辑算子树
@@ -60,15 +61,15 @@ DBcompiler/
 │       └── optimizer.cpp    # B：表达式化简、计划改写、保留原树
 ├── app/main.cpp              # A 调试入口：Token、原 AST、优化 AST 展示
 ├── app/plan_json.cpp         # 完整编译流程及 JSON 计划导出入口
-├── examples/contracts.cpp    # 手工构造五类 AST、绑定结果和计划
+├── examples/contracts.cpp    # 手工构造基础 AST、绑定结果和计划
 ├── examples/semantic.cpp     # 手工 AST 调用真实 analyze 的演示
-├── examples/plans.cpp        # 五类 AST → 真实语义分析 → 真实计划生成 → 打印
+├── examples/plans.cpp        # 基础 AST → 真实语义分析 → 真实计划生成 → 打印
 ├── examples/optimizer.cpp    # 真实 SQL 编译 → 优化前后计划对照
 ├── tests/
 │   ├── lexer/lexer_tests.cpp # A：词法及扩展 Token 回归
 │   ├── parser/               # A：语法与 9 组 AST 优化测试
 │   ├── catalog/catalog_tests.cpp # B：5 个模式/快照行为用例
-│   ├── semantic/semantic_tests.cpp # B：46 个语义行为用例
+│   ├── semantic/semantic_tests.cpp # B：语义行为用例
 │   ├── test_support.hpp      # 测试断言和手工 AST 辅助，不属于产品 API
 │   ├── planner/plan_tests.cpp # B：23 个计划结构与打印用例
 │   ├── optimizer/            # B：25 组优化测试及独立参考求值器
@@ -88,7 +89,7 @@ DBcompiler/
 | 工作 | A：词法与语法 | B：语义与计划 |
 |---|---|---|
 | 输入处理 | lex：关键字、注释、转义、位置、EOF | 不处理字符流 |
-| 语法结构 | parse：五类语句、聚合调用、别名、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，检查聚合类型与分组约束 |
+| 语法结构 | parse：六类语句、聚合调用、别名、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，检查聚合类型与分组约束 |
 | 名称与类型 | 保留名称原文和源码范围 | Catalog 查询、关系实例/表列绑定、类型检查、INSERT 重排、UPDATE 规则 |
 | 计划生成 | 提供准确的 AST | 构造增删改查及 NestedLoopJoin/GroupBy/Aggregate/Sort 计划 |
 | 规则优化 | 展示用 AST 折叠，维护原始/优化 AST 对照 | 绑定后计划折叠、布尔化简、恒真 Filter 消除和等价性测试 |
@@ -113,7 +114,7 @@ SQL
 ```
 
 五个入口均返回 `Result<T>`，即成功值或 Diagnostic，调用者遇错应停止该条流程。
-lex、parse、analyze 与 buildPlan 均已实现五类语句的对应阶段。
+lex、parse、analyze 与 buildPlan 均已实现六类语句的对应阶段。
 optimizePlan 显式调用，保持版本、输出和 RowId；除零/溢出运算保留给执行层按需求值时报错。
 `formatPlan(plan)` 返回可读文本树，展示算子参数、业务输出列、模式版本和行标识属性。
 parse 支持多语句，按文法处理优先级，保留实际源码范围。
@@ -128,7 +129,7 @@ CREATE 不在编译时修改 Catalog；未来由上层按“编译→执行成�
 | minisql_plan_json | SQL→优化计划→JSON，供 Java 引擎调用 | frontend + backend |
 | contracts_example | 手工结构示例 | contracts |
 | semantic_example | 调用真实语义分析的演示 | backend |
-| plans_example | 五类语句的 B 侧完整流程和计划打印 | backend |
+| plans_example | 基础语句的 B 侧完整流程和计划打印 | backend |
 | optimizer_example | 真实 SQL 编译和优化前后计划打印 | frontend + backend |
 | lexer_tests / parser_tests / ast_optimizer_tests | A 的模块测试，仅 BUILD_TESTING 开启时构建 | frontend |
 | scaffold_smoke | 真实 SQL→计划/诊断的 14 个联调用例，仅 BUILD_TESTING 开启时构建 | frontend + backend |
@@ -137,9 +138,8 @@ CREATE 不在编译时修改 Catalog；未来由上层按“编译→执行成�
 
 A 与 B 的库互不依赖，因此可以独立实现和测试。MemoryCatalog 已归入 backend；
 语义分析仍只依赖 CatalogSnapshot，可替换为外部数据库的模式快照。
-BOOL/FLOAT、NULL 插入、限定名、JOIN/GROUP/ORDER 已贯通 B。执行层需要按接口文档实现
-NestedLoopJoin 的左右行拼接、GroupBy 的按键去重及 Sort 的多键方向比较。
-`minisql_plan_json` 已导出这些节点；当前 Java 引擎仍只执行基础增删改查节点。
+BOOL/FLOAT/NULL、约束 DDL、多行 INSERT、查询表达式、内外连接、GROUP/HAVING、
+DISTINCT、ORDER 和 LIMIT 已贯通 B 与 JSON。相邻 Java 引擎执行全部这些节点和字段。
 
 ## 4. 构建和运行
 
@@ -171,8 +171,8 @@ bash scripts/check.sh
 ```
 
 该脚本用 c++ 和 ar 分别构建 A/B 静态库和 JSON 导出器，验证全部公共头文件可独立包含，
-再编译运行前端空输入检查、四种示例、A 的词法/语法和 4 组 AST 优化测试、
-14 个联调用例、B 的 63 个 Catalog/语义/计划用例及 24 组计划优化测试。
+再编译运行前端空输入检查、示例、A 的词法/语法/AST 优化测试以及 B 的 Catalog、
+语义、计划、优化和 SQL 联调用例。
 产物位于 `build/direct/`，不会覆盖
 CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
 
@@ -181,7 +181,7 @@ CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
 测试包含快照隔离、失败注册无副作用、名称大小写、列重排、表达式类型、错误位置及深度边界。
 新增用例包含 UPDATE 旧值引用、重复赋值、DELETE 条件、修改计划行标识、
 输出模式、外部非连续列 ID、无效绑定结果诊断和确定性打印。
-新增联调用例验证真实 SQL 的扩展类型、限定名、JOIN/GROUP/ORDER 计划、源码范围和五类语句。
+新增联调用例验证真实 SQL 的扩展类型、限定名、JOIN/GROUP/ORDER 计划、源码范围和六类语句。
 联调驱动显式注册 CREATE 模式，不执行数据库 CRUD。
 优化测试另用测试专用参考求值器比较 SELECT/UPDATE/DELETE 的记录结果、影响行数及错误位置，
 包含 49 种确定性表达式组合；INT64 边界使用明确预期用例。参考求值器不是产品执行引擎。
@@ -198,6 +198,8 @@ CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
    再按 bindWhere → UPDATE/DELETE → buildPlan → formatPlan 阅读 [计划代码讲解](docs/planner-walkthrough.md)。
    JOIN/GROUP/ORDER 按 resolveColumn → bindStatement(SelectStmt) → selectSource → printNode 阅读
    [高级查询代码讲解](docs/advanced-query-walkthrough.md)。
+   A 扩展功能按公共结构 → analyzer → plan_builder/optimizer → JSON/Java 阅读
+   [剩余功能实现讲解](docs/remaining-features-walkthrough.md)。
    优化部分按 constant_fold → optimizeExpr → optimizeNode 阅读 [优化代码讲解](docs/optimizer-walkthrough.md)。
 4. 新增功能时在所属 tests 目录增加行为测试，显式更新 CMake；若新增源文件，
    同步 scripts/check.sh 的构建清单。

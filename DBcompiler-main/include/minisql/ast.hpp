@@ -39,7 +39,7 @@ struct BinaryExpr {
 
 struct Expr {
     // AggregateCall 允许 A 表达 HAVING COUNT(*) > 0、SELECT COUNT(*) + 1 等聚合表达式；
-    // B 已支持 SELECT 顶层聚合；HAVING 和聚合算术仍显式报 UnsupportedFeature。
+    // B 在 SELECT/HAVING/ORDER BY 中把调用绑定成 BoundAggregate 表达式叶节点。
     std::variant<IdentifierExpr, LiteralExpr, UnaryExpr, BinaryExpr, AggregateCall> node;
     SourceLocation span;
 };
@@ -55,10 +55,10 @@ struct ColumnDefinition {
     DataType type;
     SourceLocation span;
     std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
-    bool primary_key = false; // A 只保留列级 PRIMARY KEY 语法；B 后续决定唯一性和索引语义。
-    bool not_null = false; // A 不做 NULL 约束检查；B/Catalog/执行层后续适配。
-    bool unique = false; // 列级 UNIQUE 语法标记；是否与 PRIMARY KEY 合并由 B 决定。
-    std::optional<LocatedLiteral> default_value = {}; // DEFAULT 字面量；类型兼容性由 B 检查。
+    bool primary_key = false; // B 将其提升为 NOT NULL + UNIQUE；当前不自动建索引。
+    bool not_null = false; // B/Catalog 保存，执行层在写入前检查。
+    bool unique = false; // NULL 不参与唯一值冲突检查。
+    std::optional<LocatedLiteral> default_value = {}; // B 检查类型并为省略的 INSERT 列填值。
 };
 
 struct CreateTableStmt {
@@ -68,7 +68,7 @@ struct CreateTableStmt {
 
 struct DropTableStmt {
     std::vector<Identifier> tables;
-    bool if_exists = false; // A 只保留 IF EXISTS 语法；B 后续决定缺表时是否忽略。
+    bool if_exists = false; // true 时 B/Catalog/执行层忽略不存在的表。
 };
 
 struct InsertStmt {
@@ -86,17 +86,15 @@ struct OrderByItem {
     Identifier column;
     SortDirection direction = SortDirection::Asc;
     SourceLocation span;
-    ExprPtr expression = nullptr; // 非空表示 ORDER BY 表达式；B 当前可先显式 UnsupportedFeature。
+    ExprPtr expression = nullptr; // 非空表示 ORDER BY 表达式；B 绑定为计算排序键。
 };
-
-enum class JoinType { Inner, Left, Right, Full };
 
 struct JoinClause {
     Identifier table;
     ExprPtr on;
     SourceLocation span;
     std::optional<Identifier> alias = {}; // 关系实例名；省略时使用真实表名。
-    JoinType type = JoinType::Inner; // A 只记录连接种类；B 后续决定外连接计划和 NULL 补齐语义。
+    JoinType type = JoinType::Inner; // B 原样传入计划，外连接缺失侧由执行层补 NULL。
 };
 
 struct SelectStmt {
@@ -110,11 +108,11 @@ struct SelectStmt {
     std::optional<Identifier> table_alias = {};
     // 与显式 columns 一一对应（包括 SelectItem）；nullopt 沿用列名或函数展示名。
     std::vector<std::optional<Identifier>> column_aliases = {};
-    // LIMIT/OFFSET 只保存语法值；B 后续决定计划与执行语义。nullopt 表示未声明。
+    // nullopt 表示未声明；B 在最终投影/聚合后应用 OFFSET 和 LIMIT。
     std::optional<std::int64_t> limit = {};
     std::optional<std::int64_t> offset = {};
-    ExprPtr having = nullptr; // HAVING 在 GROUP BY 后过滤分组；B 后续负责聚合语义绑定。
-    bool distinct = false; // SELECT DISTINCT 标记；B 后续决定去重计划与 NULL 比较规则。
+    ExprPtr having = nullptr; // B 在分组上下文绑定，执行层仅保留 TRUE 的分组。
+    bool distinct = false; // 最终输出去重，两个相同位置的 NULL 视为相等。
 };
 
 struct Assignment {

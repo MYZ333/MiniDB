@@ -3,15 +3,25 @@ package minidb;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** Executes protocolVersion=1 plans emitted by DBcompiler-main/app/plan_json.cpp. */
 public final class DatabaseEngine {
-    public record ColumnSchema(long id, String name, String type) { }
+    /** Catalog metadata needed to enforce SQL column constraints at the storage boundary. */
+    public record ColumnSchema(
+        long id, String name, String type, Long varcharLength,
+        boolean primaryKey, boolean notNull, boolean unique,
+        Object defaultValue, boolean hasDefault) {
+        public ColumnSchema(long id, String name, String type) {
+            this(id, name, type, null, false, false, false, null, false);
+        }
+    }
     public record TableSchema(long id, String name, List<ColumnSchema> columns) { }
     public record StoredRow(long id, List<Object> values) { }
     public record CommandResult(String operation, long affectedRows) implements ExecutionResult { }
@@ -26,7 +36,8 @@ public final class DatabaseEngine {
     private record PlanRow(Map<Long, Long> rowIds, List<ColumnSlot> layout, List<Object> values) { }
 
     /** Materialized aggregate row keeps hidden GROUP BY values for ORDER BY. */
-    private record AggregateRow(List<Object> groupValues, List<Object> outputValues) { }
+    private record AggregateRow(
+        List<Object> groupValues, List<Object> outputValues, List<PlanRow> sourceRows) { }
 
     private final RecordStore records;
     private final Map<Long, TableSchema> tablesById = new LinkedHashMap<>();
@@ -58,6 +69,7 @@ public final class DatabaseEngine {
         String type = string(node.get("type"), "node type");
         return switch (type) {
             case "CreateTable" -> createTable(node);
+            case "DropTable" -> dropTable(node);
             case "Insert" -> insert(node);
             case "Project" -> project(node);
             case "Aggregate" -> aggregate(node);
@@ -74,6 +86,7 @@ public final class DatabaseEngine {
         if (tablesByName.containsKey(name))
             throw new EngineException("TableAlreadyExists", "table already exists: " + name);
         List<ColumnSchema> columns = new ArrayList<>();
+        boolean hasPrimaryKey = false;
         for (Object value : list(node.get("columns"), "columns")) {
             Map<String, Object> column = map(value, "column");
             String columnName = normalize(string(column.get("name"), "column name"));
@@ -83,7 +96,22 @@ public final class DatabaseEngine {
                 throw new EngineException("UnsupportedType", "unsupported column type: " + type);
             if (columns.stream().anyMatch(existing -> existing.name().equals(columnName)))
                 throw new EngineException("DuplicateColumn", "duplicate column: " + columnName);
-            columns.add(new ColumnSchema(columns.size() + 1L, columnName, type));
+            Long varcharLength = nodeLong(column.get("varcharLength"));
+            if (varcharLength != null && (!type.equals("VARCHAR") || varcharLength <= 0))
+                throw new EngineException("UnsupportedType", "VARCHAR length must be positive");
+            boolean primaryKey = optionalBoolean(column.get("primaryKey"), false);
+            if (primaryKey && hasPrimaryKey)
+                throw new EngineException("InvalidPlan", "table may contain only one PRIMARY KEY column");
+            hasPrimaryKey |= primaryKey;
+            boolean notNull = optionalBoolean(column.get("notNull"), false) || primaryKey;
+            boolean unique = optionalBoolean(column.get("unique"), false) || primaryKey;
+            boolean hasDefault = optionalBoolean(column.get("hasDefault"), false);
+            Object defaultValue = hasDefault
+                ? coerceValue(column.get("defaultValue"), type, column) : null;
+            ColumnSchema schema = new ColumnSchema(columns.size() + 1L, columnName, type,
+                varcharLength, primaryKey, notNull, unique, defaultValue, hasDefault);
+            validateColumnValue(schema, defaultValue, hasDefault, column);
+            columns.add(schema);
         }
         if (columns.isEmpty())
             throw new EngineException("EmptyColumnList", "table must contain at least one column");
@@ -95,15 +123,47 @@ public final class DatabaseEngine {
         return new CommandResult("CREATE", 0);
     }
 
+    /** DROP mutates catalog and storage together; IF EXISTS with no match is a no-op. */
+    private CommandResult dropTable(Map<String, Object> node) {
+        boolean ifExists = optionalBoolean(node.get("ifExists"), false);
+        List<String> names = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (Object raw : list(node.get("tableNames"), "tableNames")) {
+            String name = normalize(string(raw, "table name"));
+            if (!seen.add(name))
+                throw new EngineException("DuplicateTable", "duplicate table: " + name);
+            if (!ifExists && !tablesByName.containsKey(name))
+                throw new EngineException("TableNotFound", "table does not exist: " + name);
+            names.add(name);
+        }
+        if (names.isEmpty()) throw new EngineException("InvalidPlan", "DROP requires table names");
+        long removed = 0;
+        for (String name : names) {
+            TableSchema table = tablesByName.remove(name);
+            if (table == null) continue;
+            records.dropTable(table.id());
+            tablesById.remove(table.id());
+            removed++;
+        }
+        if (removed > 0) catalogVersion++;
+        return new CommandResult("DROP", removed);
+    }
+
     private CommandResult insert(Map<String, Object> node) {
         TableSchema table = resolveTable(map(node.get("table"), "table"));
-        List<Object> values = new ArrayList<>(list(node.get("values"), "values"));
-        if (values.size() != table.columns().size())
-            throw new EngineException("InvalidPlan", "INSERT values do not cover table schema");
-        for (int i = 0; i < values.size(); i++)
-            values.set(i, coerceValue(values.get(i), table.columns().get(i).type(), null));
-        records.insert(table.id(), values);
-        return new CommandResult("INSERT", 1);
+        List<Object> encodedRows = node.get("rows") instanceof List<?>
+            ? list(node.get("rows"), "rows") : List.of(list(node.get("values"), "values"));
+        if (encodedRows.isEmpty()) throw new EngineException("InvalidPlan", "INSERT requires rows");
+        List<List<Object>> rows = new ArrayList<>();
+        for (Object raw : encodedRows)
+            rows.add(normalizeRow(table, list(raw, "insert row"), node));
+        List<List<Object>> finalRows = new ArrayList<>();
+        for (StoredRow present : records.scan(table.id()))
+            finalRows.add(new ArrayList<>(present.values()));
+        finalRows.addAll(rows);
+        validateFinalRows(table, finalRows);
+        for (List<Object> row : rows) records.insert(table.id(), row);
+        return new CommandResult("INSERT", rows.size());
     }
 
     private QueryResult project(Map<String, Object> node) {
@@ -113,15 +173,27 @@ public final class DatabaseEngine {
             names.add(string(map(output, "output column").get("name"), "output name"));
         List<Map<String, Object>> references =
             objectList(node.get("columns"), "project columns", "column ref");
-        if (names.size() != references.size())
+        List<Map<String, Object>> expressions = node.get("expressions") instanceof List<?>
+            ? objectList(node.get("expressions"), "project expressions", "expression")
+            : List.of();
+        int selectedCount = expressions.isEmpty() ? references.size() : expressions.size();
+        if (names.size() != selectedCount)
             throw new EngineException("InvalidPlan", "Project output does not match selected columns");
         List<List<Object>> rows = new ArrayList<>();
         for (PlanRow row : input) {
             List<Object> selected = new ArrayList<>();
-            for (Map<String, Object> reference : references)
-                selected.add(columnValue(reference, row));
+            if (expressions.isEmpty()) {
+                for (Map<String, Object> reference : references)
+                    selected.add(columnValue(reference, row));
+            } else {
+                for (Map<String, Object> expression : expressions)
+                    selected.add(evaluate(expression, row));
+            }
             rows.add(selected);
         }
+        if (optionalBoolean(node.get("distinct"), false))
+            rows = distinctRows(rows);
+        rows = window(rows, node);
         return new QueryResult(List.copyOf(names), List.copyOf(rows));
     }
 
@@ -143,8 +215,13 @@ public final class DatabaseEngine {
             groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(row);
         }
 
+        Map<String, Object> having = node.get("having") instanceof Map<?, ?>
+            ? map(node.get("having"), "HAVING") : null;
         List<AggregateRow> aggregateRows = new ArrayList<>();
         for (Map.Entry<List<Object>, List<PlanRow>> group : groups.entrySet()) {
+            if (having != null && !predicateTrue(
+                    evaluateAggregate(having, group.getValue()), having))
+                continue;
             List<Object> values = new ArrayList<>();
             for (Map<String, Object> item : items) {
                 String kind = string(item.get("kind"), "aggregate item kind");
@@ -156,12 +233,16 @@ public final class DatabaseEngine {
                                            group.getValue().get(0)));
                 } else if (kind.equals("aggregate")) {
                     values.add(aggregateValue(item, group.getValue()));
+                } else if (kind.equals("expression")) {
+                    values.add(evaluateAggregate(
+                        map(item.get("expression"), "aggregate expression"), group.getValue()));
                 } else {
                     throw new EngineException("InvalidPlan", "unknown aggregate item kind: " + kind);
                 }
             }
             // ArrayList allows SQL NULL elements; List.copyOf deliberately rejects them.
-            aggregateRows.add(new AggregateRow(new ArrayList<>(group.getKey()), values));
+            aggregateRows.add(new AggregateRow(
+                new ArrayList<>(group.getKey()), values, group.getValue()));
         }
 
         List<Map<String, Object>> order =
@@ -178,9 +259,18 @@ public final class DatabaseEngine {
                     throw new EngineException("InvalidPlan", "aggregate output ordinal is out of range");
             } else if (kind.equals("group")) {
                 referenceIndex(map(item.get("column"), "order group column"), groupKeys);
+            } else if (kind.equals("expression")) {
+                map(item.get("expression"), "order expression");
             } else throw new EngineException("InvalidPlan", "unknown aggregate order kind");
         }
         aggregateRows.sort((left, right) -> compareAggregateRows(left, right, order, groupKeys, items));
+        if (optionalBoolean(node.get("distinct"), false)) {
+            Map<List<Object>, AggregateRow> unique = new LinkedHashMap<>();
+            for (AggregateRow row : aggregateRows)
+                unique.putIfAbsent(new ArrayList<>(row.outputValues()), row);
+            aggregateRows = new ArrayList<>(unique.values());
+        }
+        aggregateRows = windowAggregateRows(aggregateRows, node);
         List<String> names = new ArrayList<>();
         for (Object output : list(node.get("output"), "output"))
             names.add(string(map(output, "output column").get("name"), "output name"));
@@ -202,8 +292,12 @@ public final class DatabaseEngine {
                 referenceIndex(map(item.get("column"), "aggregate column"), groupKeys);
                 continue;
             }
-            if (!kind.equals("aggregate"))
-                throw error("InvalidPlan", "unknown aggregate item kind", item);
+            if (!kind.equals("aggregate")) {
+                if (kind.equals("expression")) {
+                    map(item.get("expression"), "aggregate expression");
+                    continue;
+                } else throw error("InvalidPlan", "unknown aggregate item kind", item);
+            }
             String function = string(item.get("function"), "aggregate function");
             if (!List.of("COUNT", "SUM", "AVG", "MIN", "MAX").contains(function))
                 throw error("InvalidPlan", "unknown aggregate function", item);
@@ -290,14 +384,24 @@ public final class DatabaseEngine {
                 a = left.outputValues().get(ordinal);
                 b = right.outputValues().get(ordinal);
                 Map<String, Object> selected = items.get(ordinal);
-                type = selected.get("kind").equals("column")
+                String selectedKind = string(selected.get("kind"), "selected item kind");
+                type = selectedKind.equals("column")
                     ? string(map(selected.get("column"), "selected column").get("type"), "column type")
-                    : string(selected.get("type"), "aggregate type");
+                    : selectedKind.equals("expression")
+                        ? string(map(selected.get("expression"), "selected expression").get("type"),
+                                 "expression type")
+                        : string(selected.get("type"), "aggregate type");
             } else if (kind.equals("group")) {
                 int ordinal = referenceIndex(map(orderItem.get("column"), "order group column"), groupKeys);
                 a = left.groupValues().get(ordinal);
                 b = right.groupValues().get(ordinal);
                 type = string(groupKeys.get(ordinal).get("type"), "group key type");
+            } else if (kind.equals("expression")) {
+                Map<String, Object> expression =
+                    map(orderItem.get("expression"), "aggregate order expression");
+                a = evaluateAggregate(expression, left.sourceRows());
+                b = evaluateAggregate(expression, right.sourceRows());
+                type = string(expression.get("type"), "aggregate order expression type");
             } else throw new EngineException("InvalidPlan", "unknown aggregate order kind: " + kind);
             int compared = compareValues(a, b, type, direction);
             if (compared != 0) return compared;
@@ -328,7 +432,7 @@ public final class DatabaseEngine {
         Map<String, Object> inputNode = map(node.get("input"), "Update input");
         if (!Boolean.TRUE.equals(inputNode.get("carriesRowId")))
             throw new EngineException("InvalidPlan", "Update input must carry RowId");
-        long affected = 0;
+        Map<Long, List<Object>> replacements = new LinkedHashMap<>();
         for (PlanRow oldRow : readInput(inputNode)) {
             List<Object> updated = tableValues(table, oldRow);
             // Every RHS reads oldRow, preserving simultaneous SET a=b,b=a semantics.
@@ -345,10 +449,16 @@ public final class DatabaseEngine {
                     throw new EngineException("StorageFailure", "row does not match update schema");
                 updated.set(ordinal, value);
             }
-            records.replace(table.id(), rowIdFor(table, oldRow), updated);
-            affected++;
+            replacements.put(rowIdFor(table, oldRow), updated);
         }
-        return new CommandResult("UPDATE", affected);
+        // 先验证更新后的整张表，再执行写入，避免约束失败留下部分更新。
+        List<List<Object>> finalRows = new ArrayList<>();
+        for (StoredRow present : records.scan(table.id()))
+            finalRows.add(replacements.getOrDefault(present.id(), present.values()));
+        validateFinalRows(table, finalRows);
+        for (Map.Entry<Long, List<Object>> replacement : replacements.entrySet())
+            records.replace(table.id(), replacement.getKey(), replacement.getValue());
+        return new CommandResult("UPDATE", replacements.size());
     }
 
     private CommandResult delete(Map<String, Object> node) {
@@ -398,23 +508,80 @@ public final class DatabaseEngine {
         Map<String, Object> predicate = map(node.get("predicate"), "predicate");
         List<PlanRow> selected = new ArrayList<>();
         for (PlanRow row : readInput(map(node.get("input"), "Filter input")))
-            if (bool(evaluate(predicate, row), predicate)) selected.add(row);
+            if (predicateTrue(evaluate(predicate, row), predicate)) selected.add(row);
         return selected;
     }
 
-    /** Inner join in stable left-major, right-minor nested-loop order. */
+    /** Nested loops preserve left-major order and add NULL-extended rows for outer joins. */
     private List<PlanRow> nestedLoopJoin(Map<String, Object> node) {
-        List<PlanRow> leftRows = readInput(map(node.get("left"), "join left input"));
-        List<PlanRow> rightRows = readInput(map(node.get("right"), "join right input"));
+        Map<String, Object> leftNode = map(node.get("left"), "join left input");
+        Map<String, Object> rightNode = map(node.get("right"), "join right input");
+        List<PlanRow> leftRows = readInput(leftNode);
+        List<PlanRow> rightRows = readInput(rightNode);
         Map<String, Object> predicate = map(node.get("predicate"), "join predicate");
+        String joinType = node.get("joinType") == null
+            ? "INNER" : string(node.get("joinType"), "join type");
+        if (!List.of("INNER", "LEFT", "RIGHT", "FULL").contains(joinType))
+            throw new EngineException("InvalidPlan", "unknown join type: " + joinType);
         List<PlanRow> joined = new ArrayList<>();
+        boolean[] rightMatched = new boolean[rightRows.size()];
         for (PlanRow left : leftRows) {
-            for (PlanRow right : rightRows) {
+            boolean leftMatched = false;
+            for (int index = 0; index < rightRows.size(); index++) {
+                PlanRow right = rightRows.get(index);
                 PlanRow candidate = combine(left, right);
-                if (bool(evaluate(predicate, candidate), predicate)) joined.add(candidate);
+                if (predicateTrue(evaluate(predicate, candidate), predicate)) {
+                    joined.add(candidate);
+                    leftMatched = true;
+                    rightMatched[index] = true;
+                }
             }
+            if (!leftMatched && (joinType.equals("LEFT") || joinType.equals("FULL")))
+                joined.add(combine(left, nullRowFor(rightNode)));
         }
+        if (joinType.equals("RIGHT") || joinType.equals("FULL"))
+            for (int index = 0; index < rightRows.size(); index++)
+                if (!rightMatched[index])
+                    joined.add(combine(nullRowFor(leftNode), rightRows.get(index)));
         return joined;
+    }
+
+    /** Reconstructs an empty input layout so an outer join can NULL-extend an empty side. */
+    private PlanRow nullRowFor(Map<String, Object> node) {
+        List<ColumnSlot> layout = layoutFor(node);
+        List<Object> values = new ArrayList<>();
+        for (int i = 0; i < layout.size(); i++) values.add(null);
+        return new PlanRow(Map.of(), layout, values);
+    }
+
+    private List<ColumnSlot> layoutFor(Map<String, Object> node) {
+        String type = string(node.get("type"), "layout node type");
+        if (type.equals("SeqScan")) {
+            TableSchema table = resolveTable(map(node.get("table"), "layout table"));
+            long relationId = optionalLong(node.get("relationId"), table.id());
+            List<ColumnSlot> layout = new ArrayList<>();
+            for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
+                ColumnSchema column = table.columns().get(ordinal);
+                layout.add(new ColumnSlot(table.id(), column.id(), relationId,
+                                          ordinal, column.type()));
+            }
+            return layout;
+        }
+        if (type.equals("NestedLoopJoin")) {
+            List<ColumnSlot> layout = new ArrayList<>(
+                layoutFor(map(node.get("left"), "layout left input")));
+            layout.addAll(layoutFor(map(node.get("right"), "layout right input")));
+            return layout;
+        }
+        if (type.equals("Filter") || type.equals("Sort"))
+            return layoutFor(map(node.get("input"), "layout input"));
+        if (type.equals("GroupBy")) {
+            List<ColumnSlot> layout = new ArrayList<>();
+            for (Map<String, Object> key : objectList(node.get("keys"), "group keys", "group key"))
+                layout.add(slotFromReference(key));
+            return layout;
+        }
+        throw new EngineException("InvalidPlan", "cannot derive layout for " + type);
     }
 
     /** Without aggregates GROUP BY keeps the first row for every distinct key tuple. */
@@ -444,14 +611,26 @@ public final class DatabaseEngine {
             new ArrayList<>(readInput(map(node.get("input"), "Sort input")));
         Comparator<PlanRow> comparator = (left, right) -> {
             for (Map<String, Object> item : items) {
-                Map<String, Object> reference = map(item.get("column"), "sort column");
                 String direction = string(item.get("direction"), "sort direction");
                 if (!(direction.equals("ASC") || direction.equals("DESC")))
                     throw new EngineException("InvalidPlan",
                         "unknown sort direction: " + direction);
-                int compared = compareValues(
-                    columnValue(reference, left), columnValue(reference, right),
-                    string(reference.get("type"), "sort column type"), direction);
+                String kind = item.get("kind") == null
+                    ? "column" : string(item.get("kind"), "sort item kind");
+                Object a, b;
+                String valueType;
+                if (kind.equals("column")) {
+                    Map<String, Object> reference = map(item.get("column"), "sort column");
+                    a = columnValue(reference, left);
+                    b = columnValue(reference, right);
+                    valueType = string(reference.get("type"), "sort column type");
+                } else if (kind.equals("expression")) {
+                    Map<String, Object> expression = map(item.get("expression"), "sort expression");
+                    a = evaluate(expression, left);
+                    b = evaluate(expression, right);
+                    valueType = string(expression.get("type"), "sort expression type");
+                } else throw new EngineException("InvalidPlan", "unknown sort item kind: " + kind);
+                int compared = compareValues(a, b, valueType, direction);
                 if (compared != 0) return compared;
             }
             return 0;
@@ -482,14 +661,43 @@ public final class DatabaseEngine {
             case "unary" -> unary(string(expression.get("op"), "unary op"),
                 evaluate(map(expression.get("operand"), "operand"), row), expression);
             case "binary" -> binary(expression, row);
+            case "aggregate" -> throw error("InvalidPlan",
+                "aggregate expression requires a group", expression);
             default -> throw error("InvalidPlan",
                 "unknown expression kind: " + kind, expression);
         };
     }
 
+    /** Evaluates an expression once per group; aggregate leaves consume every source row. */
+    private Object evaluateAggregate(Map<String, Object> expression, List<PlanRow> rows) {
+        String kind = string(expression.get("kind"), "aggregate expression kind");
+        return switch (kind) {
+            case "literal" -> coerceValue(expression.get("value"),
+                string(expression.get("type"), "literal type"), expression);
+            case "column" -> {
+                if (rows.isEmpty()) throw error("InvalidPlan",
+                    "empty aggregate group cannot read a source column", expression);
+                yield columnValue(map(expression.get("column"), "column"), rows.get(0));
+            }
+            case "aggregate" -> aggregateValue(expression, rows);
+            case "unary" -> unary(string(expression.get("op"), "unary op"),
+                evaluateAggregate(map(expression.get("operand"), "operand"), rows), expression);
+            case "binary" -> {
+                Object left = evaluateAggregate(map(expression.get("left"), "left"), rows);
+                String op = string(expression.get("op"), "binary op");
+                if (op.equals("And") && Boolean.FALSE.equals(left)) yield false;
+                if (op.equals("Or") && Boolean.TRUE.equals(left)) yield true;
+                Object right = evaluateAggregate(map(expression.get("right"), "right"), rows);
+                yield binaryValues(op, left, right, expression);
+            }
+            default -> throw error("InvalidPlan",
+                "unknown aggregate expression kind: " + kind, expression);
+        };
+    }
+
     private Object unary(String op, Object value, Map<String, Object> expression) {
         return switch (op) {
-            case "Not" -> !bool(value, expression);
+            case "Not" -> value == null ? null : !bool(value, expression);
             // 空值判定不触发布尔/数字强制转换，适用于所有列类型。
             case "IsNull" -> value == null;
             case "IsNotNull" -> value != null;
@@ -499,6 +707,7 @@ public final class DatabaseEngine {
     }
 
     private Object negate(Object value, Map<String, Object> expression) {
+        if (value == null) return null;
         if (value instanceof Double number) return finite(-number, expression);
         try { return Math.negateExact(integer(value, expression)); }
         catch (ArithmeticException ex) {
@@ -509,24 +718,65 @@ public final class DatabaseEngine {
     private Object binary(Map<String, Object> expression, PlanRow row) {
         String op = string(expression.get("op"), "binary op");
         Object left = evaluate(map(expression.get("left"), "left"), row);
-        if (op.equals("And") && !bool(left, expression)) return false;
-        if (op.equals("Or") && bool(left, expression)) return true;
+        if (op.equals("And") && Boolean.FALSE.equals(left)) return false;
+        if (op.equals("Or") && Boolean.TRUE.equals(left)) return true;
         Object right = evaluate(map(expression.get("right"), "right"), row);
+        return binaryValues(op, left, right, expression);
+    }
+
+    /** Implements SQL three-valued logic: UNKNOWN is represented by Java null. */
+    private Object binaryValues(String op, Object left, Object right,
+                                Map<String, Object> expression) {
         return switch (op) {
-            case "And" -> bool(right, expression);
-            case "Or" -> bool(right, expression);
-            case "Equal" -> equalValues(left, right);
-            case "NotEqual" -> !equalValues(left, right);
-            case "Less" -> compareExpressionValues(left, right, expression) < 0;
-            case "LessEqual" -> compareExpressionValues(left, right, expression) <= 0;
-            case "Greater" -> compareExpressionValues(left, right, expression) > 0;
-            case "GreaterEqual" -> compareExpressionValues(left, right, expression) >= 0;
-            case "Add" -> arithmetic("add", left, right, expression);
-            case "Subtract" -> arithmetic("subtract", left, right, expression);
-            case "Multiply" -> arithmetic("multiply", left, right, expression);
-            case "Divide" -> divide(left, right, expression);
+            case "And" -> andValue(left, right, expression);
+            case "Or" -> orValue(left, right, expression);
+            case "Equal" -> left == null || right == null ? null : equalValues(left, right);
+            case "NotEqual" -> left == null || right == null ? null : !equalValues(left, right);
+            case "Less" -> left == null || right == null ? null :
+                compareExpressionValues(left, right, expression) < 0;
+            case "LessEqual" -> left == null || right == null ? null :
+                compareExpressionValues(left, right, expression) <= 0;
+            case "Greater" -> left == null || right == null ? null :
+                compareExpressionValues(left, right, expression) > 0;
+            case "GreaterEqual" -> left == null || right == null ? null :
+                compareExpressionValues(left, right, expression) >= 0;
+            case "Add" -> left == null || right == null ? null : arithmetic("add", left, right, expression);
+            case "Subtract" -> left == null || right == null ? null : arithmetic("subtract", left, right, expression);
+            case "Multiply" -> left == null || right == null ? null : arithmetic("multiply", left, right, expression);
+            case "Divide" -> left == null || right == null ? null : divide(left, right, expression);
+            case "Like" -> left == null || right == null ? null : like(
+                typed(left, String.class, "VARCHAR"), typed(right, String.class, "VARCHAR"));
             default -> throw error("InvalidPlan", "unknown binary operator", expression);
         };
+    }
+
+    private Object andValue(Object left, Object right, Map<String, Object> expression) {
+        Boolean a = nullableBoolean(left, expression), b = nullableBoolean(right, expression);
+        if (Boolean.FALSE.equals(a) || Boolean.FALSE.equals(b)) return false;
+        return a == null || b == null ? null : true;
+    }
+
+    private Object orValue(Object left, Object right, Map<String, Object> expression) {
+        Boolean a = nullableBoolean(left, expression), b = nullableBoolean(right, expression);
+        if (Boolean.TRUE.equals(a) || Boolean.TRUE.equals(b)) return true;
+        return a == null || b == null ? null : false;
+    }
+
+    /** '%' matches any code-point sequence and '_' exactly one Unicode code point. */
+    private static boolean like(String value, String pattern) {
+        int[] text = value.codePoints().toArray(), wildcard = pattern.codePoints().toArray();
+        boolean[] previous = new boolean[text.length + 1];
+        previous[0] = true;
+        for (int token : wildcard) {
+            boolean[] current = new boolean[text.length + 1];
+            if (token == '%') current[0] = previous[0];
+            for (int index = 1; index <= text.length; index++) {
+                if (token == '%') current[index] = previous[index] || current[index - 1];
+                else if (token == '_' || token == text[index - 1]) current[index] = previous[index - 1];
+            }
+            previous = current;
+        }
+        return previous[text.length];
     }
 
     private Object arithmetic(String operation, Object left, Object right,
@@ -621,6 +871,94 @@ public final class DatabaseEngine {
             "column is not available from the input plan");
     }
 
+    private static ColumnSlot slotFromReference(Map<String, Object> reference) {
+        long tableId = longValue(reference.get("tableId"), "column table id");
+        return new ColumnSlot(tableId,
+            longValue(reference.get("columnId"), "column id"),
+            optionalLong(reference.get("relationId"), tableId),
+            Math.toIntExact(longValue(reference.get("ordinal"), "column ordinal")),
+            string(reference.get("type"), "column type"));
+    }
+
+    private List<Object> normalizeRow(TableSchema table, List<Object> raw,
+                                      Map<String, Object> expression) {
+        if (raw.size() != table.columns().size())
+            throw new EngineException("InvalidPlan", "row does not cover table schema");
+        List<Object> values = new ArrayList<>();
+        for (int ordinal = 0; ordinal < raw.size(); ordinal++) {
+            ColumnSchema column = table.columns().get(ordinal);
+            Object value = coerceValue(raw.get(ordinal), column.type(), expression);
+            validateColumnValue(column, value, true, expression);
+            values.add(value);
+        }
+        return values;
+    }
+
+    /** Verifies NOT NULL, VARCHAR(n), PRIMARY KEY and UNIQUE against the final table image. */
+    private void validateFinalRows(TableSchema table, List<List<Object>> rows) {
+        List<Set<Object>> uniqueValues = new ArrayList<>();
+        for (int ordinal = 0; ordinal < table.columns().size(); ordinal++)
+            uniqueValues.add(new HashSet<>());
+        for (List<Object> row : rows) {
+            if (row.size() != table.columns().size())
+                throw new EngineException("StorageFailure", "stored row does not match table schema");
+            for (int ordinal = 0; ordinal < row.size(); ordinal++) {
+                ColumnSchema column = table.columns().get(ordinal);
+                Object value = coerceValue(row.get(ordinal), column.type(), null);
+                validateColumnValue(column, value, true, null);
+                if (column.unique() && value != null
+                    && !uniqueValues.get(ordinal).add(value))
+                    throw new EngineException("ConstraintViolation",
+                        "duplicate value for unique column " + table.name() + "." + column.name());
+            }
+        }
+    }
+
+    private static void validateColumnValue(ColumnSchema column, Object value,
+                                            boolean present,
+                                            Map<String, Object> expression) {
+        if (!present) return;
+        if (value == null && column.notNull())
+            throw error("ConstraintViolation",
+                "column " + column.name() + " does not allow NULL", expression);
+        if (value instanceof String text && column.varcharLength() != null
+            && text.codePointCount(0, text.length()) > column.varcharLength())
+            throw error("ConstraintViolation",
+                "value exceeds VARCHAR(" + column.varcharLength() + ") for " + column.name(), expression);
+    }
+
+    private static List<List<Object>> distinctRows(List<List<Object>> rows) {
+        Map<List<Object>, List<Object>> unique = new LinkedHashMap<>();
+        for (List<Object> row : rows) unique.putIfAbsent(new ArrayList<>(row), row);
+        return new ArrayList<>(unique.values());
+    }
+
+    private static List<List<Object>> window(List<List<Object>> rows, Map<String, Object> node) {
+        int from = windowStart(rows.size(), node);
+        int to = windowEnd(rows.size(), from, node);
+        return new ArrayList<>(rows.subList(from, to));
+    }
+
+    private static List<AggregateRow> windowAggregateRows(
+        List<AggregateRow> rows, Map<String, Object> node) {
+        int from = windowStart(rows.size(), node);
+        int to = windowEnd(rows.size(), from, node);
+        return new ArrayList<>(rows.subList(from, to));
+    }
+
+    private static int windowStart(int size, Map<String, Object> node) {
+        long offset = node.get("offset") == null ? 0 : longValue(node.get("offset"), "offset");
+        if (offset < 0) throw new EngineException("InvalidPlan", "OFFSET must be non-negative");
+        return (int) Math.min(offset, size);
+    }
+
+    private static int windowEnd(int size, int from, Map<String, Object> node) {
+        if (node.get("limit") == null) return size;
+        long limit = longValue(node.get("limit"), "limit");
+        if (limit < 0) throw new EngineException("InvalidPlan", "LIMIT must be non-negative");
+        return from + (int) Math.min(limit, (long) size - from);
+    }
+
     private List<Object> tableValues(TableSchema table, PlanRow row) {
         List<Object> values = new ArrayList<>();
         long relationId = row.rowIds().containsKey(0L) ? 0 : table.id();
@@ -651,7 +989,7 @@ public final class DatabaseEngine {
         return actual;
     }
 
-    /** NULL can be stored in every declared type, but cannot be an expression operand yet. */
+    /** NULL is accepted by the type coercer; SQL constraints are checked separately. */
     private static Object coerceValue(Object value, String type,
                                       Map<String, Object> expression) {
         if (value == null) return null;
@@ -710,6 +1048,15 @@ public final class DatabaseEngine {
         throw error("InvalidPlan", "operator requires BOOL", expression);
     }
 
+    private static boolean predicateTrue(Object value, Map<String, Object> expression) {
+        return value != null && bool(value, expression);
+    }
+
+    private static Boolean nullableBoolean(Object value, Map<String, Object> expression) {
+        if (value == null) return null;
+        return bool(value, expression);
+    }
+
     private static <T> T typed(Object value, Class<T> expected, String type) {
         if (expected.isInstance(value)) return expected.cast(value);
         throw new EngineException("StorageFailure",
@@ -757,6 +1104,14 @@ public final class DatabaseEngine {
     }
     private static long optionalLong(Object value, long fallback) {
         return value == null ? fallback : longValue(value, "optional integer");
+    }
+    private static Long nodeLong(Object value) {
+        return value == null ? null : longValue(value, "optional integer");
+    }
+    private static boolean optionalBoolean(Object value, boolean fallback) {
+        if (value == null) return fallback;
+        if (value instanceof Boolean truth) return truth;
+        throw new EngineException("ProtocolError", "optional boolean must be a boolean");
     }
     private static EngineException error(
         String code, String message, Map<String, Object> expression) {

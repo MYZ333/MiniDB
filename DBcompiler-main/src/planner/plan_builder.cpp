@@ -55,6 +55,12 @@ DataType valueType(const ScalarValue& value) {
     return DataType::Null;
 }
 
+std::size_t utf8Length(const std::string& value) {
+    std::size_t count = 0;
+    for (unsigned char byte : value) if ((byte & 0xc0u) != 0x80u) ++count;
+    return count;
+}
+
 std::optional<Diagnostic> checkExpr(const BoundExprPtr& expr, const Relations& relations,
                                     std::size_t depth = 0) {
     if (!expr) return invalid("required bound expression is missing");
@@ -69,9 +75,16 @@ std::optional<Diagnostic> checkExpr(const BoundExprPtr& expr, const Relations& r
                 return invalid("bound literal type does not match value", expr->span);
         } else if constexpr (std::is_same_v<T, BoundUnary>) {
             return checkExpr(node.operand, relations, depth + 1);
-        } else {
+        } else if constexpr (std::is_same_v<T, BoundBinary>) {
             if (auto error = checkExpr(node.left, relations, depth + 1)) return error;
             return checkExpr(node.right, relations, depth + 1);
+        } else {
+            if (node.argument && !validRef(*node.argument, relations))
+                return invalid("aggregate argument does not match visible schemas", node.span);
+            if (!node.argument && node.kind != AggregateKind::Count)
+                return invalid("only COUNT may omit its argument", node.span);
+            if (node.type != expr->type)
+                return invalid("aggregate expression result type is inconsistent", node.span);
         }
         return std::nullopt;
     }, expr->node);
@@ -82,6 +95,36 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, BoundCreateTable>) {
             if (stmt.table_name.empty() || stmt.columns.empty()) return invalid("CREATE requires a name and columns");
+            std::unordered_set<std::string> names;
+            bool has_primary_key = false;
+            for (const auto& column : stmt.columns) {
+                if (column.name.empty() || !names.insert(column.name).second)
+                    return invalid("CREATE column names must be non-empty and unique");
+                if (column.type == DataType::Null)
+                    return invalid("NULL is not a declarable column type");
+                if (column.varchar_length &&
+                    (column.type != DataType::Varchar || *column.varchar_length <= 0))
+                    return invalid("VARCHAR length must be positive");
+                if (column.primary_key && has_primary_key)
+                    return invalid("CREATE permits only one PRIMARY KEY column");
+                has_primary_key = has_primary_key || column.primary_key;
+                if (!column.default_value) continue;
+                const auto type = valueType(*column.default_value);
+                if ((column.not_null || column.primary_key) && type == DataType::Null)
+                    return invalid("NOT NULL column cannot default to NULL");
+                if (type != DataType::Null && type != column.type)
+                    return invalid("DEFAULT value type does not match column");
+                if (column.varchar_length && type == DataType::Varchar &&
+                    utf8Length(std::get<std::string>(*column.default_value)) >
+                        static_cast<std::size_t>(*column.varchar_length))
+                    return invalid("DEFAULT exceeds VARCHAR length");
+            }
+        } else if constexpr (std::is_same_v<T, BoundDropTable>) {
+            if (stmt.table_names.empty()) return invalid("DROP requires table names");
+            std::unordered_set<std::string> names;
+            for (const auto& name : stmt.table_names)
+                if (name.empty() || !names.insert(name).second)
+                    return invalid("DROP table names must be non-empty and unique");
         } else if constexpr (std::is_same_v<T, BoundSelect>) {
             if (!stmt.table || stmt.table->columns.empty()) return invalid("base table schema is missing or empty");
             Relations relations{{stmt.table, stmt.relation_id,
@@ -102,14 +145,16 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                 if (stmt.where->type != DataType::Bool) return invalid("WHERE must be BOOL", stmt.where->span);
                 if (auto error = checkExpr(stmt.where, relations)) return error;
             }
-            if (stmt.columns.empty() && stmt.aggregate_items.empty())
+            if (stmt.columns.empty() && stmt.aggregate_items.empty() && stmt.projection_expressions.empty())
                 return invalid("SELECT requires output columns");
-            const auto output_count = stmt.aggregate_items.empty()
-                ? stmt.columns.size() : stmt.aggregate_items.size();
+            const auto output_count = !stmt.aggregate_items.empty() ? stmt.aggregate_items.size() :
+                !stmt.projection_expressions.empty() ? stmt.projection_expressions.size() : stmt.columns.size();
             if (!stmt.output_names.empty() && stmt.output_names.size() != output_count)
                 return invalid("SELECT output names do not match columns");
             for (const auto& ref : stmt.columns)
                 if (!validRef(ref, relations)) return invalid("SELECT column does not match visible schemas");
+            for (const auto& expression : stmt.projection_expressions)
+                if (auto error = checkExpr(expression, relations)) return error;
             std::vector<BoundColumnRef> checked_groups;
             for (const auto& ref : stmt.group_by) {
                 if (!validRef(ref, relations)) return invalid("GROUP BY column does not match visible schemas");
@@ -123,8 +168,8 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                     if (const auto* ref = std::get_if<BoundColumnRef>(&item.value)) {
                         if (!validRef(*ref, relations) || !containsRef(stmt.group_by, *ref))
                             return invalid("aggregate output column must occur in GROUP BY");
-                    } else {
-                        const auto& aggregate = std::get<BoundAggregate>(item.value);
+                    } else if (const auto* aggregate_ptr = std::get_if<BoundAggregate>(&item.value)) {
+                        const auto& aggregate = *aggregate_ptr;
                         if (aggregate.argument && !validRef(*aggregate.argument, relations))
                             return invalid("aggregate argument does not match visible schemas", aggregate.span);
                         if (!aggregate.argument && aggregate.kind != AggregateKind::Count)
@@ -143,6 +188,8 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                             kind == AggregateKind::Avg ? DataType::Float : argument_type;
                         if (aggregate.type != expected)
                             return invalid("aggregate result type is inconsistent", aggregate.span);
+                    } else {
+                        if (auto error = checkExpr(std::get<BoundExprPtr>(item.value), relations)) return error;
                     }
                 }
                 for (const auto& item : stmt.aggregate_order_by) {
@@ -150,9 +197,10 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                         if (*ordinal >= stmt.aggregate_items.size())
                             return invalid("aggregate ORDER BY output ordinal is out of range");
                     } else {
-                        const auto& ref = std::get<BoundColumnRef>(item.key);
-                        if (!validRef(ref, relations) || !containsRef(stmt.group_by, ref))
-                            return invalid("aggregate ORDER BY column must occur in GROUP BY");
+                        if (const auto* ref = std::get_if<BoundColumnRef>(&item.key)) {
+                            if (!validRef(*ref, relations) || !containsRef(stmt.group_by, *ref))
+                                return invalid("aggregate ORDER BY column must occur in GROUP BY");
+                        } else if (auto error = checkExpr(std::get<BoundExprPtr>(item.key), relations)) return error;
                     }
                 }
             } else if (!stmt.group_by.empty()) {
@@ -166,14 +214,38 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                 if (!stmt.group_by.empty() && !containsRef(stmt.group_by, item.column))
                     return invalid("ORDER BY column must occur in GROUP BY");
             }
+            for (const auto& item : stmt.expression_order_by) {
+                if (const auto* ref = std::get_if<BoundColumnRef>(&item.key)) {
+                    if (!validRef(*ref, relations)) return invalid("ORDER BY column does not match visible schemas");
+                } else if (auto error = checkExpr(std::get<BoundExprPtr>(item.key), relations)) return error;
+            }
+            if (stmt.having) {
+                if (stmt.having->type != DataType::Bool) return invalid("HAVING must be BOOL", stmt.having->span);
+                if (auto error = checkExpr(stmt.having, relations)) return error;
+            }
+            if (stmt.limit && *stmt.limit < 0) return invalid("LIMIT must be non-negative");
+            if (stmt.offset < 0) return invalid("OFFSET must be non-negative");
         } else {
             if (!stmt.table || stmt.table->columns.empty()) return invalid("target table schema is missing or empty");
             if constexpr (std::is_same_v<T, BoundInsert>) {
-                if (stmt.values.size() != stmt.table->columns.size()) return invalid("INSERT values must cover all columns");
-                for (std::size_t i = 0; i < stmt.values.size(); ++i) {
-                    if (valueType(stmt.values[i]) != DataType::Null &&
-                        valueType(stmt.values[i]) != stmt.table->columns[i].type)
-                        return invalid("INSERT value type does not match schema");
+                const auto rows = stmt.rows.empty()
+                    ? std::vector<std::vector<ScalarValue>>{stmt.values} : stmt.rows;
+                if (rows.empty()) return invalid("INSERT requires rows");
+                for (const auto& row : rows) {
+                    if (row.size() != stmt.table->columns.size())
+                        return invalid("INSERT values must cover all columns");
+                    for (std::size_t i = 0; i < row.size(); ++i) {
+                        const auto type = valueType(row[i]);
+                        const auto& column = stmt.table->columns[i];
+                        if (type == DataType::Null && column.not_null)
+                            return invalid("INSERT cannot store NULL in a NOT NULL column");
+                        if (type != DataType::Null && type != column.type)
+                            return invalid("INSERT value type does not match schema");
+                        if (column.varchar_length && type == DataType::Varchar &&
+                            utf8Length(std::get<std::string>(row[i])) >
+                                static_cast<std::size_t>(*column.varchar_length))
+                            return invalid("INSERT value exceeds VARCHAR length");
+                    }
                 }
             } else {
                 if (stmt.where) {
@@ -189,7 +261,12 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                             return invalid("UPDATE target is invalid or duplicated");
                         if (auto error = checkExpr(assignment.value,
                             Relations{{stmt.table, 0, stmt.table->name}})) return error;
-                        if (assignment.target.type != assignment.value->type)
+                        if (assignment.value->type == DataType::Null &&
+                            stmt.table->columns[assignment.target.ordinal].not_null)
+                            return invalid("UPDATE cannot store NULL in a NOT NULL column",
+                                           assignment.value->span);
+                        if (assignment.value->type != DataType::Null &&
+                            assignment.target.type != assignment.value->type)
                             return invalid("UPDATE value type does not match target", assignment.value->span);
                     }
                 }
@@ -249,7 +326,7 @@ PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
             scanOutput(join.table));
         auto output = input->output;
         output.insert(output.end(), right->output.begin(), right->output.end());
-        input = node(NestedLoopJoinPlan{input, right, join.on}, std::move(output));
+        input = node(NestedLoopJoinPlan{input, right, join.on, join.type}, std::move(output));
         relations.push_back({join.table, join.relation_id,
             join.relation_name.empty() ? join.table->name : join.relation_name});
     }
@@ -258,7 +335,8 @@ PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
     if (!stmt.aggregate_items.empty()) return input;
     if (!stmt.group_by.empty())
         input = node(GroupByPlan{stmt.group_by, input}, referencedOutput(stmt.group_by, relations));
-    if (!stmt.order_by.empty()) input = node(SortPlan{stmt.order_by, input}, input->output);
+    if (!stmt.order_by.empty() || !stmt.expression_order_by.empty())
+        input = node(SortPlan{stmt.order_by, input, stmt.expression_order_by}, input->output);
     return input;
 }
 } // namespace
@@ -269,8 +347,10 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, BoundCreateTable>) {
             return node(CreateTablePlan{stmt.table_name, stmt.columns});
+        } else if constexpr (std::is_same_v<T, BoundDropTable>) {
+            return node(DropTablePlan{stmt.table_names, stmt.if_exists});
         } else if constexpr (std::is_same_v<T, BoundInsert>) {
-            return node(InsertPlan{stmt.table, stmt.values});
+            return node(InsertPlan{stmt.table, stmt.values, stmt.rows});
         } else if constexpr (std::is_same_v<T, BoundSelect>) {
             Relations relations{{stmt.table, stmt.relation_id,
                 stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}};
@@ -279,15 +359,23 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
                 std::vector<OutputColumn> output;
                 for (std::size_t i = 0; i < stmt.aggregate_items.size(); ++i) {
                     const auto type = std::visit([](const auto& item) {
-                        return item.type;
+                        using I = std::decay_t<decltype(item)>;
+                        if constexpr (std::is_same_v<I, BoundExprPtr>) return item->type;
+                        else return item.type;
                     }, stmt.aggregate_items[i].value);
                     output.push_back({stmt.output_names[i], type});
                 }
                 return node(AggregatePlan{stmt.group_by, stmt.aggregate_items,
-                                          stmt.aggregate_order_by, input}, std::move(output));
+                                          stmt.aggregate_order_by, input, stmt.having,
+                                          stmt.distinct, stmt.limit, stmt.offset}, std::move(output));
             }
-            return node(ProjectPlan{stmt.columns, input},
-                        referencedOutput(stmt.columns, relations, stmt.output_names));
+            std::vector<OutputColumn> output;
+            if (!stmt.projection_expressions.empty()) {
+                for (std::size_t i = 0; i < stmt.projection_expressions.size(); ++i)
+                    output.push_back({stmt.output_names[i], stmt.projection_expressions[i]->type});
+            } else output = referencedOutput(stmt.columns, relations, stmt.output_names);
+            return node(ProjectPlan{stmt.columns, input, stmt.projection_expressions,
+                                    stmt.distinct, stmt.limit, stmt.offset}, std::move(output));
         } else if constexpr (std::is_same_v<T, BoundUpdate>) {
             // 修改操作的输入携带行标识，根只返回影响行数（执行结果，不是业务列）。
             return node(UpdatePlan{stmt.table, stmt.assignments, source(stmt.table, stmt.where, true)});

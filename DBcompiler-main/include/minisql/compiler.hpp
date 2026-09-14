@@ -1,6 +1,6 @@
 #pragma once
 
-// B 的公共入口。五类语句的语义分析与逻辑计划生成均已实现。
+// B 的公共入口。CREATE/DROP/INSERT/SELECT/UPDATE/DELETE 均生成真实绑定和计划。
 #include "minisql/ast.hpp"
 #include "minisql/plan.hpp"
 

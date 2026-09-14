@@ -47,7 +47,7 @@ int main() {
               std::get<std::size_t>(aggregate.order_by[0].key) == 2,
               "A expression wrappers or parallel aliases broke B aggregation");
     });
-    suite.run("parser-only extensions fail explicitly instead of being ignored", [] {
+    suite.run("A syntax extensions compile through B instead of being ignored", [] {
         Fixture f;
         for (const std::string sql : {
             "SELECT DISTINCT name FROM student;",
@@ -71,11 +71,10 @@ int main() {
             "CREATE TABLE constrained(id INT DEFAULT 1);",
             "CREATE TABLE constrained(name VARCHAR(20));"
         }) {
-            const auto error = failure(f.bind(sql), ErrorCode::UnsupportedFeature);
-            check(error.span.has_value(), "unsupported feature must preserve source location");
+            f.compile(sql);
         }
         check(f.catalog.snapshot()->version() == 1 &&
-              f.catalog.snapshot()->findTable("student"), "rejected syntax modified the catalog");
+              f.catalog.snapshot()->findTable("student"), "compilation must not mutate the catalog");
     });
     suite.run("new scalar syntax and DML aliases bind through existing contracts", [] {
         Fixture f;
@@ -92,6 +91,25 @@ int main() {
         }) f.compile(sql);
         failure(f.bind("UPDATE student s SET student.age=1;"), ErrorCode::ColumnNotFound);
         failure(f.bind("DELETE FROM student s WHERE student.id=1;"), ErrorCode::ColumnNotFound);
+    });
+    suite.run("DDL constraints supply defaults and reject invalid writes", [] {
+        const auto parsed = statements(
+            "CREATE TABLE account(id INT PRIMARY KEY,name VARCHAR(4) NOT NULL,active BOOL DEFAULT TRUE);"
+            "INSERT INTO account(id,name) VALUES(1,'Ann');");
+        MemoryCatalog catalog;
+        const auto create = value(analyze(parsed[0], *catalog.snapshot()));
+        const auto& definition = std::get<BoundCreateTable>(create.node);
+        check(definition.columns[0].primary_key && definition.columns[0].not_null &&
+              definition.columns[0].unique && definition.columns[1].varchar_length == 4,
+              "CREATE constraint metadata was lost");
+        value(catalog.createTable(definition.table_name, definition.columns));
+        const auto insert = value(analyze(parsed[1], *catalog.snapshot()));
+        const auto& row = std::get<BoundInsert>(insert.node).values;
+        check(std::get<bool>(row[2]), "omitted column did not receive DEFAULT TRUE");
+        failure(analyze(statements("INSERT INTO account(id) VALUES(2);")[0], *catalog.snapshot()),
+                ErrorCode::MissingInsertColumn);
+        failure(analyze(statements("INSERT INTO account VALUES(2,'ABCDE',FALSE);")[0],
+                        *catalog.snapshot()), ErrorCode::TypeMismatch);
     });
     suite.run("SQL five-statement pipeline with explicit catalog registration", [] {
         const auto parsed = statements(

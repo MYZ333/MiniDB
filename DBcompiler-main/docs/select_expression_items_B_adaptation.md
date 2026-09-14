@@ -1,6 +1,7 @@
 # SELECT 表达式项 B 侧适配说明
 
-> 本文保留 A 分支交付时的设计与历史记录。整合后的支持状态以 [grammar.md 0.22](../grammar.md) 和 [本次整合说明](zhangbo-merge-notes.md) 为准；顶层聚合已接通 B，部分扩展仍明确拒绝执行。
+> 本文保留 A 分支交付时的设计记录。适配现已完成；当前状态以
+> [grammar.md 0.23](../grammar.md) 和 [实现讲解](remaining-features-walkthrough.md) 为准。
 
 本文档单独说明 A 新增的 SELECT 表达式项改动，供 B 适配语义分析、计划生成和执行层时参考。
 

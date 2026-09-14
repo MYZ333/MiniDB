@@ -13,6 +13,14 @@ struct BoundColumnRef {
     std::uint64_t relation_id = 0; // 同一物理表的不同 FROM/JOIN 实例必须不同。
 };
 
+// 聚合叶节点可嵌入 SELECT/HAVING/ORDER BY 表达式。
+struct BoundAggregate {
+    AggregateKind kind;
+    std::optional<BoundColumnRef> argument;
+    DataType type;
+    SourceLocation span;
+};
+
 struct BoundExpr;
 using BoundExprPtr = std::shared_ptr<const BoundExpr>;
 
@@ -30,7 +38,7 @@ struct BoundBinary {
 };
 
 struct BoundExpr {
-    std::variant<BoundColumnRef, BoundLiteral, BoundUnary, BoundBinary> node;
+    std::variant<BoundColumnRef, BoundLiteral, BoundUnary, BoundBinary, BoundAggregate> node;
     DataType type; // 每个表达式均有确定类型，运算结果也不例外。
     SourceLocation span;
 };
@@ -40,9 +48,15 @@ struct BoundCreateTable {
     std::vector<ColumnSpec> columns; // ID 留给执行建表的 Catalog 分配。
 };
 
+struct BoundDropTable {
+    std::vector<std::string> table_names;
+    bool if_exists = false;
+};
+
 struct BoundInsert {
     std::shared_ptr<const TableSchema> table;
     std::vector<ScalarValue> values; // 已按表列顺序重排，数量等于全部表列数。
+    std::vector<std::vector<ScalarValue>> rows = {}; // 多行时保存全部完整记录。
 };
 
 struct BoundJoin {
@@ -50,6 +64,7 @@ struct BoundJoin {
     BoundExprPtr on; // 加入当前表后绑定；必须为 BOOL。
     std::string relation_name = {}; // 已归一化的表别名或真实表名。
     std::uint64_t relation_id = 0;
+    JoinType type = JoinType::Inner;
 };
 
 struct BoundOrderBy {
@@ -57,21 +72,18 @@ struct BoundOrderBy {
     SortDirection direction; // 每个排序键独立指定升序或降序。
 };
 
-// 聚合项只接受列或 COUNT(*)。表达式聚合留给后续表达式系统扩展。
-struct BoundAggregate {
-    AggregateKind kind;
-    std::optional<BoundColumnRef> argument;
-    DataType type; // COUNT 为 INT；AVG 为 FLOAT；其余沿用参数类型。
-    SourceLocation span;
+struct BoundExpressionOrder {
+    std::variant<BoundColumnRef, BoundExprPtr> key;
+    SortDirection direction;
 };
 
 struct BoundAggregateItem {
-    std::variant<BoundColumnRef, BoundAggregate> value;
+    std::variant<BoundColumnRef, BoundAggregate, BoundExprPtr> value;
 };
 
 // 聚合后排序可以引用 SELECT 输出别名，也可以引用未投影的分组键。
 struct BoundAggregateOrder {
-    std::variant<std::size_t, BoundColumnRef> key; // size_t 是输出列序号。
+    std::variant<std::size_t, BoundColumnRef, BoundExprPtr> key; // size_t 是输出列序号。
     SortDirection direction;
 };
 
@@ -88,6 +100,12 @@ struct BoundSelect {
     // 非空表示查询含聚合函数；顺序与最终输出列和 output_names 一致。
     std::vector<BoundAggregateItem> aggregate_items = {};
     std::vector<BoundAggregateOrder> aggregate_order_by = {};
+    std::vector<BoundExprPtr> projection_expressions = {};
+    std::vector<BoundExpressionOrder> expression_order_by = {};
+    BoundExprPtr having = {};
+    bool distinct = false;
+    std::optional<std::int64_t> limit = {};
+    std::int64_t offset = 0;
 };
 
 struct BoundAssignment {
@@ -108,7 +126,8 @@ struct BoundDelete {
 
 struct BoundStatement {
     CatalogVersion catalog_version;
-    std::variant<BoundCreateTable, BoundInsert, BoundSelect, BoundUpdate, BoundDelete> node;
+    std::variant<BoundCreateTable, BoundDropTable, BoundInsert, BoundSelect,
+                 BoundUpdate, BoundDelete> node;
 };
 
 } // namespace minisql

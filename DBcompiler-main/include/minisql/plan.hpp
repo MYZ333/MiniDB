@@ -17,20 +17,26 @@ struct CreateTablePlan {
     std::string table_name;
     std::vector<ColumnSpec> columns;
 };
+struct DropTablePlan {
+    std::vector<std::string> table_names;
+    bool if_exists = false;
+};
 struct InsertPlan {
     std::shared_ptr<const TableSchema> table;
     std::vector<ScalarValue> values;
+    std::vector<std::vector<ScalarValue>> rows = {};
 };
 struct SeqScanPlan {
     std::shared_ptr<const TableSchema> table;
     std::uint64_t relation_id = 0;
     std::string relation_name = {};
 };
-// 首版内连接：输出布局固定为左输入列后接右输入列。
+// 所有连接的输出布局都固定为左输入列后接右输入列；外连接缺失侧填 NULL。
 struct NestedLoopJoinPlan {
     PlanPtr left;
     PlanPtr right;
     BoundExprPtr predicate;
+    JoinType type = JoinType::Inner;
 };
 struct FilterPlan {
     BoundExprPtr predicate;
@@ -47,15 +53,24 @@ struct AggregatePlan {
     std::vector<BoundAggregateItem> items;
     std::vector<BoundAggregateOrder> order_by;
     PlanPtr input;
+    BoundExprPtr having = {};
+    bool distinct = false;
+    std::optional<std::int64_t> limit = {};
+    std::int64_t offset = 0;
 };
 // 多键稳定优先级由 items 顺序表达；相同键行之间不保证稳定排序。
 struct SortPlan {
     std::vector<BoundOrderBy> items;
     PlanPtr input;
+    std::vector<BoundExpressionOrder> expression_items = {};
 };
 struct ProjectPlan {
     std::vector<BoundColumnRef> columns;
     PlanPtr input;
+    std::vector<BoundExprPtr> expressions = {};
+    bool distinct = false;
+    std::optional<std::int64_t> limit = {};
+    std::int64_t offset = 0;
 };
 struct UpdatePlan {
     std::shared_ptr<const TableSchema> table;
@@ -68,7 +83,7 @@ struct DeletePlan {
 };
 
 struct PlanNode {
-    std::variant<CreateTablePlan, InsertPlan, SeqScanPlan, NestedLoopJoinPlan,
+    std::variant<CreateTablePlan, DropTablePlan, InsertPlan, SeqScanPlan, NestedLoopJoinPlan,
                  FilterPlan, GroupByPlan, AggregatePlan, SortPlan, ProjectPlan,
                  UpdatePlan, DeletePlan> node;
     std::vector<OutputColumn> output; // 有序业务列；修改类根节点为空。

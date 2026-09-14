@@ -40,6 +40,10 @@ std::optional<ScalarValue> integers(BinaryOp op, std::int64_t a, std::int64_t b)
 } // namespace
 
 std::optional<ScalarValue> foldUnary(UnaryOp op, const ScalarValue& operand) {
+    if (op == UnaryOp::IsNull || op == UnaryOp::IsNotNull) {
+        const bool is_null = std::holds_alternative<NullValue>(operand);
+        return ScalarValue{op == UnaryOp::IsNull ? is_null : !is_null};
+    }
     if (op == UnaryOp::Negate) {
         if (const auto* value = std::get_if<std::int64_t>(&operand)) {
             if (*value != minimum) return ScalarValue{-*value};

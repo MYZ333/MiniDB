@@ -29,7 +29,9 @@ std::optional<DataType> binaryResult(BinaryOp op, DataType left, DataType right)
     case BinaryOp::And: case BinaryOp::Or:
         if (left == DataType::Bool) return DataType::Bool;
         break;
-    case BinaryOp::Like: break; // 语义入口显式拒绝尚未实现的匹配运算。
+    case BinaryOp::Like:
+        if (left == DataType::Varchar) return DataType::Bool;
+        break;
     }
     return std::nullopt;
 }

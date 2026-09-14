@@ -52,12 +52,13 @@ using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullVa
 // IsNull/IsNotNull 接受任意类型，返回非空 BOOL，贯通 A/B 与执行层。
 enum class UnaryOp { Negate, Not, IsNull, IsNotNull };
 enum class SortDirection { Asc, Desc };
+enum class JoinType { Inner, Left, Right, Full };
 enum class AggregateKind { Count, Sum, Avg, Min, Max };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     And, Or,
-    Like // A 解析 SQL LIKE；B 后续定义字符串匹配语义。
+    Like // VARCHAR LIKE VARCHAR；执行层以 %/_ 实现 Unicode 码点匹配。
 };
 
 enum class DiagnosticStage { Lexical, Syntax, Semantic, Plan, Execution };
@@ -93,6 +94,10 @@ struct ColumnSpec {
     std::string name; // 已归一化。
     DataType type;
     std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
+    bool primary_key = false;
+    bool not_null = false;
+    bool unique = false;
+    std::optional<ScalarValue> default_value = {};
 };
 
 } // namespace minisql

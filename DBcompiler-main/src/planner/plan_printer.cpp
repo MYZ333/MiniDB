@@ -38,6 +38,27 @@ const char* opName(BinaryOp op) {
     return "UNKNOWN";
 }
 
+const char* aggregateName(AggregateKind kind) {
+    switch (kind) {
+    case AggregateKind::Count: return "COUNT";
+    case AggregateKind::Sum: return "SUM";
+    case AggregateKind::Avg: return "AVG";
+    case AggregateKind::Min: return "MIN";
+    case AggregateKind::Max: return "MAX";
+    }
+    return "UNKNOWN";
+}
+
+const char* joinName(JoinType type) {
+    switch (type) {
+    case JoinType::Inner: return "INNER";
+    case JoinType::Left: return "LEFT";
+    case JoinType::Right: return "RIGHT";
+    case JoinType::Full: return "FULL";
+    }
+    return "UNKNOWN";
+}
+
 std::string literal(const ScalarValue& value) {
     return std::visit([](const auto& item) -> std::string {
         using T = std::decay_t<decltype(item)>;
@@ -105,7 +126,8 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
             collectRelations(op.input, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             addRelation(relations, op.table, op.relation_id, op.relation_name);
-        } else if constexpr (!std::is_same_v<T, CreateTablePlan>) {
+        } else if constexpr (!std::is_same_v<T, CreateTablePlan> &&
+                             !std::is_same_v<T, DropTablePlan>) {
             addRelation(relations, op.table, 0, op.table ? op.table->name : std::string{});
         }
     }, plan->node);
@@ -137,9 +159,15 @@ std::string expression(const BoundExprPtr& expr, const Relations& relations,
                     (node.op == UnaryOp::IsNull ? " IS NULL)" : " IS NOT NULL)");
             return std::string("(") + (node.op == UnaryOp::Not ? "NOT " : "-") +
                    expression(node.operand, relations, depth + 1) + ")";
-        } else
+        } else if constexpr (std::is_same_v<T, BoundBinary>)
             return "(" + expression(node.left, relations, depth + 1) + " " + opName(node.op) + " " +
                    expression(node.right, relations, depth + 1) + ")";
+        else {
+            std::string result = aggregateName(node.kind);
+            result += '(';
+            result += node.argument ? columnName(*node.argument, relations) : "*";
+            return result + ')';
+        }
     }, expr->node);
 }
 
@@ -158,15 +186,36 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
             out << "CreateTable[" << op.table_name << "; ";
             for (std::size_t i = 0; i < op.columns.size(); ++i) {
                 if (i) out << ", ";
-                out << op.columns[i].name << ':' << typeName(op.columns[i].type);
+                const auto& column = op.columns[i];
+                out << column.name << ':' << typeName(column.type);
+                if (column.varchar_length) out << '(' << *column.varchar_length << ')';
+                if (column.primary_key) out << " PRIMARY KEY";
+                else {
+                    if (column.not_null) out << " NOT NULL";
+                    if (column.unique) out << " UNIQUE";
+                }
+                if (column.default_value) out << " DEFAULT " << literal(*column.default_value);
+            }
+        } else if constexpr (std::is_same_v<T, DropTablePlan>) {
+            out << "DropTable[";
+            if (op.if_exists) out << "IF EXISTS ";
+            for (std::size_t i = 0; i < op.table_names.size(); ++i) {
+                if (i) out << ", ";
+                out << op.table_names[i];
             }
         } else if constexpr (std::is_same_v<T, InsertPlan>) {
-            out << "Insert[" << tableName(op.table) << "; values=(";
-            for (std::size_t i = 0; i < op.values.size(); ++i) {
-                if (i) out << ", ";
-                out << literal(op.values[i]);
+            const auto rows = op.rows.empty()
+                ? std::vector<std::vector<ScalarValue>>{op.values} : op.rows;
+            out << "Insert[" << tableName(op.table) << "; rows=";
+            for (std::size_t row = 0; row < rows.size(); ++row) {
+                if (row) out << ", ";
+                out << '(';
+                for (std::size_t i = 0; i < rows[row].size(); ++i) {
+                    if (i) out << ", ";
+                    out << literal(rows[row][i]);
+                }
+                out << ')';
             }
-            out << ')';
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             out << "SeqScan[" << tableName(op.table);
             if (op.table && !op.relation_name.empty() && op.relation_name != op.table->name)
@@ -174,7 +223,8 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             left = op.left;
             right = op.right;
-            out << "NestedLoopJoin[" << expression(op.predicate, relations);
+            out << "NestedLoopJoin[" << joinName(op.type) << "; "
+                << expression(op.predicate, relations);
         } else {
             input = op.input;
             if constexpr (std::is_same_v<T, FilterPlan>) {
@@ -199,16 +249,12 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                         using I = std::decay_t<decltype(item)>;
                         if constexpr (std::is_same_v<I, BoundColumnRef>) {
                             out << columnName(item, relations);
-                        } else {
-                            const char* name = item.kind == AggregateKind::Count ? "COUNT" :
-                                item.kind == AggregateKind::Sum ? "SUM" :
-                                item.kind == AggregateKind::Avg ? "AVG" :
-                                item.kind == AggregateKind::Min ? "MIN" : "MAX";
-                            out << name << '(';
+                        } else if constexpr (std::is_same_v<I, BoundAggregate>) {
+                            out << aggregateName(item.kind) << '(';
                             if (item.argument) out << columnName(*item.argument, relations);
                             else out << '*';
                             out << ')';
-                        }
+                        } else out << expression(item, relations);
                     }, op.items[i].value);
                 }
                 if (!op.order_by.empty()) out << "; order=";
@@ -216,9 +262,15 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                     if (i) out << ", ";
                     if (const auto* ordinal = std::get_if<std::size_t>(&op.order_by[i].key))
                         out << "output#" << *ordinal;
-                    else out << columnName(std::get<BoundColumnRef>(op.order_by[i].key), relations);
+                    else if (const auto* ref = std::get_if<BoundColumnRef>(&op.order_by[i].key))
+                        out << columnName(*ref, relations);
+                    else out << expression(std::get<BoundExprPtr>(op.order_by[i].key), relations);
                     out << ' ' << (op.order_by[i].direction == SortDirection::Asc ? "ASC" : "DESC");
                 }
+                if (op.having) out << "; having=" << expression(op.having, relations);
+                if (op.distinct) out << "; DISTINCT";
+                if (op.limit) out << "; limit=" << *op.limit;
+                if (op.offset) out << "; offset=" << op.offset;
             } else if constexpr (std::is_same_v<T, SortPlan>) {
                 out << "Sort[";
                 for (std::size_t i = 0; i < op.items.size(); ++i) {
@@ -226,12 +278,25 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                     out << columnName(op.items[i].column, relations) << ' '
                         << (op.items[i].direction == SortDirection::Asc ? "ASC" : "DESC");
                 }
+                for (std::size_t i = 0; i < op.expression_items.size(); ++i) {
+                    if (i || !op.items.empty()) out << ", ";
+                    const auto& item = op.expression_items[i];
+                    if (const auto* ref = std::get_if<BoundColumnRef>(&item.key))
+                        out << columnName(*ref, relations);
+                    else out << expression(std::get<BoundExprPtr>(item.key), relations);
+                    out << ' ' << (item.direction == SortDirection::Asc ? "ASC" : "DESC");
+                }
             } else if constexpr (std::is_same_v<T, ProjectPlan>) {
                 out << "Project[";
-                for (std::size_t i = 0; i < op.columns.size(); ++i) {
+                const auto count = op.expressions.empty() ? op.columns.size() : op.expressions.size();
+                for (std::size_t i = 0; i < count; ++i) {
                     if (i) out << ", ";
-                    out << columnName(op.columns[i], relations);
+                    if (op.expressions.empty()) out << columnName(op.columns[i], relations);
+                    else out << expression(op.expressions[i], relations);
                 }
+                if (op.distinct) out << "; DISTINCT";
+                if (op.limit) out << "; limit=" << *op.limit;
+                if (op.offset) out << "; offset=" << op.offset;
             } else if constexpr (std::is_same_v<T, UpdatePlan>) {
                 out << "Update[" << tableName(op.table) << "; ";
                 for (std::size_t i = 0; i < op.assignments.size(); ++i) {

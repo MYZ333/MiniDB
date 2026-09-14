@@ -1,5 +1,5 @@
 // B：将 AST 的名称解析为具体表列，并为每个表达式推导类型。
-// 五类语句共享名字解析、表达式类型规则和 WHERE 检查。
+// 六类语句共享名字解析、表达式类型规则和布尔子句检查。
 #include "minisql/compiler.hpp"
 #include "type_rules.hpp"
 
@@ -62,6 +62,37 @@ bool sameColumn(const BoundColumnRef& left, const BoundColumnRef& right) {
 bool containsColumn(const std::vector<BoundColumnRef>& columns, const BoundColumnRef& target) {
     for (const auto& column : columns) if (sameColumn(column, target)) return true;
     return false;
+}
+
+bool containsAggregate(const BoundExprPtr& expression) {
+    if (!expression) return false;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, BoundAggregate>) return true;
+        else if constexpr (std::is_same_v<T, BoundUnary>) return containsAggregate(node.operand);
+        else if constexpr (std::is_same_v<T, BoundBinary>)
+            return containsAggregate(node.left) || containsAggregate(node.right);
+        else return false;
+    }, expression->node);
+}
+
+// 聚合函数之外出现的列必须由 GROUP BY 唯一确定。
+bool groupingCompatible(const BoundExprPtr& expression,
+                        const std::vector<BoundColumnRef>& group_by) {
+    if (!expression) return true;
+    return std::visit([&](const auto& node) -> bool {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, BoundColumnRef>) return containsColumn(group_by, node);
+        else if constexpr (std::is_same_v<T, BoundAggregate> || std::is_same_v<T, BoundLiteral>) return true;
+        else if constexpr (std::is_same_v<T, BoundUnary>) return groupingCompatible(node.operand, group_by);
+        else return groupingCompatible(node.left, group_by) && groupingCompatible(node.right, group_by);
+    }, expression->node);
+}
+
+std::size_t utf8Length(const std::string& value) {
+    std::size_t count = 0;
+    for (unsigned char byte : value) if ((byte & 0xc0u) != 0x80u) ++count;
+    return count;
 }
 
 // A 使用语法枚举，B 使用计划枚举；逐项映射，不依赖枚举整数值。
@@ -157,11 +188,8 @@ private:
         }
         std::unordered_set<std::string> names;
         std::vector<ColumnSpec> columns;
+        bool has_primary_key = false;
         for (const auto& column : stmt.columns) {
-            if (column.varchar_length || column.primary_key || column.not_null ||
-                column.unique || column.default_value)
-                return error(ErrorCode::UnsupportedFeature,
-                    "column length and constraints are not supported by execution yet", column.span);
             auto normalized = normalizeName(column.name.text);
             if (!names.insert(normalized).second) {
                 return error(ErrorCode::DuplicateColumn, "duplicate column '" + column.name.text + "'",
@@ -171,35 +199,67 @@ private:
                 return error(ErrorCode::UnsupportedType, "NULL is not a declarable column type",
                              location(column.span, location(column.name.span, statement_span_)));
             }
-            columns.push_back({std::move(normalized), column.type});
+            if (column.varchar_length &&
+                (column.type != DataType::Varchar || *column.varchar_length <= 0)) {
+                return error(ErrorCode::UnsupportedType,
+                    "VARCHAR length must be a positive integer", location(column.span, statement_span_));
+            }
+            if (column.primary_key && has_primary_key)
+                return error(ErrorCode::InvalidAst,
+                    "table may contain only one PRIMARY KEY column",
+                    location(column.span, statement_span_));
+            has_primary_key = has_primary_key || column.primary_key;
+            std::optional<ScalarValue> default_value;
+            if (column.default_value) {
+                const auto actual = literalType(column.default_value->value);
+                if ((column.not_null || column.primary_key) && actual == DataType::Null)
+                    return error(ErrorCode::TypeMismatch,
+                        "NOT NULL column cannot default to NULL", column.default_value->span);
+                if (actual != DataType::Null && actual != column.type)
+                    return error(ErrorCode::TypeMismatch,
+                        std::string("DEFAULT expects ") + typeName(column.type) + ", but " +
+                        typeName(actual) + " found", column.default_value->span);
+                if (column.varchar_length && actual == DataType::Varchar &&
+                    utf8Length(std::get<std::string>(column.default_value->value)) >
+                        static_cast<std::size_t>(*column.varchar_length))
+                    return error(ErrorCode::TypeMismatch,
+                        "DEFAULT exceeds VARCHAR length", column.default_value->span);
+                default_value = scalar(column.default_value->value);
+            }
+            columns.push_back({std::move(normalized), column.type, column.varchar_length,
+                               column.primary_key, column.not_null || column.primary_key,
+                               column.unique || column.primary_key, std::move(default_value)});
         }
         // 只有描述，没有注册动作，也不分配数据库 ID。
         return success(BoundCreateTable{normalizeName(stmt.table.text), std::move(columns)});
     }
 
     Result<BoundStatement> bindStatement(const DropTableStmt& stmt) {
-        // A 已能保存 DROP TABLE / IF EXISTS / 多表名；B 当前没有 BoundDropTable、
-        // DropPlan 或 Catalog 删除事务，先明确拒绝，避免调用方误以为已删除表。
-        const SourceLocation span = stmt.tables.empty()
-            ? statement_span_
-            : location(stmt.tables.front().span, statement_span_);
-        return error(ErrorCode::UnsupportedFeature,
-                     "DROP TABLE is not supported by semantic analysis yet",
-                     span);
+        if (stmt.tables.empty())
+            return error(ErrorCode::InvalidAst, "DROP TABLE requires at least one table", statement_span_);
+        std::unordered_set<std::string> seen;
+        std::vector<std::string> names;
+        for (const auto& table : stmt.tables) {
+            auto name = normalizeName(table.text);
+            if (!seen.insert(name).second)
+                return error(ErrorCode::DuplicateTable,
+                    "duplicate table '" + table.text + "' in DROP TABLE", table.span);
+            if (!stmt.if_exists && !catalog_.findTable(name))
+                return error(ErrorCode::TableNotFound,
+                    "table '" + table.text + "' does not exist", table.span);
+            names.push_back(std::move(name));
+        }
+        return success(BoundDropTable{std::move(names), stmt.if_exists});
     }
 
     Result<BoundStatement> bindStatement(const InsertStmt& stmt) {
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
         auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        if (stmt.rows.size() > 1) {
-            // A 已能保存 INSERT 多行；B 当前 BoundInsert/InsertPlan 仍是单行结构，
-            // 先明确拒绝，避免只绑定第一行造成静默丢数据。
-            return error(ErrorCode::UnsupportedFeature,
-                         "multi-row INSERT is not supported by semantic analysis yet",
-                         statement_span_);
-        }
-        const auto& input_values = stmt.rows.empty() ? stmt.values : stmt.rows.front();
+        const std::vector<std::vector<LocatedLiteral>> input_rows = stmt.rows.empty()
+            ? std::vector<std::vector<LocatedLiteral>>{stmt.values} : stmt.rows;
+        if (input_rows.empty())
+            return error(ErrorCode::ValueCountMismatch, "INSERT requires at least one row", statement_span_);
         std::vector<BoundColumnRef> targets;
         if (stmt.columns) {
             if (stmt.columns->empty()) {
@@ -221,67 +281,47 @@ private:
             for (std::size_t i = 0; i < table->columns.size(); ++i)
                 targets.push_back(columnRef(scope.front(), i));
         }
-        if (targets.size() != input_values.size()) {
-            return error(ErrorCode::ValueCountMismatch, "INSERT has " + std::to_string(targets.size()) +
-                " columns but " + std::to_string(input_values.size()) + " values", statement_span_);
-        }
-        if (targets.size() != table->columns.size()) {
-            return error(ErrorCode::MissingInsertColumn,
-                         "INSERT must provide all columns; DEFAULT is not supported", statement_span_);
-        }
-
-        // 确认完整覆盖后再分配输出，按 ordinal 写入而不是按 SQL 输入顺序追加。
-        std::vector<ScalarValue> values(table->columns.size());
-        for (std::size_t i = 0; i < targets.size(); ++i) {
-            const auto actual = literalType(input_values[i].value);
-            // 当前模式统一允许空值；NULL 没有自己的列类型，不参与普通表达式运算。
-            if (actual != DataType::Null && targets[i].type != actual) {
-                return error(ErrorCode::TypeMismatch,
-                    table->name + "." + table->columns[targets[i].ordinal].name + " expects " +
-                    typeName(targets[i].type) + ", but " + typeName(actual) + " found",
-                    location(input_values[i].span, statement_span_));
+        std::vector<std::vector<ScalarValue>> rows;
+        for (const auto& input_values : input_rows) {
+            if (targets.size() != input_values.size())
+                return error(ErrorCode::ValueCountMismatch,
+                    "INSERT has " + std::to_string(targets.size()) + " columns but " +
+                    std::to_string(input_values.size()) + " values", statement_span_);
+            std::vector<ScalarValue> values(table->columns.size(), NullValue{});
+            std::vector<bool> provided(table->columns.size(), false);
+            for (std::size_t i = 0; i < targets.size(); ++i) {
+                const auto ordinal = targets[i].ordinal;
+                const auto& field = table->columns[ordinal];
+                const auto actual = literalType(input_values[i].value);
+                if (actual == DataType::Null && field.not_null)
+                    return error(ErrorCode::TypeMismatch,
+                        table->name + "." + field.name + " does not allow NULL", input_values[i].span);
+                if (actual != DataType::Null && field.type != actual)
+                    return error(ErrorCode::TypeMismatch,
+                        table->name + "." + field.name + " expects " + typeName(field.type) +
+                        ", but " + typeName(actual) + " found", input_values[i].span);
+                if (field.varchar_length && actual == DataType::Varchar &&
+                    utf8Length(std::get<std::string>(input_values[i].value)) >
+                        static_cast<std::size_t>(*field.varchar_length))
+                    return error(ErrorCode::TypeMismatch,
+                        table->name + "." + field.name + " exceeds VARCHAR length", input_values[i].span);
+                values[ordinal] = scalar(input_values[i].value);
+                provided[ordinal] = true;
             }
-            values[targets[i].ordinal] = scalar(input_values[i].value);
+            for (std::size_t ordinal = 0; ordinal < table->columns.size(); ++ordinal) {
+                if (provided[ordinal]) continue;
+                const auto& field = table->columns[ordinal];
+                if (field.default_value) values[ordinal] = *field.default_value;
+                else if (field.not_null)
+                    return error(ErrorCode::MissingInsertColumn,
+                        "INSERT omits required column '" + field.name + "'", statement_span_);
+            }
+            rows.push_back(std::move(values));
         }
-        return success(BoundInsert{std::move(table), std::move(values)});
+        return success(BoundInsert{table, rows.front(), std::move(rows)});
     }
 
     Result<BoundStatement> bindStatement(const SelectStmt& stmt) {
-        // 括号包裹的单列/聚合在 A 中属于 ExprPtr；先归一化为已有绑定路径。
-        if (const auto* items = std::get_if<std::vector<SelectItem>>(&stmt.columns)) {
-            auto normalized = *items;
-            bool changed = false;
-            bool all_columns = true;
-            for (auto& item : normalized) {
-                if (const auto* expression = std::get_if<ExprPtr>(&item)) {
-                    if (!*expression)
-                        return error(ErrorCode::InvalidAst, "SELECT expression is missing", statement_span_);
-                    if (const auto* column = std::get_if<IdentifierExpr>(&(*expression)->node)) {
-                        item = column->name;
-                    } else if (const auto* aggregate = std::get_if<AggregateCall>(&(*expression)->node)) {
-                        item = *aggregate;
-                    } else {
-                        return error(ErrorCode::UnsupportedFeature,
-                            "SELECT computed expressions are not supported yet", (*expression)->span);
-                    }
-                    changed = true;
-                }
-                all_columns &= std::holds_alternative<Identifier>(item);
-            }
-            if (all_columns || changed) {
-                auto query = stmt;
-                if (all_columns) {
-                    std::vector<Identifier> names;
-                    for (const auto& item : normalized) names.push_back(std::get<Identifier>(item));
-                    query.columns = std::move(names);
-                } else query.columns = std::move(normalized);
-                return bindStatement(query);
-            }
-        }
-        // 不能丢弃 A 新增而执行层尚未实现的标记，否则会悄悄改变 SQL 含义。
-        if (stmt.distinct || stmt.having || stmt.limit || stmt.offset)
-            return error(ErrorCode::UnsupportedFeature,
-                "DISTINCT, HAVING and LIMIT/OFFSET are not supported by execution yet", statement_span_);
         if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
             return error(ErrorCode::InvalidAst, "table alias must be a simple identifier",
                          location(stmt.table_alias->span, statement_span_));
@@ -293,8 +333,6 @@ private:
         BindingScope scope{{table, relation_name, 1}};
         std::vector<BoundJoin> joins;
         for (const auto& join : stmt.joins) {
-            if (join.type != JoinType::Inner)
-                return error(ErrorCode::UnsupportedFeature, "outer JOIN is not supported yet", join.span);
             if (join.alias && join.alias->text.find('.') != std::string::npos)
                 return error(ErrorCode::InvalidAst, "JOIN alias must be a simple identifier",
                              location(join.alias->span, location(join.span, statement_span_)));
@@ -316,13 +354,14 @@ private:
             auto condition = bindBoolean(join.on, scope, "JOIN ON", ErrorCode::JoinConditionNotBoolean);
             if (const auto* failure = std::get_if<Diagnostic>(&condition)) return *failure;
             joins.push_back({std::move(joined), std::get<BoundExprPtr>(std::move(condition)),
-                             joined_name, relation_id});
+                             joined_name, relation_id, join.type});
         }
+
         std::vector<BoundColumnRef> columns;
+        std::vector<BoundExprPtr> projection_expressions;
         std::vector<std::string> output_names;
-        std::vector<std::pair<std::string, BoundColumnRef>> output_aliases;
+        std::vector<std::pair<std::string, std::size_t>> output_aliases;
         std::vector<BoundAggregateItem> aggregate_items;
-        std::vector<std::pair<std::string, std::size_t>> aggregate_aliases;
         if (std::holds_alternative<AllColumns>(stmt.columns)) {
             if (!stmt.column_aliases.empty())
                 return error(ErrorCode::InvalidAst,
@@ -353,7 +392,7 @@ private:
                             location(stmt.column_aliases[i]->span, statement_span_));
                     auto alias = normalizeName(stmt.column_aliases[i]->text);
                     output_names.push_back(alias);
-                    output_aliases.push_back({std::move(alias), ref});
+                    output_aliases.push_back({std::move(alias), i});
                 } else {
                     output_names.push_back(
                         scope[ref.relation_id - 1].table->columns[ref.ordinal].name);
@@ -366,48 +405,41 @@ private:
             if (!stmt.column_aliases.empty() && stmt.column_aliases.size() != items.size())
                 return error(ErrorCode::InvalidAst,
                              "SELECT aliases must match selected items", statement_span_);
-            for (const auto& item : items) {
-                const std::size_t output_ordinal = aggregate_items.size();
+            for (std::size_t output_ordinal = 0; output_ordinal < items.size(); ++output_ordinal) {
+                const auto& item = items[output_ordinal];
                 std::string default_name;
+                BoundExprPtr expression;
                 if (const auto* name = std::get_if<Identifier>(&item)) {
                     auto resolved = resolveColumn(*name, scope, statement_span_);
                     if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
                     auto ref = std::get<BoundColumnRef>(resolved);
                     columns.push_back(ref);
-                    aggregate_items.push_back({ref});
+                    expression = std::make_shared<const BoundExpr>(BoundExpr{ref, ref.type, name->span});
                     default_name = scope[ref.relation_id - 1].table->columns[ref.ordinal].name;
+                } else if (const auto* call = std::get_if<AggregateCall>(&item)) {
+                    auto source = std::make_shared<const Expr>(Expr{*call, call->span});
+                    auto bound = bindExpr(source, scope, 0, statement_span_, true);
+                    if (const auto* failure = std::get_if<Diagnostic>(&bound)) return *failure;
+                    expression = std::get<BoundExprPtr>(std::move(bound));
+                    const auto& aggregate = std::get<BoundAggregate>(expression->node);
+                    default_name = aggregateName(aggregate.kind) + std::string{"("} +
+                        (aggregate.argument ? scope[aggregate.argument->relation_id - 1]
+                            .table->columns[aggregate.argument->ordinal].name : "*") + ")";
                 } else {
-                    const auto& call = std::get<AggregateCall>(item);
-                    const auto kind = aggregateKind(call.function);
-                    if (!kind) {
-                        return error(ErrorCode::UnsupportedFeature,
-                            "unsupported aggregate function", location(call.span, statement_span_));
-                    }
-                    std::optional<BoundColumnRef> argument;
-                    const auto* argument_name = std::get_if<Identifier>(&call.argument);
-                    const bool count_star = !argument_name;
-                    if (argument_name) {
-                        auto resolved = resolveColumn(*argument_name, scope, call.span);
-                        if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
-                        argument = std::get<BoundColumnRef>(resolved);
-                    }
-                    if (count_star && *kind != AggregateKind::Count)
-                        return error(ErrorCode::InvalidOperandType,
-                            aggregateName(*kind) + " does not accept '*'", location(call.span, statement_span_));
-                    DataType result_type = DataType::Int;
-                    if (*kind == AggregateKind::Avg) result_type = DataType::Float;
-                    else if (*kind != AggregateKind::Count) result_type = argument->type;
-                    if ((*kind == AggregateKind::Sum || *kind == AggregateKind::Avg) &&
-                        argument->type != DataType::Int && argument->type != DataType::Float) {
-                        return error(ErrorCode::InvalidOperandType,
-                            aggregateName(*kind) + " expects an INT or FLOAT column",
-                            location(argument_name->span, location(call.span, statement_span_)));
-                    }
-                    aggregate_items.push_back({BoundAggregate{*kind, argument, result_type,
-                                                              location(call.span, statement_span_)}});
-                    default_name = aggregateName(*kind) + "(" +
-                        (count_star ? "*" : normalizeName(argument_name->text)) + ")";
+                    const auto& source = std::get<ExprPtr>(item);
+                    auto bound = bindExpr(source, scope, 0, statement_span_, true);
+                    if (const auto* failure = std::get_if<Diagnostic>(&bound)) return *failure;
+                    expression = std::get<BoundExprPtr>(std::move(bound));
+                    // 括号只改变解析路径，不应把 `(age)` 或 `(COUNT(*))` 的默认列名变成 exprN。
+                    if (const auto* ref = std::get_if<BoundColumnRef>(&expression->node)) {
+                        default_name = scope[ref->relation_id - 1].table->columns[ref->ordinal].name;
+                    } else if (const auto* aggregate = std::get_if<BoundAggregate>(&expression->node)) {
+                        default_name = aggregateName(aggregate->kind) + std::string{"("} +
+                            (aggregate->argument ? scope[aggregate->argument->relation_id - 1]
+                                .table->columns[aggregate->argument->ordinal].name : "*") + ")";
+                    } else default_name = "expr" + std::to_string(output_ordinal + 1);
                 }
+                projection_expressions.push_back(expression);
                 const auto alias_name = stmt.column_aliases.empty()
                     ? std::optional<Identifier>{} : stmt.column_aliases[output_ordinal];
                 if (alias_name) {
@@ -416,7 +448,7 @@ private:
                                      location(alias_name->span, statement_span_));
                     auto alias = normalizeName(alias_name->text);
                     output_names.push_back(alias);
-                    aggregate_aliases.push_back({std::move(alias), output_ordinal});
+                    output_aliases.push_back({std::move(alias), output_ordinal});
                 } else output_names.push_back(std::move(default_name));
             }
         }
@@ -435,40 +467,43 @@ private:
             }
             group_by.push_back(ref);
         }
-        if (!aggregate_items.empty()) {
-            for (const auto& item : aggregate_items) {
-                if (const auto* ref = std::get_if<BoundColumnRef>(&item.value)) {
-                    if (!containsColumn(group_by, *ref)) {
-                        return error(ErrorCode::InvalidGrouping,
-                            "a selected non-aggregate column must occur in GROUP BY", statement_span_);
-                    }
-                }
-            }
-        } else if (!group_by.empty()) {
-            for (const auto& column : columns) {
-                if (!containsColumn(group_by, column)) {
-                    return error(ErrorCode::InvalidGrouping,
-                        "every selected non-aggregate column must occur in GROUP BY",
-                        statement_span_);
-                }
-            }
+        BoundExprPtr having;
+        if (stmt.having) {
+            auto result = bindBoolean(stmt.having, scope, "HAVING",
+                                      ErrorCode::WhereNotBoolean, true);
+            if (const auto* failure = std::get_if<Diagnostic>(&result)) return *failure;
+            having = std::get<BoundExprPtr>(std::move(result));
         }
 
+        struct PendingOrder {
+            std::optional<std::size_t> output_ordinal;
+            BoundExprPtr expression;
+            SortDirection direction;
+            SourceLocation span;
+        };
+        std::vector<PendingOrder> pending_order;
+        bool aggregate_query = having && containsAggregate(having);
+        for (const auto& expression : projection_expressions)
+            aggregate_query = aggregate_query || containsAggregate(expression);
+        // 旧列清单没有 BoundExpr；在需要统一处理时按列引用构造只读表达式。
+        auto projectedExpression = [&](std::size_t ordinal) -> BoundExprPtr {
+            if (!projection_expressions.empty()) return projection_expressions[ordinal];
+            const auto& ref = columns[ordinal];
+            return std::make_shared<const BoundExpr>(BoundExpr{ref, ref.type, statement_span_});
+        };
         std::vector<BoundOrderBy> order_by;
         std::vector<BoundAggregateOrder> aggregate_order_by;
         for (const auto& item : stmt.order_by) {
+            PendingOrder pending{std::nullopt, nullptr, item.direction, item.span};
             if (item.expression) {
-                // A 已能保存 ORDER BY 表达式；B 当前 SortPlan 只接受 BoundColumnRef，
-                // 先明确拒绝，避免继续按旧 column 字段绑定出误导性错误。
-                return error(ErrorCode::UnsupportedFeature,
-                             "ORDER BY expressions are not supported by semantic analysis yet",
-                             location(item.expression->span, item.span));
-            }
-            if (!aggregate_items.empty()) {
+                auto bound = bindExpr(item.expression, scope, 0, item.span, true);
+                if (const auto* failure = std::get_if<Diagnostic>(&bound)) return *failure;
+                pending.expression = std::get<BoundExprPtr>(std::move(bound));
+            } else {
                 std::optional<std::size_t> alias_match;
                 const auto order_name = normalizeName(item.column.text);
                 if (order_name.find('.') == std::string::npos) {
-                    for (const auto& alias : aggregate_aliases) {
+                    for (const auto& alias : output_aliases) {
                         if (alias.first != order_name) continue;
                         if (alias_match) {
                             return error(ErrorCode::AmbiguousColumn,
@@ -479,53 +514,89 @@ private:
                     }
                 }
                 if (alias_match) {
-                    aggregate_order_by.push_back({*alias_match, item.direction});
-                    continue;
+                    pending.output_ordinal = *alias_match;
+                } else {
+                    auto resolved = resolveColumn(item.column, scope, item.span);
+                    if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
+                    auto ref = std::get<BoundColumnRef>(resolved);
+                    pending.expression = std::make_shared<const BoundExpr>(
+                        BoundExpr{ref, ref.type, item.column.span});
                 }
-                auto resolved = resolveColumn(item.column, scope, item.span);
-                if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
-                auto ref = std::get<BoundColumnRef>(resolved);
-                if (!containsColumn(group_by, ref)) {
+            }
+            if (pending.expression) aggregate_query = aggregate_query || containsAggregate(pending.expression);
+            pending_order.push_back(std::move(pending));
+        }
+
+        if (having) aggregate_query = true; // HAVING always runs after forming groups.
+        std::vector<BoundExpressionOrder> expression_order_by;
+        if (aggregate_query) {
+            std::vector<BoundExprPtr> selected;
+            if (!projection_expressions.empty()) selected = projection_expressions;
+            else for (std::size_t i = 0; i < columns.size(); ++i) selected.push_back(projectedExpression(i));
+            for (const auto& expression : selected) {
+                if (!groupingCompatible(expression, group_by))
                     return error(ErrorCode::InvalidGrouping,
-                        "ORDER BY source column must occur in GROUP BY in an aggregate query",
-                        location(item.column.span, item.span));
-                }
-                aggregate_order_by.push_back({ref, item.direction});
-                continue;
+                        "non-aggregate SELECT columns must occur in GROUP BY", expression->span);
+                if (const auto* ref = std::get_if<BoundColumnRef>(&expression->node))
+                    aggregate_items.push_back({*ref});
+                else if (const auto* aggregate = std::get_if<BoundAggregate>(&expression->node))
+                    aggregate_items.push_back({*aggregate});
+                else aggregate_items.push_back({expression});
             }
-            std::optional<BoundColumnRef> alias_match;
-            const auto order_name = normalizeName(item.column.text);
-            if (order_name.find('.') == std::string::npos) {
-                for (const auto& alias : output_aliases) {
-                    if (alias.first != order_name) continue;
-                    if (alias_match) {
-                        return error(ErrorCode::AmbiguousColumn,
-                            "ORDER BY alias '" + item.column.text + "' is ambiguous",
-                            location(item.column.span, item.span));
-                    }
-                    alias_match = alias.second;
-                }
-            }
-            BoundColumnRef ref;
-            if (alias_match) {
-                ref = *alias_match;
-            } else {
-                auto resolved = resolveColumn(item.column, scope, item.span);
-                if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
-                ref = std::get<BoundColumnRef>(resolved);
-            }
-            if (!group_by.empty() && !containsColumn(group_by, ref)) {
+            if (!groupingCompatible(having, group_by))
                 return error(ErrorCode::InvalidGrouping,
-                    "ORDER BY column must occur in GROUP BY in a grouped query",
-                    location(item.column.span, item.span));
+                    "non-aggregate HAVING columns must occur in GROUP BY", having->span);
+            for (const auto& pending : pending_order) {
+                if (pending.output_ordinal) {
+                    aggregate_order_by.push_back({*pending.output_ordinal, pending.direction});
+                } else {
+                    if (!groupingCompatible(pending.expression, group_by))
+                        return error(ErrorCode::InvalidGrouping,
+                            "non-aggregate ORDER BY columns must occur in GROUP BY", pending.span);
+                    if (const auto* ref = std::get_if<BoundColumnRef>(&pending.expression->node))
+                        aggregate_order_by.push_back({*ref, pending.direction});
+                    else aggregate_order_by.push_back({pending.expression, pending.direction});
+                }
             }
-            order_by.push_back({ref, item.direction});
+        } else {
+            if (!group_by.empty()) {
+                if (!projection_expressions.empty()) {
+                    for (const auto& expression : projection_expressions)
+                        if (!groupingCompatible(expression, group_by))
+                            return error(ErrorCode::InvalidGrouping,
+                                "SELECT expression columns must occur in GROUP BY", expression->span);
+                } else for (const auto& column : columns)
+                    if (!containsColumn(group_by, column))
+                        return error(ErrorCode::InvalidGrouping,
+                            "every selected column must occur in GROUP BY", statement_span_);
+            }
+            bool simple_order = projection_expressions.empty();
+            for (const auto& pending : pending_order) {
+                auto expression = pending.output_ordinal
+                    ? projectedExpression(*pending.output_ordinal) : pending.expression;
+                if (!group_by.empty() && !groupingCompatible(expression, group_by))
+                    return error(ErrorCode::InvalidGrouping,
+                        "ORDER BY expression columns must occur in GROUP BY", pending.span);
+                if (simple_order) {
+                    if (const auto* ref = std::get_if<BoundColumnRef>(&expression->node)) {
+                        order_by.push_back({*ref, pending.direction});
+                        continue;
+                    }
+                    simple_order = false;
+                    for (const auto& old : order_by) expression_order_by.push_back({old.column, old.direction});
+                    order_by.clear();
+                }
+                expression_order_by.push_back({expression, pending.direction});
+            }
         }
         return success(BoundSelect{std::move(table), std::move(columns),
                                    std::get<BoundExprPtr>(std::move(predicate)),
                                    std::move(joins), std::move(group_by), std::move(order_by),
                                    relation_name, 1, std::move(output_names),
-                                   std::move(aggregate_items), std::move(aggregate_order_by)});
+                                   std::move(aggregate_items), std::move(aggregate_order_by),
+                                   std::move(projection_expressions),
+                                   std::move(expression_order_by), std::move(having), stmt.distinct,
+                                   stmt.limit, stmt.offset.value_or(0)});
     }
 
     Result<BoundStatement> bindStatement(const UpdateStmt& stmt) {
@@ -556,9 +627,14 @@ private:
             auto expression = bindExpr(assignment.value, scope, 0, span);
             if (const auto* failure = std::get_if<Diagnostic>(&expression)) return *failure;
             auto rhs = std::get<BoundExprPtr>(std::move(expression));
-            if (rhs->type != target.type) {
+            const auto& target_column = table->columns[target.ordinal];
+            if (rhs->type == DataType::Null && target_column.not_null) {
                 return error(ErrorCode::TypeMismatch,
-                    table->name + "." + table->columns[target.ordinal].name + " expects " +
+                    table->name + "." + target_column.name + " does not allow NULL", rhs->span);
+            }
+            if (rhs->type != DataType::Null && rhs->type != target.type) {
+                return error(ErrorCode::TypeMismatch,
+                    table->name + "." + target_column.name + " expects " +
                     typeName(target.type) + ", but " + typeName(rhs->type) + " found", rhs->span);
             }
             assignments.push_back({target, std::move(rhs)});
@@ -585,10 +661,11 @@ private:
 
     // SELECT/UPDATE/DELETE 共用：没有 WHERE 合法；有条件则必须推导为 BOOL。
     Result<BoundExprPtr> bindBoolean(const ExprPtr& expression, const BindingScope& scope,
-                                    const char* clause, ErrorCode type_error) {
+                                    const char* clause, ErrorCode type_error,
+                                    bool allow_aggregate = false) {
         if (!expression) return error(ErrorCode::InvalidAst,
                                       std::string(clause) + " requires an expression", statement_span_);
-        auto result = bindExpr(expression, scope, 0, statement_span_);
+        auto result = bindExpr(expression, scope, 0, statement_span_, allow_aggregate);
         if (const auto* failure = std::get_if<Diagnostic>(&result)) return *failure;
         auto predicate = std::get<BoundExprPtr>(std::move(result));
         if (predicate->type != DataType::Bool) {
@@ -604,7 +681,8 @@ private:
     }
 
     Result<BoundExprPtr> bindExpr(const ExprPtr& expr, const BindingScope& scope,
-                                 std::size_t depth, SourceLocation fallback) {
+                                 std::size_t depth, SourceLocation fallback,
+                                 bool allow_aggregate = false) {
         if (!expr) return error(ErrorCode::InvalidAst, "required expression child is missing", fallback);
         const auto span = location(expr->span, fallback);
         // 手工 AST 也可能过深；限制递归深度，不让非法输入耗尽 C++ 调用栈。
@@ -622,7 +700,7 @@ private:
                     BoundLiteral{scalar(node.value)}, literalType(node.value), span});
             } else if constexpr (std::is_same_v<T, UnaryExpr>) {
                 const auto op_span = location(node.operator_span, span);
-                auto operand = bindExpr(node.operand, scope, depth + 1, op_span);
+                auto operand = bindExpr(node.operand, scope, depth + 1, op_span, allow_aggregate);
                 if (const auto* failure = std::get_if<Diagnostic>(&operand)) return *failure;
                 auto child = std::get<BoundExprPtr>(std::move(operand));
                 auto type = unaryResult(node.op, child->type);
@@ -631,19 +709,35 @@ private:
                 return std::make_shared<const BoundExpr>(BoundExpr{
                     BoundUnary{node.op, child, op_span}, *type, span});
             } else if constexpr (std::is_same_v<T, AggregateCall>) {
-                // B 支持 SELECT 顶层聚合；普通表达式中的聚合仍需单独的表达式计划，
-                // 先明确拒绝，避免把 AggregateCall 误当 BinaryExpr 访问 left/right。
-                return error(ErrorCode::UnsupportedFeature,
-                             "aggregate expressions are not supported by semantic analysis yet",
-                             span);
+                if (!allow_aggregate)
+                    return error(ErrorCode::InvalidGrouping,
+                        "aggregate functions are only allowed in SELECT, HAVING and ORDER BY", span);
+                const auto kind = aggregateKind(node.function);
+                if (!kind)
+                    return error(ErrorCode::UnsupportedFeature, "aggregate function is not supported", span);
+                std::optional<BoundColumnRef> argument;
+                if (const auto* name = std::get_if<Identifier>(&node.argument)) {
+                    auto resolved = resolveColumn(*name, scope, span);
+                    if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
+                    argument = std::get<BoundColumnRef>(resolved);
+                } else if (*kind != AggregateKind::Count) {
+                    return error(ErrorCode::InvalidOperandType,
+                        aggregateName(*kind) + " does not accept '*'", span);
+                }
+                DataType result_type = DataType::Int;
+                if (*kind == AggregateKind::Avg) result_type = DataType::Float;
+                else if (*kind != AggregateKind::Count) result_type = argument->type;
+                if ((*kind == AggregateKind::Sum || *kind == AggregateKind::Avg) &&
+                    argument->type != DataType::Int && argument->type != DataType::Float)
+                    return error(ErrorCode::InvalidOperandType,
+                        aggregateName(*kind) + " expects an INT or FLOAT column", span);
+                BoundAggregate aggregate{*kind, argument, result_type, span};
+                return std::make_shared<const BoundExpr>(BoundExpr{aggregate, result_type, span});
             } else {
-                if (node.op == BinaryOp::Like)
-                    return error(ErrorCode::UnsupportedFeature, "LIKE is not supported by execution yet",
-                                 location(node.operator_span, span));
                 const auto op_span = location(node.operator_span, span);
-                auto left = bindExpr(node.left, scope, depth + 1, op_span);
+                auto left = bindExpr(node.left, scope, depth + 1, op_span, allow_aggregate);
                 if (const auto* failure = std::get_if<Diagnostic>(&left)) return *failure;
-                auto right = bindExpr(node.right, scope, depth + 1, op_span);
+                auto right = bindExpr(node.right, scope, depth + 1, op_span, allow_aggregate);
                 if (const auto* failure = std::get_if<Diagnostic>(&right)) return *failure;
                 auto lhs = std::get<BoundExprPtr>(std::move(left));
                 auto rhs = std::get<BoundExprPtr>(std::move(right));

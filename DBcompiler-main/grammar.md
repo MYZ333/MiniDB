@@ -1,8 +1,8 @@
-# MiniSQL 文法（接口版本 0.22）
+# MiniSQL 文法（接口版本 0.23）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 已整合 feature-zhangbo 的语法扩展与 B 的聚合实现。下列 EBNF 描述 A 能解析的范围，
-第 3 节区分完整执行支持和仅解析支持，调用方应以第 3 节作为可执行 SQL 的依据。
+第 3 节记录完整执行边界，调用方应以该节作为可执行 SQL 的依据。
 
 ## 1. 词法约定
 
@@ -19,7 +19,7 @@
 - 跳过空白、`--` 行注释和不嵌套的 `/* ... */` 块注释。
 - 支持运算符 `= != <> < <= > >= + - * /`；不支持 `==`。
 - 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、INNER/LEFT/RIGHT/FULL OUTER JOIN、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN 和 COUNT/SUM/AVG/MIN/MAX 关键字。
-- INSERT 值位置不支持 `DEFAULT` 关键字。DROP TABLE、外连接和多行 INSERT 仅支持解析，B 返回 UnsupportedFeature。
+- INSERT 值位置不支持 `DEFAULT` 关键字；省略列时由 B 写入列 DEFAULT 或 NULL。
 - COUNT/SUM/AVG/MIN/MAX 由 A 识别为关键字，不能再作为未加引号的普通表名、列名或别名。
 - 每条语句必须以分号结束；空输入合法；单独的空分号不是语句。
 - 源码位置：字节偏移从 0 开始，行列从 1 开始；列也按字节计算。
@@ -105,21 +105,23 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 | COUNT/SUM/AVG/MIN/MAX 顶层 SELECT 项（可带括号） | 支持 | 支持 |
 | <>、BETWEEN/NOT BETWEEN、字面量 IN/NOT IN | 支持 | 复用已有比较与逻辑表达式；受既有类型和 NULL 限制 |
 | IS NULL / IS NOT NULL | 支持 | 支持，任意类型及 NULL 字面量均返回 BOOL |
-| DISTINCT、HAVING、LIMIT/OFFSET、外连接 | 支持 | UnsupportedFeature |
-| SELECT 计算表达式、聚合结果算术、ORDER BY 表达式 | 支持 | UnsupportedFeature；SELECT 括号包裹单列/聚合除外 |
-| LIKE/NOT LIKE、VARCHAR(n)、列级约束和 DEFAULT | 支持 | UnsupportedFeature |
-| 多行 INSERT、DROP TABLE | 支持 | UnsupportedFeature |
+| DISTINCT、HAVING、LIMIT/OFFSET、LEFT/RIGHT/FULL JOIN | 支持 | 支持 |
+| SELECT 计算表达式、聚合结果算术、ORDER BY 表达式 | 支持 | 支持 |
+| LIKE/NOT LIKE、VARCHAR(n)、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT | 支持 | 支持 |
+| 多行 INSERT、DROP TABLE（含 IF EXISTS 和多表名） | 支持 | 支持 |
 
-B 对未支持的标记在生成计划前明确拒绝，不会忽略 LIMIT、把外连接当内连接执行，
-也不会只插入多行 INSERT 的第一行或丢弃建表约束。零值 LIMIT/OFFSET 同样检查。
+B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划再把它们传给 Java。
+因此 LIMIT 不会被忽略，外连接不会退化为内连接，多行 INSERT 和建表约束也不会丢失。
 
 - INT 使用 int64_t，FLOAT 使用 double，VARCHAR 使用 std::string，BOOL 使用 bool。
   CREATE 至少一列，表名和列名不得重复，编译不修改 Catalog。
-- INSERT 当前执行单行字面量，必须覆盖所有列；允许重排列顺序，NULL 可写入任意列。
-  A 的 rows 保存所有行且 values 保存首行用于源码兼容；B 优先读取 rows，超过一行拒绝。
+- INSERT 可一次绑定和执行多行，显式列允许重排。省略的列依次使用 DEFAULT、NULL；
+  NOT NULL/PRIMARY KEY 列既无输入又无 DEFAULT 时报告 MissingInsertColumn。
+  A 的 rows 保存所有行且 values 保存首行用于源码兼容；B 和执行层以 rows 为准并原子检查整批约束。
 - SELECT 保留输出顺序和重复项。星号按 FROM、各 JOIN 表和表内模式顺序展开。
   含表达式或聚合的清单使用 vector<SelectItem>，别名平行保存在 column_aliases。
-- JOIN 按 SQL 顺序构造左深内连接树，ON 必须为 BOOL。声明表别名后应使用别名限定列；
+- JOIN 按 SQL 顺序构造左深连接树，ON 必须为 BOOL。INNER/LEFT/RIGHT/FULL 均保留连接类型，
+  外连接未匹配侧按固定输入布局补 NULL。声明表别名后应使用别名限定列；
   自连接的不同扫描使用不同 relation_id。可见关系名不得重复，非限定列有歧义时报错。
 - 无聚合函数时 GROUP BY 按键去重；有聚合时计算每组聚合值。普通投影列必须属于分组键，
   分组键不能重复，两个 NULL 键归为同组。无 GROUP BY 的聚合查询不能混入普通列。
@@ -129,8 +131,10 @@ B 对未支持的标记在生成计划前明确拒绝，不会忽略 LIMIT、把
   全表空输入聚合仍输出一行，有 GROUP BY 的空输入输出零行。
 - SUM(INT) 检查 64 位溢出；FLOAT 累加产生非有限值时报 FloatOverflow。
   AVG 使用 double 累加再除以非 NULL 数量，有浮点舍入误差，累加溢出也报 FloatOverflow。
-- ORDER BY 允许隐藏源列；聚合/分组查询中隐藏列须是分组键，亦可引用唯一输出别名。
-  聚合结果请使用 SELECT 别名排序，直接 ORDER BY SUM(amount) 当前仍返回 UnsupportedFeature。
+- HAVING 在分组形成后求值，可包含聚合表达式；结果只有 TRUE 的分组被保留。
+  SELECT 和 ORDER BY 可以把聚合调用作为表达式叶节点，例如 `SUM(amount)+1`。
+- ORDER BY 允许隐藏源列、计算表达式；聚合/分组查询中聚合外的列须是分组键，
+  亦可引用唯一输出别名或直接使用 `ORDER BY SUM(amount)`。
   多键按书写顺序比较，ASC NULL 最后，DESC NULL 最前，同值行最终顺序未定义。
   INT/FLOAT 按数值比较，VARCHAR 按 UTF-8 字节，BOOL 为 FALSE 小于 TRUE。
   WHERE、ON、GROUP BY 不能引用 SELECT 输出别名。
@@ -138,9 +142,16 @@ B 对未支持的标记在生成计划前明确拒绝，不会忽略 LIMIT、把
   替代物理表名参与限定列解析，行标识与存储身份保持不变；省略 WHERE 影响全部行。
 - INT/FLOAT 支持同类型算术与比较，不做隐式转换；VARCHAR/BOOL 支持等于和不等于。
   BETWEEN 展开为比较与 AND，IN 展开为等值与 OR，NOT 版本再包裹 NOT。
-  NULL 三值逻辑尚未实现：NULL 字面量参与普通运算会被拒绝，nullable 列参与普通比较
-  仍遵循旧执行行为；不能把 IN/NOT IN 在 NULL 上解释为标准三值逻辑。
-  检查空值请使用 IS NULL/IS NOT NULL；这两个运算不会把 NULL 转为数字或布尔值。
+- LIKE 的两个操作数必须是 VARCHAR；`%` 匹配任意 Unicode 码点序列，`_` 匹配一个码点，
+  当前文法没有 ESCAPE 子句。NOT LIKE 由 NOT 包裹 LIKE 实现。
+- 执行表达式用 Java null 表示 SQL UNKNOWN：普通算术、比较和 LIKE 任一操作数为 NULL 时返回 NULL，
+  AND/OR/NOT 使用三值逻辑，WHERE/ON/HAVING 只保留 TRUE。NULL 字面量在编译期仍不能直接参与
+  需要确定同类型操作数的普通运算；检查空值使用 IS NULL/IS NOT NULL。
+- DISTINCT 在最终投影后去重，两个相同位置的 NULL 视为相等；随后应用 OFFSET/LIMIT。
+- VARCHAR(n) 按 Unicode 码点数限制。PRIMARY KEY 等价于 NOT NULL + UNIQUE，一张表只允许一个；
+  UNIQUE 允许多个 NULL。INSERT 与 UPDATE 在写入前针对最终表状态检查，失败不留下部分写入。
+- DROP TABLE 可带多个名字。无 IF EXISTS 时先验证全部表再删除；IF EXISTS 忽略缺失表。
+  至少删除一张表时 CatalogVersion 只增加一次，存储中的记录随表删除。
 - WHERE/ON 必须为 BOOL；AND/OR 从左到右短路。优化不得吞掉可达的除零、溢出或其源码位置。
   整数除法向零截断。聚合 DISTINCT、COUNT(1)、聚合参数算术和嵌套调用仍不在 A 的文法中。
 
@@ -155,27 +166,25 @@ Parser 在构造 AST 时执行同一高度限制，另限制括号/NOT/负号递
 可完整执行的示例：
 
 ```sql
-CREATE TABLE student(id INT, name VARCHAR, age INT);
-INSERT INTO student VALUES (1, 'Alice', 20);
-INSERT INTO student VALUES (2, 'Bob', NULL);
+CREATE TABLE student(id INT PRIMARY KEY, name VARCHAR(20) UNIQUE, age INT DEFAULT 18);
+INSERT INTO student(id, name) VALUES (1, 'Alice'), (2, 'Bob');
 UPDATE student s SET s.age=s.age+1 WHERE s.id=1;
 SELECT name FROM student WHERE age IS NULL;
 SELECT (COUNT(*)) AS rows, SUM(age) AS total FROM student;
-SELECT age, COUNT(*) AS rows FROM student GROUP BY age ORDER BY rows DESC;
-SELECT s.name FROM student s INNER JOIN student t ON s.id=t.id WHERE s.id IN (1,2);
+SELECT age, COUNT(*) AS rows, SUM(id)+1 FROM student
+  GROUP BY age HAVING COUNT(*)>0 ORDER BY SUM(id) DESC LIMIT 10;
+SELECT DISTINCT s.name FROM student s LEFT JOIN student t ON s.id=t.id
+  WHERE s.name LIKE 'A%' ORDER BY s.age+1;
 DELETE FROM student s WHERE s.id <> 1;
+DROP TABLE IF EXISTS student;
 ```
 
-下列可解析，但编译执行时明确返回 UnsupportedFeature：
+当前文法之外的示例：
 
 ```sql
-SELECT DISTINCT age FROM student;
-SELECT COUNT(*) FROM student HAVING COUNT(*) > 1;
-SELECT * FROM student LIMIT 0;
-SELECT age+1 FROM student;
-CREATE TABLE account(id INT PRIMARY KEY, name VARCHAR(20));
-INSERT INTO student VALUES (3,'c',20),(4,'d',21);
-DROP TABLE IF EXISTS student;
+SELECT COUNT(DISTINCT age) FROM student; -- 聚合函数内部 DISTINCT 尚未定义
+INSERT INTO student VALUES (DEFAULT, 'Carol', 20); -- 值位置 DEFAULT 尚未定义
+SELECT * FROM student OFFSET 2; -- OFFSET 当前必须跟在 LIMIT 后
 ```
 
 预期结构见 `docs/interfaces.md` 和 `examples/contracts.cpp`。
@@ -207,3 +216,5 @@ DROP TABLE IF EXISTS student;
 - 优化进度：A 提供展示用 AST 优化；B 提供绑定后计划优化，两者接口分离。
 
 - 0.22：整合 A 0.7–0.21 与 B 聚合分支（原 B 文法 0.7）。统一新 SelectItem/聚合 AST，保留聚合执行，接通 IS NULL 与 DML 别名，显式拒绝仅解析扩展。
+- 0.23：B 完成 A 侧剩余扩展：计算/聚合表达式、表达式排序、HAVING、DISTINCT、LIMIT/OFFSET、
+  LIKE、外连接、多行 INSERT、DROP TABLE，以及 VARCHAR 长度和列约束；同步扩展 JSON 与 Java 执行层。

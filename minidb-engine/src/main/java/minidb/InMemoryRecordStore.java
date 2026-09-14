@@ -14,6 +14,11 @@ public final class InMemoryRecordStore implements RecordStore {
         if (rows.putIfAbsent(schema.id(), new ArrayList<>()) != null) throw new EngineException("StorageFailure", "record table already exists");
         nextRowId.put(schema.id(), 1L);
     }
+    public void dropTable(long tableId) {
+        if (rows.remove(tableId) == null)
+            throw new EngineException("StorageFailure", "record table not found: " + tableId);
+        nextRowId.remove(tableId);
+    }
     public long insert(long tableId, List<Object> values) {
         List<DatabaseEngine.StoredRow> table = table(tableId); long rowId = nextRowId.compute(tableId, (id, old) -> old + 1) - 1;
         table.add(new DatabaseEngine.StoredRow(rowId, new ArrayList<>(values))); return rowId;

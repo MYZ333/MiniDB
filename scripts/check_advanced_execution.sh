@@ -34,6 +34,15 @@ sources=(
 "$build_dir/minisql_plan_json" \
     < "$engine_dir/src/test/resources/aggregate-overflow.sql" \
     > "$engine_dir/target/aggregate-overflow-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/remaining-features.sql" \
+    > "$engine_dir/target/remaining-features-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/constraint-unique.sql" \
+    > "$engine_dir/target/constraint-unique-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/constraint-update.sql" \
+    > "$engine_dir/target/constraint-update-plan.json"
 
 mvn -q -f "$engine_dir/pom.xml" test-compile
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" minidb.EngineTest
@@ -42,3 +51,8 @@ java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     minidb.AggregateQueryEngineTest "$engine_dir/target/aggregate-query-plan.json" \
     "$engine_dir/target/aggregate-overflow-plan.json"
+java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
+    minidb.RemainingFeaturesEngineTest \
+    "$engine_dir/target/remaining-features-plan.json" \
+    "$engine_dir/target/constraint-unique-plan.json" \
+    "$engine_dir/target/constraint-update-plan.json"

@@ -77,6 +77,13 @@ int main() {
         check(plan.catalog_version == 0 && !catalog.snapshot()->findTable("student"), "planning changed catalog");
         check(plan.root->output.empty() && !plan.root->carries_row_id, "CREATE has unexpected row output");
     });
+    suite.run("DROP plan preserves names and IF EXISTS", [] {
+        Fixture f;
+        const auto plan = f.compile(DropTableStmt{{id("student"), id("missing")}, true});
+        const auto& drop = std::get<DropTablePlan>(plan.root->node);
+        check(drop.if_exists && drop.table_names == std::vector<std::string>({"student", "missing"}) &&
+              plan.catalog_version == 1, "DROP plan payload mismatch");
+    });
     suite.run("INSERT plan carries already reordered values", [] {
         Fixture f;
         auto plan = f.compile(InsertStmt{id("student"), std::vector<Identifier>{id("name"), id("age"), id("id")},
@@ -85,6 +92,18 @@ int main() {
         check(std::get<std::int64_t>(op.values[0]) == 1 && std::get<std::string>(op.values[1]) == "Alice" &&
               std::get<std::int64_t>(op.values[2]) == 20, "INSERT lost schema order");
         check(plan.root->output.empty() && !plan.root->carries_row_id, "INSERT output should be execution status only");
+    });
+    suite.run("INSERT plan carries every VALUES row", [] {
+        Fixture f;
+        InsertStmt insert{id("student"), std::nullopt, {}};
+        insert.rows = {
+            {{std::int64_t{1}, {}}, {std::string{"A"}, {}}, {std::int64_t{10}, {}}},
+            {{std::int64_t{2}, {}}, {std::string{"B"}, {}}, {std::int64_t{20}, {}}}
+        };
+        const auto plan = f.compile(std::move(insert));
+        const auto& rows = std::get<InsertPlan>(plan.root->node).rows;
+        check(rows.size() == 2 && std::get<std::int64_t>(rows[1][0]) == 2,
+              "multi-row INSERT plan lost a row");
     });
     suite.run("SELECT Filter Project order and output dependencies", [] {
         Fixture f;
@@ -173,7 +192,7 @@ int main() {
               plan.root->output[1].name == "manager_name",
               "Project lost relation or output aliases");
         const auto printed = formatPlan(plan);
-        check(printed.find("NestedLoopJoin[(e.age = m.id)]") != std::string::npos &&
+        check(printed.find("NestedLoopJoin[INNER; (e.age = m.id)]") != std::string::npos &&
               printed.find("SeqScan[student#1 AS e]") != std::string::npos &&
               printed.find("SeqScan[student#1 AS m]") != std::string::npos,
               "plan printer does not distinguish self JOIN aliases");
@@ -187,6 +206,24 @@ int main() {
         const auto& sort = std::get<SortPlan>(project.input->node);
         check(sort.input->output.size() == 3 && project.input->output.size() == 3 &&
               plan.root->output.size() == 1, "hidden sort key was projected away too early");
+    });
+    suite.run("computed Project keeps DISTINCT paging and expression Sort", [] {
+        Fixture f;
+        SelectStmt select{id("student"),
+            std::vector<SelectItem>{bin(BinaryOp::Add, col("age"), num(1))}, nullptr};
+        select.column_aliases = {id("next_age")};
+        select.order_by = {{id(""), SortDirection::Desc, {},
+                            bin(BinaryOp::Add, col("id"), num(2))}};
+        select.distinct = true;
+        select.limit = 5;
+        select.offset = 1;
+        const auto plan = f.compile(std::move(select));
+        const auto& project = std::get<ProjectPlan>(plan.root->node);
+        const auto& sort = std::get<SortPlan>(project.input->node);
+        check(project.expressions.size() == 1 && project.distinct && project.limit == 5 &&
+              project.offset == 1 && sort.expression_items.size() == 1 &&
+              plan.root->output[0].name == "next_age",
+              "computed query plan lost an expression or final modifier");
     });
     suite.run("UPDATE filtered scan carries row identity", [] {
         Fixture f;
@@ -327,7 +364,7 @@ int main() {
         check(output.find("Project[student.name]") != std::string::npos &&
               output.find("Sort[student.name DESC]") != std::string::npos &&
               output.find("GroupBy[student.name]") != std::string::npos &&
-              output.find("NestedLoopJoin[(student.id = score.student_id)]") != std::string::npos &&
+              output.find("NestedLoopJoin[INNER; (student.id = score.student_id)]") != std::string::npos &&
               output.find("  SeqScan[student#1]") != std::string::npos &&
               output.find("  SeqScan[score#2]") != std::string::npos,
               "advanced plan printer omitted an operator or JOIN branch");
@@ -339,7 +376,7 @@ int main() {
         Fixture f;
         auto insert = f.compile(InsertStmt{id("student"), std::nullopt,
             {{std::int64_t{1}, {}}, {std::string{"Tom's\n\\book"}, {}}, {std::int64_t{20}, {}}}});
-        check(formatPlan(insert).find("values=(1, 'Tom''s\\n\\\\book', 20)") != std::string::npos, "string escaping mismatch");
+        check(formatPlan(insert).find("rows=(1, 'Tom''s\\n\\\\book', 20)") != std::string::npos, "string escaping mismatch");
         check(formatPlan(f.compile(DeleteStmt{id("student"), nullptr})).find("Delete[student#1] output=[] row_id=no\n") != std::string::npos, "DELETE print mismatch");
     });
     return suite.finish();

@@ -88,10 +88,10 @@ aggregate 先使用 LinkedHashMap 按分组键列表归类，每个键映射到�
 aggregate-query.sql 覆盖五类函数、NULL、空表、全 NULL、排序和自连接；
 aggregate-overflow.sql 验证整数 SUM 溢出的 SQL 行列。
 
-grammar.md 0.22 定义语言范围，interfaces.md 定义 C++ 接口，
-json-plan-protocol.md 定义跨语言字段。暂不支持 HAVING、聚合 DISTINCT、
-COUNT(1)、函数参数算术、嵌套聚合和直接 ORDER BY SUM(amount)；
-排序聚合结果请使用 SELECT 别名。普通表达式尚未实现 NULL 三值逻辑。
+grammar.md 0.23 定义语言范围，interfaces.md 定义 C++ 接口，
+json-plan-protocol.md 定义跨语言字段。HAVING、聚合结果算术和直接
+`ORDER BY SUM(amount)` 已接通；仍不支持聚合函数内部 DISTINCT、COUNT(1)、
+函数参数算术和嵌套聚合。普通表达式由 Java 执行 SQL NULL 三值逻辑。
 
 答辩时可这样说明：A 负责识别聚合调用的语法，B 负责确认函数与列合法并生成带类型的计划；
 执行层在扫描和过滤之后按分组键归类，计算每组的聚合结果，再按输出别名排序。

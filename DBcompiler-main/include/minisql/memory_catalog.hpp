@@ -13,6 +13,8 @@ public:
     // 此方法不是 analyze 的一部分，不代表执行了 CREATE SQL。
     Result<std::shared_ptr<const TableSchema>> createTable(
         std::string table_name, const std::vector<ColumnSpec>& columns);
+    // 一个 DROP 语句至多递增一次版本；不存在且 if_exists=true 的名称被忽略。
+    Result<std::size_t> dropTables(const std::vector<std::string>& table_names, bool if_exists);
 
     // 复制名称索引并共享不可变 TableSchema，旧快照不受后续建表影响。
     std::shared_ptr<const CatalogSnapshot> snapshot() const;

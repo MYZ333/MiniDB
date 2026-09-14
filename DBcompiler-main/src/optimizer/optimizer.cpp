@@ -35,7 +35,9 @@ Result<BoundExprPtr> optimizeExpr(const BoundExprPtr& expr, std::size_t depth = 
     if (depth >= 256) return invalid("expression exceeds 256 levels", expr->span);
     return std::visit([&](const auto& node) -> Result<BoundExprPtr> {
         using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, BoundColumnRef> || std::is_same_v<T, BoundLiteral>) {
+        if constexpr (std::is_same_v<T, BoundColumnRef> || std::is_same_v<T, BoundLiteral> ||
+                      std::is_same_v<T, BoundAggregate>) {
+            // 聚合叶节点由 AggregatePlan 按分组求值，不能在普通常量折叠阶段展开。
             return expr;
         } else if constexpr (std::is_same_v<T, BoundUnary>) {
             auto result = optimizeExpr(node.operand, depth + 1);
@@ -47,7 +49,7 @@ Result<BoundExprPtr> optimizeExpr(const BoundExprPtr& expr, std::size_t depth = 
             if (child == node.operand) return expr;
             return std::make_shared<const BoundExpr>(BoundExpr{
                 BoundUnary{node.op, child, node.operator_span}, expr->type, expr->span});
-        } else {
+        } else if constexpr (std::is_same_v<T, BoundBinary>) {
             if (!node.left || !node.right) return invalid("binary expression child is missing", expr->span);
             auto left = optimizeExpr(node.left, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&left)) return *error;
@@ -76,6 +78,8 @@ Result<BoundExprPtr> optimizeExpr(const BoundExprPtr& expr, std::size_t depth = 
             if (lhs == node.left && rhs == node.right) return expr;
             return std::make_shared<const BoundExpr>(BoundExpr{
                 BoundBinary{node.op, lhs, rhs, node.operator_span}, expr->type, expr->span});
+        } else {
+            return invalid("unknown expression node", expr->span);
         }
     }, expr->node);
 }
@@ -112,8 +116,9 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
     if (depth >= 256) return invalid("plan exceeds 256 levels");
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan>) {
-            return plan; // 第一阶段 INSERT 已是单行字面量，无需继续折叠。
+        if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, DropTablePlan> ||
+                      std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan>) {
+            return plan; // DDL、字面量 INSERT 和扫描没有可折叠的子表达式。
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             auto left_result = optimizeNode(op.left, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;
@@ -129,7 +134,7 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
             if (!isConcatenatedOutput(*plan, *left, *right))
                 return invalid("NestedLoopJoin output must concatenate left and right metadata");
             if (left == op.left && right == op.right && predicate == op.predicate) return plan;
-            return replace(plan, NestedLoopJoinPlan{left, right, predicate});
+            return replace(plan, NestedLoopJoinPlan{left, right, predicate, op.type});
         } else {
             auto child = optimizeNode(op.input, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&child)) return *error;
@@ -176,16 +181,67 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
                 if (op.items.empty() || plan->carries_row_id || input->carries_row_id ||
                     plan->output.size() != op.items.size())
                     return invalid("Aggregate items and output metadata are inconsistent");
-                if (input == op.input) return plan;
-                return replace(plan, AggregatePlan{op.group_keys, op.items, op.order_by, input});
+                auto items = op.items;
+                auto order = op.order_by;
+                auto having = op.having;
+                bool changed = input != op.input;
+                for (auto& item : items) {
+                    if (auto* expression = std::get_if<BoundExprPtr>(&item.value)) {
+                        auto optimized = optimizeExpr(*expression);
+                        if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                        auto value = std::get<BoundExprPtr>(std::move(optimized));
+                        changed = changed || value != *expression;
+                        *expression = std::move(value);
+                    }
+                }
+                for (auto& item : order) {
+                    if (auto* expression = std::get_if<BoundExprPtr>(&item.key)) {
+                        auto optimized = optimizeExpr(*expression);
+                        if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                        auto value = std::get<BoundExprPtr>(std::move(optimized));
+                        changed = changed || value != *expression;
+                        *expression = std::move(value);
+                    }
+                }
+                if (having) {
+                    auto optimized = optimizeExpr(having);
+                    if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                    auto value = std::get<BoundExprPtr>(std::move(optimized));
+                    changed = changed || value != having;
+                    having = std::move(value);
+                }
+                if (!changed) return plan;
+                return replace(plan, AggregatePlan{op.group_keys, std::move(items),
+                    std::move(order), input, std::move(having), op.distinct, op.limit, op.offset});
             } else if constexpr (std::is_same_v<T, SortPlan>) {
-                if (op.items.empty() || !sameOutput(*plan, *input))
+                if ((op.items.empty() && op.expression_items.empty()) || !sameOutput(*plan, *input))
                     return invalid("Sort requires items and must preserve input metadata");
-                if (input == op.input) return plan;
-                return replace(plan, SortPlan{op.items, input});
+                auto expressions = op.expression_items;
+                bool changed = input != op.input;
+                for (auto& item : expressions) {
+                    if (auto* expression = std::get_if<BoundExprPtr>(&item.key)) {
+                        auto optimized = optimizeExpr(*expression);
+                        if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                        auto value = std::get<BoundExprPtr>(std::move(optimized));
+                        changed = changed || value != *expression;
+                        *expression = std::move(value);
+                    }
+                }
+                if (!changed) return plan;
+                return replace(plan, SortPlan{op.items, input, std::move(expressions)});
             } else {
-                if (input == op.input) return plan;
-                return replace(plan, ProjectPlan{op.columns, input});
+                auto expressions = op.expressions;
+                bool changed = input != op.input;
+                for (auto& expression : expressions) {
+                    auto optimized = optimizeExpr(expression);
+                    if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                    auto value = std::get<BoundExprPtr>(std::move(optimized));
+                    changed = changed || value != expression;
+                    expression = std::move(value);
+                }
+                if (!changed) return plan;
+                return replace(plan, ProjectPlan{op.columns, input, std::move(expressions),
+                                                 op.distinct, op.limit, op.offset});
             }
         }
     }, plan->node);

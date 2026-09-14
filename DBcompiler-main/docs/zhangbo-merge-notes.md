@@ -1,5 +1,8 @@
 # feature-zhangbo 与 B 聚合分支整合
 
+> 本文记录 0.22 合并当时的状态。其“仅解析”限制已由 B 0.23 实现取代；
+> 当前范围见 [grammar.md](../grammar.md)，代码阅读见 [A 扩展功能实现讲解](remaining-features-walkthrough.md)。
+
 本次以 B 的 945d0aa 为基线，合并 A 的 feature-zhangbo（f32ac98，包含 e6d63f3）。
 使用双亲 merge commit 保留两人的提交来源。工作目录为 MiniDB/DBcompiler-main，
 执行适配位于相邻 minidb-engine。

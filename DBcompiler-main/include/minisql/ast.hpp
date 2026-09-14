@@ -55,7 +55,19 @@ struct InsertStmt {
 };
 
 struct AllColumns { SourceLocation span; };
-using SelectList = std::variant<AllColumns, std::vector<Identifier>>;
+struct AggregateCall {
+    Identifier function; // B 归一化并检查 COUNT/SUM/AVG/MIN/MAX。
+    std::optional<Identifier> argument; // COUNT(*) 用 nullopt + count_star。
+    bool count_star = false;
+    SourceLocation span;
+};
+struct SelectItem {
+    std::variant<Identifier, AggregateCall> value;
+    std::optional<Identifier> alias;
+    SourceLocation span;
+};
+// vector<Identifier> 保留旧手工 AST 的源码兼容；Parser 遇聚合时使用 SelectItem。
+using SelectList = std::variant<AllColumns, std::vector<Identifier>, std::vector<SelectItem>>;
 
 struct OrderByItem {
     Identifier column;

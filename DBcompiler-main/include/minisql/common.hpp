@@ -51,6 +51,7 @@ using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullVa
 
 enum class UnaryOp { Negate, Not };
 enum class SortDirection { Asc, Desc };
+enum class AggregateKind { Count, Sum, Avg, Min, Max };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,

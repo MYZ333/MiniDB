@@ -242,12 +242,23 @@ void printStatement(const Statement& statement, int index) {
             std::cout << "Columns";
             if (std::holds_alternative<AllColumns>(stmt.columns)) {
                 std::cout << " *";
-            } else {
-                const auto& columns = std::get<std::vector<Identifier>>(stmt.columns);
-                for (std::size_t i = 0; i < columns.size(); ++i) {
-                    std::cout << " " << columns[i].text;
+            } else if (const auto* columns = std::get_if<std::vector<Identifier>>(&stmt.columns)) {
+                for (std::size_t i = 0; i < columns->size(); ++i) {
+                    std::cout << " " << (*columns)[i].text;
                     if (!stmt.column_aliases.empty() && stmt.column_aliases[i])
                         std::cout << " AS " << stmt.column_aliases[i]->text;
+                }
+            } else {
+                const auto& items = std::get<std::vector<SelectItem>>(stmt.columns);
+                for (const auto& selected : items) {
+                    std::cout << ' ';
+                    std::visit([&](const auto& item) {
+                        using I = std::decay_t<decltype(item)>;
+                        if constexpr (std::is_same_v<I, Identifier>) std::cout << item.text;
+                        else std::cout << item.function.text << '(' <<
+                            (item.count_star ? "*" : item.argument->text) << ')';
+                    }, selected.value);
+                    if (selected.alias) std::cout << " AS " << selected.alias->text;
                 }
             }
             std::cout << '\n';

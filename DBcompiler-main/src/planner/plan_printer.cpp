@@ -98,6 +98,7 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
             collectRelations(op.right, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, FilterPlan> ||
                              std::is_same_v<T, GroupByPlan> ||
+                             std::is_same_v<T, AggregatePlan> ||
                              std::is_same_v<T, SortPlan> ||
                              std::is_same_v<T, ProjectPlan>) {
             collectRelations(op.input, relations, depth + 1);
@@ -179,6 +180,40 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 for (std::size_t i = 0; i < op.keys.size(); ++i) {
                     if (i) out << ", ";
                     out << columnName(op.keys[i], relations);
+                }
+            } else if constexpr (std::is_same_v<T, AggregatePlan>) {
+                out << "Aggregate[group=";
+                if (op.group_keys.empty()) out << "<all>";
+                for (std::size_t i = 0; i < op.group_keys.size(); ++i) {
+                    if (i) out << ", ";
+                    out << columnName(op.group_keys[i], relations);
+                }
+                out << "; items=";
+                for (std::size_t i = 0; i < op.items.size(); ++i) {
+                    if (i) out << ", ";
+                    std::visit([&](const auto& item) {
+                        using I = std::decay_t<decltype(item)>;
+                        if constexpr (std::is_same_v<I, BoundColumnRef>) {
+                            out << columnName(item, relations);
+                        } else {
+                            const char* name = item.kind == AggregateKind::Count ? "COUNT" :
+                                item.kind == AggregateKind::Sum ? "SUM" :
+                                item.kind == AggregateKind::Avg ? "AVG" :
+                                item.kind == AggregateKind::Min ? "MIN" : "MAX";
+                            out << name << '(';
+                            if (item.argument) out << columnName(*item.argument, relations);
+                            else out << '*';
+                            out << ')';
+                        }
+                    }, op.items[i].value);
+                }
+                if (!op.order_by.empty()) out << "; order=";
+                for (std::size_t i = 0; i < op.order_by.size(); ++i) {
+                    if (i) out << ", ";
+                    if (const auto* ordinal = std::get_if<std::size_t>(&op.order_by[i].key))
+                        out << "output#" << *ordinal;
+                    else out << columnName(std::get<BoundColumnRef>(op.order_by[i].key), relations);
+                    out << ' ' << (op.order_by[i].direction == SortDirection::Asc ? "ASC" : "DESC");
                 }
             } else if constexpr (std::is_same_v<T, SortPlan>) {
                 out << "Sort[";

@@ -44,6 +44,16 @@ UpdateStmt increment(ExprPtr where = nullptr) {
     return {id("student"), {{id("age"), bin(BinaryOp::Add, col("age"), num(1)), {}}}, std::move(where)};
 }
 
+SelectItem selected(std::string name) { return {id(std::move(name)), std::nullopt, {}}; }
+
+SelectItem aggregate(std::string function, std::optional<std::string> argument,
+                     bool star = false, std::optional<std::string> alias = std::nullopt) {
+    return {AggregateCall{id(std::move(function)),
+                          argument ? std::optional<Identifier>{id(*argument)} : std::nullopt,
+                          star, {}},
+            alias ? std::optional<Identifier>{id(*alias)} : std::nullopt, {}};
+}
+
 // 检查 Filter 保留完整输入模式和 RowId；两者对修改计划都很关键。
 void checkFilteredInput(const PlanPtr& input, bool row_id) {
     const auto& filter = std::get<FilterPlan>(input->node);
@@ -114,6 +124,27 @@ int main() {
               "GROUP or ORDER payload mismatch");
         check(plan.root->output.size() == 1 && plan.root->output[0].name == "name" &&
               !plan.root->carries_row_id, "advanced SELECT root metadata mismatch");
+    });
+    suite.run("aggregate query produces one typed root above filtered detail rows", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<SelectItem>{
+            selected("age"), aggregate("COUNT", std::nullopt, true, "rows"),
+            aggregate("SUM", "id", false, "total"), aggregate("AVG", "age")},
+            bin(BinaryOp::Greater, col("id"), num(0))};
+        select.group_by = {id("age")};
+        select.order_by = {{id("total"), SortDirection::Desc, {}}};
+        const auto plan = f.compile(std::move(select));
+        const auto& root = std::get<AggregatePlan>(plan.root->node);
+        check(root.group_keys.size() == 1 && root.items.size() == 4 &&
+              root.order_by.size() == 1 && std::holds_alternative<FilterPlan>(root.input->node),
+              "Aggregate plan shape mismatch");
+        check(plan.root->output[0].type == DataType::Int &&
+              plan.root->output[1].name == "rows" &&
+              plan.root->output[3].type == DataType::Float,
+              "Aggregate output names or result types mismatch");
+        check(formatPlan(plan).find(
+            "Aggregate[group=student.age; items=student.age, COUNT(*), SUM(student.id), AVG(student.age); order=output#2 DESC]")
+            != std::string::npos, "Aggregate plan printer omitted payload");
     });
     suite.run("self JOIN plan preserves relation instances and output aliases", [] {
         Fixture f;
@@ -218,6 +249,21 @@ int main() {
         auto expr = std::make_shared<const BoundExpr>(BoundExpr{BoundLiteral{std::int64_t{1}}, DataType::Int, span(10)});
         auto e = failure(buildPlan(BoundStatement{1, BoundDelete{table, expr}}), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
         check(e.span->begin.offset == 10, "invalid predicate location lost");
+    });
+    suite.run("planner rejects malformed aggregate output and result types", [] {
+        Fixture f;
+        auto bound = f.bind(SelectStmt{id("student"), std::vector<SelectItem>{
+            aggregate("COUNT", std::nullopt, true, "rows")}, nullptr});
+        auto& select = std::get<BoundSelect>(bound.node);
+        select.output_names.clear();
+        failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
+        select.output_names = {"rows"};
+        auto& count = std::get<BoundAggregate>(select.aggregate_items[0].value);
+        count.type = DataType::Float;
+        failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
+        count.type = DataType::Int;
+        select.aggregate_order_by = {{std::size_t{1}, SortDirection::Asc}};
+        failure(buildPlan(bound), ErrorCode::InvalidBoundStatement, DiagnosticStage::Plan);
     });
     suite.run("planner rejects malformed UPDATE target and RHS", [] {
         Fixture f;

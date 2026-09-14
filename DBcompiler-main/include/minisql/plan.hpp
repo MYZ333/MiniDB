@@ -36,9 +36,16 @@ struct FilterPlan {
     BoundExprPtr predicate;
     PlanPtr input;
 };
-// 聚合函数加入前，GroupBy 按 keys 去重并仅输出这些键。
+// 无聚合调用的查询使用 GroupBy 按 keys 去重并仅输出这些键。
 struct GroupByPlan {
     std::vector<BoundColumnRef> keys;
+    PlanPtr input;
+};
+// Aggregate 是完整的聚合输出边界：分组、聚合、最终投影和聚合后排序在此完成。
+struct AggregatePlan {
+    std::vector<BoundColumnRef> group_keys;
+    std::vector<BoundAggregateItem> items;
+    std::vector<BoundAggregateOrder> order_by;
     PlanPtr input;
 };
 // 多键稳定优先级由 items 顺序表达；相同键行之间不保证稳定排序。
@@ -62,7 +69,7 @@ struct DeletePlan {
 
 struct PlanNode {
     std::variant<CreateTablePlan, InsertPlan, SeqScanPlan, NestedLoopJoinPlan,
-                 FilterPlan, GroupByPlan, SortPlan, ProjectPlan,
+                 FilterPlan, GroupByPlan, AggregatePlan, SortPlan, ProjectPlan,
                  UpdatePlan, DeletePlan> node;
     std::vector<OutputColumn> output; // 有序业务列；修改类根节点为空。
     bool carries_row_id = false; // 内部行标识不占用 output 的业务列。

@@ -28,6 +28,17 @@ const char* typeName(DataType type) {
 
 const char* unaryName(UnaryOp op) { return op == UnaryOp::Not ? "Not" : "Negate"; }
 
+const char* aggregateName(AggregateKind kind) {
+    switch (kind) {
+    case AggregateKind::Count: return "COUNT";
+    case AggregateKind::Sum: return "SUM";
+    case AggregateKind::Avg: return "AVG";
+    case AggregateKind::Min: return "MIN";
+    case AggregateKind::Max: return "MAX";
+    }
+    return "UNKNOWN";
+}
+
 const char* binaryName(BinaryOp op) {
     switch (op) {
     case BinaryOp::Add: return "Add";
@@ -200,6 +211,50 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth = 0) {
             for (std::size_t i = 0; i < node.keys.size(); ++i) {
                 if (i) out << ',';
                 refJson(out, node.keys[i]);
+            }
+            out << "],\"input\":";
+            nodeJson(out, node.input, depth + 1);
+        } else if constexpr (std::is_same_v<T, AggregatePlan>) {
+            out << "\"type\":\"Aggregate\",\"groupKeys\":[";
+            for (std::size_t i = 0; i < node.group_keys.size(); ++i) {
+                if (i) out << ',';
+                refJson(out, node.group_keys[i]);
+            }
+            out << "],\"items\":[";
+            for (std::size_t i = 0; i < node.items.size(); ++i) {
+                if (i) out << ',';
+                std::visit([&](const auto& item) {
+                    using I = std::decay_t<decltype(item)>;
+                    if constexpr (std::is_same_v<I, BoundColumnRef>) {
+                        out << "{\"kind\":\"column\",\"column\":";
+                        refJson(out, item);
+                        out << '}';
+                    } else {
+                        out << "{\"kind\":\"aggregate\",\"function\":";
+                        stringJson(out, aggregateName(item.kind));
+                        out << ",\"argument\":";
+                        if (item.argument) refJson(out, *item.argument); else out << "null";
+                        out << ",\"type\":";
+                        stringJson(out, typeName(item.type));
+                        out << ",\"span\":";
+                        spanJson(out, item.span);
+                        out << '}';
+                    }
+                }, node.items[i].value);
+            }
+            out << "],\"orderBy\":[";
+            for (std::size_t i = 0; i < node.order_by.size(); ++i) {
+                if (i) out << ',';
+                out << '{';
+                if (const auto* ordinal = std::get_if<std::size_t>(&node.order_by[i].key)) {
+                    out << "\"kind\":\"output\",\"ordinal\":" << *ordinal;
+                } else {
+                    out << "\"kind\":\"group\",\"column\":";
+                    refJson(out, std::get<BoundColumnRef>(node.order_by[i].key));
+                }
+                out << ",\"direction\":\""
+                    << (node.order_by[i].direction == SortDirection::Asc ? "ASC" : "DESC")
+                    << "\"}";
             }
             out << "],\"input\":";
             nodeJson(out, node.input, depth + 1);

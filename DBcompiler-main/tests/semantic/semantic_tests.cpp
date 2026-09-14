@@ -40,6 +40,18 @@ InsertStmt insert() {
     return {id("student"), std::nullopt,
         {{std::int64_t{1}, span(30)}, {std::string{"Alice"}, span(33, 7)}, {std::int64_t{20}, span(42, 2)}}};
 }
+
+SelectItem selected(std::string name, std::optional<std::string> alias = std::nullopt) {
+    return {id(std::move(name)), alias ? std::optional<Identifier>{id(*alias)} : std::nullopt, {}};
+}
+
+SelectItem aggregate(std::string function, std::optional<std::string> argument,
+                     bool star = false, std::optional<std::string> alias = std::nullopt) {
+    return {AggregateCall{id(std::move(function)),
+                          argument ? std::optional<Identifier>{id(*argument)} : std::nullopt,
+                          star, {}},
+            alias ? std::optional<Identifier>{id(*alias)} : std::nullopt, {}};
+}
 } // namespace
 
 int main() {
@@ -248,6 +260,58 @@ int main() {
         valid.group_by.push_back(id("NAME", span(70, 4)));
         const auto error = failure(f.analyzeSelect(valid), ErrorCode::InvalidGrouping);
         check(error.span->begin.offset == 70, "duplicate GROUP BY key location mismatch");
+    });
+    suite.run("aggregate functions bind result types aliases and post-group ordering", [] {
+        MultiTableFixture f;
+        SelectStmt select{id("student"), std::vector<SelectItem>{
+            selected("age"), aggregate("COUNT", std::nullopt, true, "rows"),
+            aggregate("SUM", "id", false, "total"), aggregate("AVG", "age"),
+            aggregate("MIN", "name"), aggregate("MAX", "name")}, nullptr};
+        select.group_by = {id("age")};
+        select.order_by = {{id("total"), SortDirection::Desc, {}},
+                           {id("age"), SortDirection::Asc, {}}};
+        const auto bound = value(f.analyzeSelect(std::move(select)));
+        const auto& query = std::get<BoundSelect>(bound.node);
+        check(query.aggregate_items.size() == 6 && query.aggregate_order_by.size() == 2,
+              "aggregate items or ordering were lost");
+        const auto& count = std::get<BoundAggregate>(query.aggregate_items[1].value);
+        const auto& average = std::get<BoundAggregate>(query.aggregate_items[3].value);
+        check(count.kind == AggregateKind::Count && !count.argument && count.type == DataType::Int,
+              "COUNT(*) binding mismatch");
+        check(average.kind == AggregateKind::Avg && average.type == DataType::Float,
+              "AVG result type mismatch");
+        check(std::get<std::size_t>(query.aggregate_order_by[0].key) == 2 &&
+              std::holds_alternative<BoundColumnRef>(query.aggregate_order_by[1].key),
+              "aggregate alias or hidden group ordering did not bind");
+    });
+    suite.run("aggregate semantic rules reject invalid functions arguments and grouping", [] {
+        Fixture f;
+        failure(f.analyzeNode(SelectStmt{id("student"), std::vector<SelectItem>{
+            aggregate("SUM", "name")}, nullptr}), ErrorCode::InvalidOperandType);
+        failure(f.analyzeNode(SelectStmt{id("student"), std::vector<SelectItem>{
+            aggregate("MEDIAN", "age")}, nullptr}), ErrorCode::UnsupportedFeature);
+        failure(f.analyzeNode(SelectStmt{id("student"), std::vector<SelectItem>{
+            aggregate("MAX", std::nullopt, true)}, nullptr}), ErrorCode::InvalidOperandType);
+
+        SelectStmt ungrouped{id("student"), std::vector<SelectItem>{
+            selected("name"), aggregate("COUNT", std::nullopt, true)}, nullptr};
+        failure(f.analyzeNode(std::move(ungrouped)), ErrorCode::InvalidGrouping);
+        SelectStmt bad_order{id("student"), std::vector<SelectItem>{
+            aggregate("COUNT", std::nullopt, true)}, nullptr};
+        bad_order.order_by = {{id("age"), SortDirection::Asc, {}}};
+        failure(f.analyzeNode(std::move(bad_order)), ErrorCode::InvalidGrouping);
+        failure(f.analyzeNode(SelectStmt{id("student"), std::vector<SelectItem>{
+            aggregate("COUNT", "age", true)}, nullptr}), ErrorCode::InvalidAst);
+        SelectStmt ambiguous{id("student"), std::vector<SelectItem>{
+            aggregate("COUNT", std::nullopt, true, "total"),
+            aggregate("SUM", "age", false, "total")}, nullptr};
+        ambiguous.order_by = {{id("total"), SortDirection::Asc, {}}};
+        failure(f.analyzeNode(std::move(ambiguous)), ErrorCode::AmbiguousColumn);
+        // Rich AST with only columns must retain ordinary SELECT semantics.
+        const auto plain = value(f.analyzeNode(SelectStmt{id("student"),
+            std::vector<SelectItem>{selected("name", "label")}, nullptr}));
+        check(std::get<BoundSelect>(plain.node).aggregate_items.empty(),
+              "rich plain SELECT was incorrectly treated as global aggregation");
     });
     suite.run("ORDER BY permits a hidden column and retains item order", [] {
         Fixture f;

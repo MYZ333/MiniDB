@@ -172,6 +172,12 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
                 }
                 if (input == op.input) return plan;
                 return replace(plan, GroupByPlan{op.keys, input});
+            } else if constexpr (std::is_same_v<T, AggregatePlan>) {
+                if (op.items.empty() || plan->carries_row_id || input->carries_row_id ||
+                    plan->output.size() != op.items.size())
+                    return invalid("Aggregate items and output metadata are inconsistent");
+                if (input == op.input) return plan;
+                return replace(plan, AggregatePlan{op.group_keys, op.items, op.order_by, input});
             } else if constexpr (std::is_same_v<T, SortPlan>) {
                 if (op.items.empty() || !sameOutput(*plan, *input))
                     return invalid("Sort requires items and must preserve input metadata");

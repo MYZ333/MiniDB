@@ -80,6 +80,19 @@ int main() {
             expectEquivalent(before, sampleRows());
         }
     });
+    suite.run("aggregate boundary survives filter optimization and empty input", [] {
+        Fixture f;
+        const auto before = f.compile("SELECT COUNT(*) AS rows FROM student WHERE 1=1;");
+        const auto after = value(optimizePlan(before));
+        const auto& aggregate = std::get<AggregatePlan>(after.root->node);
+        check(std::holds_alternative<SeqScanPlan>(aggregate.input->node) &&
+              after.root->output[0].name == "rows", "aggregate metadata lost on input rewrite");
+        const auto empty = value(optimizePlan(
+            f.compile("SELECT COUNT(*) FROM student WHERE 1=0;")));
+        const auto& filtered = std::get<AggregatePlan>(empty.root->node);
+        check(std::holds_alternative<FilterPlan>(filtered.input->node),
+              "global aggregate over empty input must retain its result boundary");
+    });
     suite.run("UPDATE RHS folds without replacing old-row references", [] {
         Fixture f;
         const auto before = f.compile("UPDATE student SET id=age+10+8,age=id+(2*3) WHERE 1=1;");

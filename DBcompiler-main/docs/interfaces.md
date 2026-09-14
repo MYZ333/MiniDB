@@ -57,7 +57,10 @@ NOT/负号/括号的递归嵌套最多 256 层，生成 AST 的单条路径最�
 Statement 保存整条语句范围；Identifier 保存原始拼写及精确范围。
 一元/二元表达式另存运算符范围，便于把类型错误定位到操作符。
 
-SELECT 使用 `variant<AllColumns, vector<Identifier>>` 区分星号和列清单。
+SELECT 使用 `variant<AllColumns, vector<Identifier>, vector<SelectItem>>`。
+旧的纯列清单保留源码兼容；含聚合的清单使用 SelectItem，每项携带列名或 AggregateCall 和可选别名。
+AggregateCall 保存原函数名、参数列、count_star 与源码范围；COUNT(*) 的参数为空且 count_star=true。
+参数列与星号必须且只能选择一种，B 检查函数种类、参数类型和分组约束。
 INSERT 使用 optional 列清单区分省略和显式给定，显式清单不得为空。
 SelectStmt 追加 group_by、order_by、joins、FROM 表别名和与选择列平行的 column_aliases，
 并为旧的三字段聚合初始化提供空默认值。JoinClause 可携带右表别名。
@@ -163,6 +166,7 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 | CreateTableStmt | 规范化名称、列定义 | CreateTable |
 | InsertStmt | 表模式、按模式顺序的值 | Insert |
 | SelectStmt | 展开列、JOIN/WHERE/GROUP/ORDER | Project → [Sort] → [GroupBy] → [Filter] → {NestedLoopJoin} → SeqScan |
+| SelectStmt（含聚合） | 分组键、聚合项、最终输出名、聚合后排序 | Aggregate → [Filter] → {NestedLoopJoin} → SeqScan |
 | UpdateStmt | 目标列、已定型 RHS、可选 BOOL 条件 | Update → [Filter] → SeqScan |
 | DeleteStmt | 表模式、可选 BOOL 条件 | Delete → [Filter] → SeqScan |
 
@@ -172,7 +176,7 @@ Project 输出选择列及列别名，可有重复名称，丢弃内部行标识
 NestedLoopJoin 执行内连接：对左输入的每行依次扫描右输入，仅输出 ON 为 TRUE 的组合行；
 输出业务列是左模式后接右模式。多个 JOIN 按 SQL 顺序形成左深树，当前不选择其他连接算法。
 自连接的多个扫描共享 table_id，但 relation_id 不同；执行层按 relation_id 和 column_id 定位值。
-GroupBy 在聚合函数尚未加入时按 keys 去重，输出恰好为分组键顺序；分组比较中两个 NULL
+GroupBy 用于没有聚合调用的查询，按 keys 去重，输出恰好为分组键顺序；分组比较中两个 NULL
 属于同一组。Sort 保留输入模式，按 items 顺序比较，ASC/DESC 分别表示升/降序；ASC 把
 NULL 放在非 NULL 之后，DESC 把 NULL 放在非 NULL 之前，相同键之间的最终顺序未定义。
 Sort 位于 Project 下方，因此能读取未投影的隐藏排序列。
@@ -211,7 +215,7 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
   TRUE AND x、FALSE OR x、x AND TRUE、x OR FALSE 可替换为 x。
   x AND FALSE、x OR TRUE 保留左侧求值，避免吞掉错误；不重排谓词。
 - Filter 的条件折叠为 TRUE 后用输入节点替换；FALSE Filter 保留。优化器递归穿过
-  GroupBy/Sort，并折叠 NestedLoopJoin 的 ON 表达式，但不删除恒真 JOIN 或改变连接顺序。
+  GroupBy/Aggregate/Sort，并折叠 NestedLoopJoin 的 ON 表达式，但不删除恒真 JOIN 或改变连接顺序。
   不删除 Update/Delete 根，不进行列裁剪、索引选择或代价优化。
 
 入口附加检查空节点、访问路径深度（最多 256 层）、Filter 的 BOOL 条件及输出/RowId
@@ -247,6 +251,20 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
 兼容性测试，CREATE 后由测试驱动显式注册模式；普通库调用没有自动注册副作用。
 `minisql` 命令保留 A 的标准输入→Token/AST 调试行为，完整库链路与命令行展示范围分别验收。
 
+## 聚合绑定和计划补充
+
+BoundSelect.aggregate_items 非空表示聚合查询，按最终 SELECT 顺序保存 BoundColumnRef 或
+BoundAggregate。后者保存 AggregateKind、可选参数列、结果类型和调用源码范围。
+aggregate_order_by 的 key 为输出序号（别名）或分组列引用（可以不出现在 SELECT 中）。
+output_names 必须与 aggregate_items 等长；旧 columns 只保留该查询中的普通列引用，
+不再用作聚合查询的输出布局。普通查询继续使用 columns/order_by。
+
+AggregatePlan 保存 group_keys/items/order_by/input，是查询根节点，负责分组、聚合、
+最终投影及聚合后排序。它直接读取 JOIN/Filter 后的明细，不经过旧 GroupBy 去重，避免丢失
+重复输入行。其 output 保存最终名字和类型，carries_row_id=false。优化器可优化其输入，
+但不能因输入为空而删掉全表 Aggregate：全表空输入仍须输出 COUNT=0 的一行。
+详细类型、NULL、空输入和支持范围以 grammar.md 0.7 为准；JSON 字段见 json-plan-protocol.md。
+
 ## 维护责任
 
 - B：共享类型、本文、文法语义约定；维护语义分析、计划生成与优化。
@@ -269,3 +287,5 @@ formatPlan 消费成功 buildPlan 或 optimizePlan 产生的计划，输出确�
   GroupBy、Sort 计划节点；明确无聚合分组、隐藏排序列和执行层行布局契约。
 - 0.9：增加表/列别名和 ORDER BY 输出别名；以 relation_id 区分同一物理表的自连接实例，
   JSON 协议保持版本 1 并为旧计划保留 tableId 回退。
+
+- 0.10：添加聚合 AST/Bound/AggregatePlan，定义聚合后投影排序和空输入规则。

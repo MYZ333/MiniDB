@@ -25,6 +25,9 @@ public final class DatabaseEngine {
     /** Intermediate row with column identity and optional per-relation RowId for modification. */
     private record PlanRow(Map<Long, Long> rowIds, List<ColumnSlot> layout, List<Object> values) { }
 
+    /** Materialized aggregate row keeps hidden GROUP BY values for ORDER BY. */
+    private record AggregateRow(List<Object> groupValues, List<Object> outputValues) { }
+
     private final RecordStore records;
     private final Map<Long, TableSchema> tablesById = new LinkedHashMap<>();
     private final Map<String, TableSchema> tablesByName = new LinkedHashMap<>();
@@ -57,6 +60,7 @@ public final class DatabaseEngine {
             case "CreateTable" -> createTable(node);
             case "Insert" -> insert(node);
             case "Project" -> project(node);
+            case "Aggregate" -> aggregate(node);
             case "Update" -> update(node);
             case "Delete" -> delete(node);
             case "SeqScan", "NestedLoopJoin", "Filter", "GroupBy", "Sort" ->
@@ -119,6 +123,204 @@ public final class DatabaseEngine {
             rows.add(selected);
         }
         return new QueryResult(List.copyOf(names), List.copyOf(rows));
+    }
+
+    /** Forms groups, evaluates aggregate states, then sorts the finished result rows. */
+    private QueryResult aggregate(Map<String, Object> node) {
+        List<Map<String, Object>> groupKeys =
+            objectList(node.get("groupKeys"), "aggregate group keys", "group key");
+        List<Map<String, Object>> items =
+            objectList(node.get("items"), "aggregate items", "aggregate item");
+        validateAggregateItems(items, groupKeys);
+        List<PlanRow> input = readInput(map(node.get("input"), "Aggregate input"));
+        Map<List<Object>, List<PlanRow>> groups = new LinkedHashMap<>();
+        // SQL 全表聚合即使输入为空也产生一行；分组聚合的空输入没有分组。
+        if (groupKeys.isEmpty()) groups.put(List.of(), new ArrayList<>());
+        for (PlanRow row : input) {
+            List<Object> key = new ArrayList<>();
+            for (Map<String, Object> reference : groupKeys)
+                key.add(columnValue(reference, row));
+            groups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(row);
+        }
+
+        List<AggregateRow> aggregateRows = new ArrayList<>();
+        for (Map.Entry<List<Object>, List<PlanRow>> group : groups.entrySet()) {
+            List<Object> values = new ArrayList<>();
+            for (Map<String, Object> item : items) {
+                String kind = string(item.get("kind"), "aggregate item kind");
+                if (kind.equals("column")) {
+                    if (group.getValue().isEmpty())
+                        throw new EngineException("InvalidPlan",
+                            "global empty aggregate cannot output a source column");
+                    values.add(columnValue(map(item.get("column"), "aggregate column"),
+                                           group.getValue().get(0)));
+                } else if (kind.equals("aggregate")) {
+                    values.add(aggregateValue(item, group.getValue()));
+                } else {
+                    throw new EngineException("InvalidPlan", "unknown aggregate item kind: " + kind);
+                }
+            }
+            // ArrayList allows SQL NULL elements; List.copyOf deliberately rejects them.
+            aggregateRows.add(new AggregateRow(new ArrayList<>(group.getKey()), values));
+        }
+
+        List<Map<String, Object>> order =
+            objectList(node.get("orderBy"), "aggregate order", "aggregate order item");
+        // Validate even for zero/one result rows, when sorting never invokes its comparator.
+        for (Map<String, Object> item : order) {
+            String direction = string(item.get("direction"), "aggregate order direction");
+            if (!direction.equals("ASC") && !direction.equals("DESC"))
+                throw new EngineException("InvalidPlan", "unknown aggregate sort direction");
+            String kind = string(item.get("kind"), "aggregate order kind");
+            if (kind.equals("output")) {
+                long ordinal = longValue(item.get("ordinal"), "output ordinal");
+                if (ordinal < 0 || ordinal >= items.size())
+                    throw new EngineException("InvalidPlan", "aggregate output ordinal is out of range");
+            } else if (kind.equals("group")) {
+                referenceIndex(map(item.get("column"), "order group column"), groupKeys);
+            } else throw new EngineException("InvalidPlan", "unknown aggregate order kind");
+        }
+        aggregateRows.sort((left, right) -> compareAggregateRows(left, right, order, groupKeys, items));
+        List<String> names = new ArrayList<>();
+        for (Object output : list(node.get("output"), "output"))
+            names.add(string(map(output, "output column").get("name"), "output name"));
+        if (names.size() != items.size())
+            throw new EngineException("InvalidPlan", "Aggregate output does not match items");
+        List<List<Object>> rows = new ArrayList<>();
+        for (AggregateRow row : aggregateRows) rows.add(row.outputValues());
+        return new QueryResult(List.copyOf(names), List.copyOf(rows));
+    }
+
+    /** Check the aggregation contract before inspecting rows, including empty input. */
+    private void validateAggregateItems(List<Map<String, Object>> items,
+                                        List<Map<String, Object>> groupKeys) {
+        if (items.isEmpty())
+            throw new EngineException("InvalidPlan", "Aggregate requires output items");
+        for (Map<String, Object> item : items) {
+            String kind = string(item.get("kind"), "aggregate item kind");
+            if (kind.equals("column")) {
+                referenceIndex(map(item.get("column"), "aggregate column"), groupKeys);
+                continue;
+            }
+            if (!kind.equals("aggregate"))
+                throw error("InvalidPlan", "unknown aggregate item kind", item);
+            String function = string(item.get("function"), "aggregate function");
+            if (!List.of("COUNT", "SUM", "AVG", "MIN", "MAX").contains(function))
+                throw error("InvalidPlan", "unknown aggregate function", item);
+            if (item.get("argument") == null && !function.equals("COUNT"))
+                throw error("InvalidPlan", "only COUNT accepts '*'", item);
+            String argumentType = item.get("argument") == null ? "INT" :
+                string(map(item.get("argument"), "aggregate argument").get("type"), "argument type");
+            if ((function.equals("SUM") || function.equals("AVG"))
+                && !argumentType.equals("INT") && !argumentType.equals("FLOAT"))
+                throw error("InvalidPlan", "numeric aggregate requires INT or FLOAT", item);
+            String expected = function.equals("COUNT") ? "INT" :
+                function.equals("AVG") ? "FLOAT" : argumentType;
+            if (!expected.equals(string(item.get("type"), "aggregate type")))
+                throw error("InvalidPlan", "aggregate result type is inconsistent", item);
+        }
+    }
+
+    /** NULL inputs are ignored. COUNT returns zero; every other empty aggregate returns NULL. */
+    private Object aggregateValue(Map<String, Object> item, List<PlanRow> rows) {
+        String function = string(item.get("function"), "aggregate function");
+        Map<String, Object> argument = item.get("argument") == null
+            ? null : map(item.get("argument"), "aggregate argument");
+        String type = string(item.get("type"), "aggregate type");
+        long count = 0;
+        Object result = null;
+        double averageSum = 0.0;
+        for (PlanRow row : rows) {
+            Object value = argument == null ? Boolean.TRUE : columnValue(argument, row);
+            if (value == null) continue;
+            try { count = Math.addExact(count, 1L); }
+            catch (ArithmeticException ex) {
+                throw error("IntegerOverflow", "aggregate row count overflows INT", item);
+            }
+            switch (function) {
+                case "COUNT" -> { }
+                case "SUM" -> {
+                    if (type.equals("INT")) {
+                        try { result = Math.addExact(result == null ? 0L : (Long) result,
+                                                     typed(value, Long.class, "INT")); }
+                        catch (ArithmeticException ex) {
+                            throw error("IntegerOverflow", "SUM overflows INT", item);
+                        }
+                    } else {
+                        double next = (result == null ? 0.0 : (Double) result)
+                            + typed(value, Double.class, "FLOAT");
+                        result = finite(next, item);
+                    }
+                }
+                case "AVG" -> {
+                    double number = value instanceof Long integer
+                        ? integer.doubleValue() : typed(value, Double.class, "FLOAT");
+                    averageSum = finite(averageSum + number, item);
+                }
+                case "MIN", "MAX" -> {
+                    if (result == null) result = value;
+                    else {
+                        int compared = compareValues(value, result,
+                            string(argument.get("type"), "aggregate argument type"), "ASC");
+                        if ((function.equals("MIN") && compared < 0)
+                            || (function.equals("MAX") && compared > 0)) result = value;
+                    }
+                }
+                default -> throw error("InvalidPlan", "unknown aggregate function: " + function, item);
+            }
+        }
+        if (function.equals("COUNT")) return count;
+        if (function.equals("AVG")) return count == 0 ? null : finite(averageSum / count, item);
+        return result;
+    }
+
+    private int compareAggregateRows(AggregateRow left, AggregateRow right,
+                                     List<Map<String, Object>> order,
+                                     List<Map<String, Object>> groupKeys,
+                                     List<Map<String, Object>> items) {
+        for (Map<String, Object> orderItem : order) {
+            String kind = string(orderItem.get("kind"), "aggregate order kind");
+            String direction = string(orderItem.get("direction"), "aggregate order direction");
+            Object a, b;
+            String type;
+            if (kind.equals("output")) {
+                int ordinal = Math.toIntExact(longValue(orderItem.get("ordinal"), "output ordinal"));
+                if (ordinal < 0 || ordinal >= items.size())
+                    throw new EngineException("InvalidPlan", "aggregate output ordinal is out of range");
+                a = left.outputValues().get(ordinal);
+                b = right.outputValues().get(ordinal);
+                Map<String, Object> selected = items.get(ordinal);
+                type = selected.get("kind").equals("column")
+                    ? string(map(selected.get("column"), "selected column").get("type"), "column type")
+                    : string(selected.get("type"), "aggregate type");
+            } else if (kind.equals("group")) {
+                int ordinal = referenceIndex(map(orderItem.get("column"), "order group column"), groupKeys);
+                a = left.groupValues().get(ordinal);
+                b = right.groupValues().get(ordinal);
+                type = string(groupKeys.get(ordinal).get("type"), "group key type");
+            } else throw new EngineException("InvalidPlan", "unknown aggregate order kind: " + kind);
+            int compared = compareValues(a, b, type, direction);
+            if (compared != 0) return compared;
+        }
+        return 0;
+    }
+
+    private int referenceIndex(Map<String, Object> reference, List<Map<String, Object>> references) {
+        long table = longValue(reference.get("tableId"), "table id");
+        long column = longValue(reference.get("columnId"), "column id");
+        long relation = optionalLong(reference.get("relationId"), table);
+        for (int i = 0; i < references.size(); i++) {
+            Map<String, Object> candidate = references.get(i);
+            if (longValue(candidate.get("tableId"), "table id") == table
+                && longValue(candidate.get("columnId"), "column id") == column
+                && optionalLong(candidate.get("relationId"), table) == relation) {
+                if (!Objects.equals(candidate.get("ordinal"), reference.get("ordinal"))
+                    || !Objects.equals(candidate.get("type"), reference.get("type")))
+                    throw new EngineException("InvalidPlan", "group reference metadata mismatch");
+                return i;
+            }
+        }
+        throw new EngineException("InvalidPlan", "ORDER BY column is not a GROUP BY key");
     }
 
     private CommandResult update(Map<String, Object> node) {

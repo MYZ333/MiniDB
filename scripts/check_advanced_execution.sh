@@ -28,8 +28,17 @@ sources=(
 "$build_dir/minisql_plan_json" \
     < "$engine_dir/src/test/resources/advanced-query.sql" \
     > "$engine_dir/target/advanced-query-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/aggregate-query.sql" \
+    > "$engine_dir/target/aggregate-query-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/aggregate-overflow.sql" \
+    > "$engine_dir/target/aggregate-overflow-plan.json"
 
 mvn -q -f "$engine_dir/pom.xml" test-compile
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" minidb.EngineTest
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     minidb.AdvancedQueryEngineTest "$engine_dir/target/advanced-query-plan.json"
+java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
+    minidb.AggregateQueryEngineTest "$engine_dir/target/aggregate-query-plan.json" \
+    "$engine_dir/target/aggregate-overflow-plan.json"

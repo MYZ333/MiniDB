@@ -5,7 +5,8 @@ CREATE、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是�
 完成前的替身；后续 Java 页式存储只需实现 `RecordStore`。
 
 执行器支持 `INT/FLOAT/VARCHAR/BOOL` 和可存储的 `NULL`，并能执行 SeqScan、
-NestedLoopJoin、Filter、GroupBy、Sort、Project。当前 GroupBy 按键去重，尚不计算聚合函数。
+NestedLoopJoin、Filter、GroupBy、Aggregate、Sort、Project。GroupBy 用于纯分组去重，
+Aggregate 执行 COUNT/SUM/AVG/MIN/MAX、全表或分组聚合以及聚合后排序。
 内部算子通过带列身份的 `PlanRow` 传行，因此 JOIN 后按
 `relationId + tableId + columnId` 精确取列，并支持同一物理表自连接。
 

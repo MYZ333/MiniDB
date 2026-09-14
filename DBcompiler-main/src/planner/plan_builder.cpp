@@ -102,8 +102,11 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                 if (stmt.where->type != DataType::Bool) return invalid("WHERE must be BOOL", stmt.where->span);
                 if (auto error = checkExpr(stmt.where, relations)) return error;
             }
-            if (stmt.columns.empty()) return invalid("SELECT requires output columns");
-            if (!stmt.output_names.empty() && stmt.output_names.size() != stmt.columns.size())
+            if (stmt.columns.empty() && stmt.aggregate_items.empty())
+                return invalid("SELECT requires output columns");
+            const auto output_count = stmt.aggregate_items.empty()
+                ? stmt.columns.size() : stmt.aggregate_items.size();
+            if (!stmt.output_names.empty() && stmt.output_names.size() != output_count)
                 return invalid("SELECT output names do not match columns");
             for (const auto& ref : stmt.columns)
                 if (!validRef(ref, relations)) return invalid("SELECT column does not match visible schemas");
@@ -113,7 +116,46 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                 if (containsRef(checked_groups, ref)) return invalid("GROUP BY column is duplicated");
                 checked_groups.push_back(ref);
             }
-            if (!stmt.group_by.empty()) {
+            if (!stmt.aggregate_items.empty()) {
+                if (stmt.output_names.size() != stmt.aggregate_items.size() || !stmt.order_by.empty())
+                    return invalid("aggregate requires output names and post-aggregate ordering");
+                for (const auto& item : stmt.aggregate_items) {
+                    if (const auto* ref = std::get_if<BoundColumnRef>(&item.value)) {
+                        if (!validRef(*ref, relations) || !containsRef(stmt.group_by, *ref))
+                            return invalid("aggregate output column must occur in GROUP BY");
+                    } else {
+                        const auto& aggregate = std::get<BoundAggregate>(item.value);
+                        if (aggregate.argument && !validRef(*aggregate.argument, relations))
+                            return invalid("aggregate argument does not match visible schemas", aggregate.span);
+                        if (!aggregate.argument && aggregate.kind != AggregateKind::Count)
+                            return invalid("only COUNT may omit its argument", aggregate.span);
+                        const auto kind = aggregate.kind;
+                        if (kind != AggregateKind::Count && kind != AggregateKind::Sum &&
+                            kind != AggregateKind::Avg && kind != AggregateKind::Min &&
+                            kind != AggregateKind::Max)
+                            return invalid("unknown aggregate kind", aggregate.span);
+                        const auto argument_type = aggregate.argument
+                            ? aggregate.argument->type : DataType::Int;
+                        if ((kind == AggregateKind::Sum || kind == AggregateKind::Avg) &&
+                            argument_type != DataType::Int && argument_type != DataType::Float)
+                            return invalid("numeric aggregate requires INT or FLOAT", aggregate.span);
+                        const auto expected = kind == AggregateKind::Count ? DataType::Int :
+                            kind == AggregateKind::Avg ? DataType::Float : argument_type;
+                        if (aggregate.type != expected)
+                            return invalid("aggregate result type is inconsistent", aggregate.span);
+                    }
+                }
+                for (const auto& item : stmt.aggregate_order_by) {
+                    if (const auto* ordinal = std::get_if<std::size_t>(&item.key)) {
+                        if (*ordinal >= stmt.aggregate_items.size())
+                            return invalid("aggregate ORDER BY output ordinal is out of range");
+                    } else {
+                        const auto& ref = std::get<BoundColumnRef>(item.key);
+                        if (!validRef(ref, relations) || !containsRef(stmt.group_by, ref))
+                            return invalid("aggregate ORDER BY column must occur in GROUP BY");
+                    }
+                }
+            } else if (!stmt.group_by.empty()) {
                 for (const auto& ref : stmt.columns) {
                     if (!containsRef(stmt.group_by, ref))
                         return invalid("SELECT column must occur in GROUP BY");
@@ -212,6 +254,8 @@ PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
             join.relation_name.empty() ? join.table->name : join.relation_name});
     }
     if (stmt.where) input = node(FilterPlan{stmt.where, input}, input->output);
+    // 聚合节点必须看到过滤后的明细行，分组和排序由 Aggregate 自己完成。
+    if (!stmt.aggregate_items.empty()) return input;
     if (!stmt.group_by.empty())
         input = node(GroupByPlan{stmt.group_by, input}, referencedOutput(stmt.group_by, relations));
     if (!stmt.order_by.empty()) input = node(SortPlan{stmt.order_by, input}, input->output);
@@ -231,6 +275,17 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
             Relations relations{{stmt.table, stmt.relation_id,
                 stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}};
             auto input = selectSource(stmt, relations);
+            if (!stmt.aggregate_items.empty()) {
+                std::vector<OutputColumn> output;
+                for (std::size_t i = 0; i < stmt.aggregate_items.size(); ++i) {
+                    const auto type = std::visit([](const auto& item) {
+                        return item.type;
+                    }, stmt.aggregate_items[i].value);
+                    output.push_back({stmt.output_names[i], type});
+                }
+                return node(AggregatePlan{stmt.group_by, stmt.aggregate_items,
+                                          stmt.aggregate_order_by, input}, std::move(output));
+            }
             return node(ProjectPlan{stmt.columns, input},
                         referencedOutput(stmt.columns, relations, stmt.output_names));
         } else if constexpr (std::is_same_v<T, BoundUpdate>) {

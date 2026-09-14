@@ -186,6 +186,25 @@ void testBoolFloatAndNull() {
     require(asBinary(where, BinaryOp::And).right != nullptr, "extended predicate missing");
 }
 
+void testAggregateSelectItems() {
+    const auto statements = parseOk(
+        "SELECT dept, COUNT(*) AS rows, SUM(s.amount) total, AVG(score), MIN(note), MAX(note) "
+        "FROM sales s GROUP BY dept ORDER BY total DESC;");
+    const auto& select = std::get<SelectStmt>(statements[0].node);
+    const auto& items = std::get<std::vector<SelectItem>>(select.columns);
+    require(items.size() == 6, "aggregate SELECT item count mismatch");
+    require(std::get<Identifier>(items[0].value).text == "dept", "plain group key lost");
+    const auto& count = std::get<AggregateCall>(items[1].value);
+    require(count.function.text == "COUNT" && count.count_star && !count.argument,
+            "COUNT(*) AST shape mismatch");
+    const auto& sum = std::get<AggregateCall>(items[2].value);
+    require(sum.argument && sum.argument->text == "s.amount" &&
+            items[2].alias && items[2].alias->text == "total",
+            "qualified aggregate argument or alias lost");
+    require(select.group_by.size() == 1 && select.order_by.size() == 1,
+            "aggregate clauses were not parsed");
+}
+
 void testIntegerBoundaries() {
     const auto statements =
         parseOk("SELECT * FROM t WHERE -9223372036854775808 < id;");
@@ -212,6 +231,13 @@ void testSyntaxErrors() {
     expectSyntaxError("SELECT t. FROM t;");
     expectSyntaxError("SELECT * FROM t GROUP age;");
     expectSyntaxError("SELECT * FROM t ORDER BY age GROUP BY id;");
+    // 聚合参数只允许一个列引用或星号，复杂表达式留给后续版本。
+    expectSyntaxError("SELECT COUNT() FROM t;");
+    expectSyntaxError("SELECT COUNT(1) FROM t;");
+    expectSyntaxError("SELECT SUM(id+1) FROM t;");
+    expectSyntaxError("SELECT SUM(MAX(id)) FROM t;");
+    expectSyntaxError("SELECT COUNT(DISTINCT id) FROM t;");
+    expectSyntaxError("SELECT COUNT(*) FROM t ORDER BY COUNT(*);");
 }
 
 void testLogicalOperatorLocations() {
@@ -268,6 +294,7 @@ int main() {
         testJoinGroupOrderAndQualifiedNames();
         testTableAndColumnAliases();
         testBoolFloatAndNull();
+        testAggregateSelectItems();
         testIntegerBoundaries();
         testSyntaxErrors();
         testLogicalOperatorLocations();

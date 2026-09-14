@@ -301,6 +301,28 @@ private:
         return std::nullopt;
     }
 
+    // 函数名保留为标识符：A 解析形状，B 检查是否为支持的聚合函数。
+    SelectItem selectItem() {
+        const SourceLocation start = locationOf(current());
+        Identifier name = identifier();
+        std::variant<Identifier, AggregateCall> value{std::move(name)};
+        SourceLocation end = std::get<Identifier>(value).span;
+        if (match(TokenKind::LeftParen)) {
+            Identifier function = std::move(std::get<Identifier>(value));
+            std::optional<Identifier> argument;
+            bool count_star = false;
+            if (match(TokenKind::Star)) count_star = true;
+            else argument = identifier();
+            const Token& right = consume(TokenKind::RightParen, "')'");
+            end = locationOf(right);
+            value = AggregateCall{
+                std::move(function), std::move(argument), count_star, merge(start, end)};
+        }
+        auto alias = optionalAlias();
+        if (alias) end = alias->span;
+        return SelectItem{std::move(value), std::move(alias), merge(start, end)};
+    }
+
     DataType typeName() {
         if (match(TokenKind::Int)) {
             return DataType::Int;
@@ -389,14 +411,25 @@ private:
         if (match(TokenKind::Star)) {
             columns = AllColumns{locationOf(previous())};
         } else {
+            std::vector<SelectItem> items;
+            items.push_back(selectItem());
+            while (match(TokenKind::Comma)) items.push_back(selectItem());
+            bool aggregate = false;
             std::vector<Identifier> selected;
-            selected.push_back(identifier());
-            aliases.push_back(optionalAlias());
-            while (match(TokenKind::Comma)) {
-                selected.push_back(identifier());
-                aliases.push_back(optionalAlias());
+            for (const auto& item : items) {
+                if (const auto* name = std::get_if<Identifier>(&item.value)) {
+                    selected.push_back(*name);
+                    aliases.push_back(item.alias);
+                } else {
+                    aggregate = true;
+                }
             }
-            columns = std::move(selected);
+            if (aggregate) {
+                columns = std::move(items);
+                aliases.clear();
+            } else {
+                columns = std::move(selected);
+            }
         }
         consume(TokenKind::From, "FROM");
         Identifier table = identifier();

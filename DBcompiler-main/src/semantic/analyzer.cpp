@@ -59,6 +59,26 @@ bool containsColumn(const std::vector<BoundColumnRef>& columns, const BoundColum
     return false;
 }
 
+std::optional<AggregateKind> aggregateKind(const std::string& name) {
+    if (name == "count") return AggregateKind::Count;
+    if (name == "sum") return AggregateKind::Sum;
+    if (name == "avg") return AggregateKind::Avg;
+    if (name == "min") return AggregateKind::Min;
+    if (name == "max") return AggregateKind::Max;
+    return std::nullopt;
+}
+
+std::string aggregateName(AggregateKind kind) {
+    switch (kind) {
+        case AggregateKind::Count: return "count";
+        case AggregateKind::Sum: return "sum";
+        case AggregateKind::Avg: return "avg";
+        case AggregateKind::Min: return "min";
+        case AggregateKind::Max: return "max";
+    }
+    return "aggregate";
+}
+
 // 限定名精确选择表；非限定名在全部可见表中查找，命中多次必须报歧义。
 Result<BoundColumnRef> resolveColumn(const Identifier& name, const BindingScope& scope,
                                     SourceLocation fallback) {
@@ -196,6 +216,22 @@ private:
     }
 
     Result<BoundStatement> bindStatement(const SelectStmt& stmt) {
+        // 外部调用方也可以用 SelectItem 表示纯列查询；统一到原列清单路径。
+        if (const auto* items = std::get_if<std::vector<SelectItem>>(&stmt.columns)) {
+            bool has_aggregate = false;
+            for (const auto& item : *items)
+                has_aggregate |= std::holds_alternative<AggregateCall>(item.value);
+            if (!has_aggregate && stmt.column_aliases.empty()) {
+                auto plain = stmt;
+                std::vector<Identifier> names;
+                for (const auto& item : *items) {
+                    names.push_back(std::get<Identifier>(item.value));
+                    plain.column_aliases.push_back(item.alias);
+                }
+                plain.columns = std::move(names);
+                return bindStatement(plain);
+            }
+        }
         if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
             return error(ErrorCode::InvalidAst, "table alias must be a simple identifier",
                          location(stmt.table_alias->span, statement_span_));
@@ -233,6 +269,8 @@ private:
         std::vector<BoundColumnRef> columns;
         std::vector<std::string> output_names;
         std::vector<std::pair<std::string, BoundColumnRef>> output_aliases;
+        std::vector<BoundAggregateItem> aggregate_items;
+        std::vector<std::pair<std::string, std::size_t>> aggregate_aliases;
         if (std::holds_alternative<AllColumns>(stmt.columns)) {
             if (!stmt.column_aliases.empty())
                 return error(ErrorCode::InvalidAst,
@@ -243,16 +281,15 @@ private:
                     output_names.push_back(visible.table->columns[i].name);
                 }
             }
-        } else {
-            const auto& names = std::get<std::vector<Identifier>>(stmt.columns);
-            if (names.empty()) {
+        } else if (const auto* names = std::get_if<std::vector<Identifier>>(&stmt.columns)) {
+            if (names->empty()) {
                 return error(ErrorCode::EmptyColumnList, "SELECT column list must not be empty", statement_span_);
             }
-            if (!stmt.column_aliases.empty() && stmt.column_aliases.size() != names.size())
+            if (!stmt.column_aliases.empty() && stmt.column_aliases.size() != names->size())
                 return error(ErrorCode::InvalidAst,
                              "SELECT aliases must match the selected columns", statement_span_);
-            for (std::size_t i = 0; i < names.size(); ++i) {
-                const auto& name = names[i];
+            for (std::size_t i = 0; i < names->size(); ++i) {
+                const auto& name = (*names)[i];
                 auto resolved = resolveColumn(name, scope, statement_span_);
                 if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
                 auto ref = std::get<BoundColumnRef>(resolved);
@@ -270,6 +307,72 @@ private:
                         scope[ref.relation_id - 1].table->columns[ref.ordinal].name);
                 }
             }
+        } else {
+            const auto& items = std::get<std::vector<SelectItem>>(stmt.columns);
+            if (items.empty())
+                return error(ErrorCode::EmptyColumnList, "SELECT column list must not be empty", statement_span_);
+            if (!stmt.column_aliases.empty())
+                return error(ErrorCode::InvalidAst,
+                             "rich SELECT items carry their aliases directly", statement_span_);
+            for (const auto& item : items) {
+                const std::size_t output_ordinal = aggregate_items.size();
+                std::string default_name;
+                if (const auto* name = std::get_if<Identifier>(&item.value)) {
+                    auto resolved = resolveColumn(*name, scope, statement_span_);
+                    if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
+                    auto ref = std::get<BoundColumnRef>(resolved);
+                    columns.push_back(ref);
+                    aggregate_items.push_back({ref});
+                    default_name = scope[ref.relation_id - 1].table->columns[ref.ordinal].name;
+                } else {
+                    const auto& call = std::get<AggregateCall>(item.value);
+                    const auto kind = aggregateKind(normalizeName(call.function.text));
+                    if (!kind) {
+                        return error(ErrorCode::UnsupportedFeature,
+                            "unsupported aggregate function '" + call.function.text + "'",
+                            location(call.function.span, location(call.span, statement_span_)));
+                    }
+                    std::optional<BoundColumnRef> argument;
+                    if (call.count_star == call.argument.has_value())
+                        return error(ErrorCode::InvalidAst,
+                            "aggregate requires exactly one column argument or '*'",
+                            location(call.span, statement_span_));
+                    if (call.argument) {
+                        auto resolved = resolveColumn(*call.argument, scope, call.span);
+                        if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
+                        argument = std::get<BoundColumnRef>(resolved);
+                    }
+                    if (call.count_star && *kind != AggregateKind::Count) {
+                        return error(ErrorCode::InvalidOperandType,
+                            aggregateName(*kind) + " does not accept '*'", location(call.span, statement_span_));
+                    }
+                    if (!call.count_star && !argument) {
+                        return error(ErrorCode::InvalidAst, "aggregate argument is missing",
+                                     location(call.span, statement_span_));
+                    }
+                    DataType result_type = DataType::Int;
+                    if (*kind == AggregateKind::Avg) result_type = DataType::Float;
+                    else if (*kind != AggregateKind::Count) result_type = argument->type;
+                    if ((*kind == AggregateKind::Sum || *kind == AggregateKind::Avg) &&
+                        argument->type != DataType::Int && argument->type != DataType::Float) {
+                        return error(ErrorCode::InvalidOperandType,
+                            aggregateName(*kind) + " expects an INT or FLOAT column",
+                            location(call.argument->span, location(call.span, statement_span_)));
+                    }
+                    aggregate_items.push_back({BoundAggregate{*kind, argument, result_type,
+                                                              location(call.span, statement_span_)}});
+                    default_name = aggregateName(*kind) + "(" +
+                        (call.count_star ? "*" : normalizeName(call.argument->text)) + ")";
+                }
+                if (item.alias) {
+                    if (item.alias->text.find('.') != std::string::npos)
+                        return error(ErrorCode::InvalidAst, "column alias must be a simple identifier",
+                                     location(item.alias->span, statement_span_));
+                    auto alias = normalizeName(item.alias->text);
+                    output_names.push_back(alias);
+                    aggregate_aliases.push_back({std::move(alias), output_ordinal});
+                } else output_names.push_back(std::move(default_name));
+            }
         }
         auto predicate = bindWhere(stmt.where, scope);
         if (const auto* failure = std::get_if<Diagnostic>(&predicate)) return *failure;
@@ -286,18 +389,57 @@ private:
             }
             group_by.push_back(ref);
         }
-        if (!group_by.empty()) {
+        if (!aggregate_items.empty()) {
+            for (const auto& item : aggregate_items) {
+                if (const auto* ref = std::get_if<BoundColumnRef>(&item.value)) {
+                    if (!containsColumn(group_by, *ref)) {
+                        return error(ErrorCode::InvalidGrouping,
+                            "a selected non-aggregate column must occur in GROUP BY", statement_span_);
+                    }
+                }
+            }
+        } else if (!group_by.empty()) {
             for (const auto& column : columns) {
                 if (!containsColumn(group_by, column)) {
                     return error(ErrorCode::InvalidGrouping,
-                        "every selected column must occur in GROUP BY when aggregate functions are unavailable",
+                        "every selected non-aggregate column must occur in GROUP BY",
                         statement_span_);
                 }
             }
         }
 
         std::vector<BoundOrderBy> order_by;
+        std::vector<BoundAggregateOrder> aggregate_order_by;
         for (const auto& item : stmt.order_by) {
+            if (!aggregate_items.empty()) {
+                std::optional<std::size_t> alias_match;
+                const auto order_name = normalizeName(item.column.text);
+                if (order_name.find('.') == std::string::npos) {
+                    for (const auto& alias : aggregate_aliases) {
+                        if (alias.first != order_name) continue;
+                        if (alias_match) {
+                            return error(ErrorCode::AmbiguousColumn,
+                                "ORDER BY alias '" + item.column.text + "' is ambiguous",
+                                location(item.column.span, item.span));
+                        }
+                        alias_match = alias.second;
+                    }
+                }
+                if (alias_match) {
+                    aggregate_order_by.push_back({*alias_match, item.direction});
+                    continue;
+                }
+                auto resolved = resolveColumn(item.column, scope, item.span);
+                if (const auto* failure = std::get_if<Diagnostic>(&resolved)) return *failure;
+                auto ref = std::get<BoundColumnRef>(resolved);
+                if (!containsColumn(group_by, ref)) {
+                    return error(ErrorCode::InvalidGrouping,
+                        "ORDER BY source column must occur in GROUP BY in an aggregate query",
+                        location(item.column.span, item.span));
+                }
+                aggregate_order_by.push_back({ref, item.direction});
+                continue;
+            }
             std::optional<BoundColumnRef> alias_match;
             const auto order_name = normalizeName(item.column.text);
             if (order_name.find('.') == std::string::npos) {
@@ -329,7 +471,8 @@ private:
         return success(BoundSelect{std::move(table), std::move(columns),
                                    std::get<BoundExprPtr>(std::move(predicate)),
                                    std::move(joins), std::move(group_by), std::move(order_by),
-                                   relation_name, 1, std::move(output_names)});
+                                   relation_name, 1, std::move(output_names),
+                                   std::move(aggregate_items), std::move(aggregate_order_by)});
     }
 
     Result<BoundStatement> bindStatement(const UpdateStmt& stmt) {

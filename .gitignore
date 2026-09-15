@@ -21,5 +21,15 @@ Thumbs.db
 # Local render and scratch directories
 qa_render/
 tmp/
+data/
 *.log
 .vscode/
+
+# Local document deliverables and Word lock files
+*.docx
+docx_render_*/
+
+# One-off local document authoring helpers
+create_bplus_index_assessment.py
+create_module_task_docs.py
+create_index_interface_spec.py

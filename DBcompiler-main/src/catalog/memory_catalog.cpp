@@ -263,4 +263,15 @@ std::shared_ptr<const CatalogSnapshot> MemoryCatalog::snapshot() const {
     return std::make_shared<const MemorySnapshot>(version_, tables_);
 }
 
+void MemoryCatalog::loadSnapshot(CatalogVersion version, std::uint64_t next_table_id,
+                                 std::vector<TableSchema> tables) {
+    tables_.clear();
+    for (auto& table : tables) {
+        auto owned = std::make_shared<const TableSchema>(std::move(table));
+        tables_.emplace(owned->name, std::move(owned));
+    }
+    version_ = version;
+    next_table_id_ = next_table_id;
+}
+
 } // namespace minisql

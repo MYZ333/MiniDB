@@ -1,8 +1,8 @@
 # MiniDB Java 数据库引擎
 
 本模块不调用 C++ 对象。它只读取 `protocolVersion: 1` 的 JSON 执行计划，执行
-CREATE、ALTER、DROP、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是存储系统
-完成前的替身；后续 Java 页式存储只需实现 `RecordStore`。
+CREATE、ALTER、DROP、INSERT、SELECT、UPDATE 和 DELETE。生产入口使用 `PageRecordStore`，
+将目录与记录写入页式 BufferPool；`InMemoryRecordStore` 仅保留给快速单元测试。
 引擎还支持 Explain 计划：普通模式返回算子树，ANALYZE 模式执行目标并采集实际行数、
 包含子算子的耗时和调用次数。
 
@@ -26,10 +26,10 @@ EmptyResult 固定产生零行，并保留列身份供外连接补 NULL；EXPLAI
 mvn '-Dmaven.repo.local=target/maven-repo' '-Dmaven.test.skip=true' package
 ```
 
-完整链路：先由 C++ 编译器生成 JSON，再交给 Java 引擎执行。
+完整链路会先将持久化 Catalog 作为侧车文件传给 C++ 编译器，再执行生成的 JSON。
 
 ```powershell
-Get-Content demo.sql | .\build\minisql_plan_json | java -jar .\minidb-engine\target\minidb-engine-1.0.0.jar
+Get-Content demo.sql | java "-Dminidb.compiler.path=E:\MiniDB\DBcompiler-main\build\Debug\minisql_plan_json.exe" -jar .\target\minidb-engine-1.0.0.jar sql
 ```
 
 运行无第三方依赖的集成测试：
@@ -57,8 +57,8 @@ EXPLAIN 的运行时采样与副作用边界见
 在工作区根目录双击 `run_minidb_web.bat`。它会构建 C++ 计划导出器和 Java JAR，
 然后启动本机服务；浏览器访问 <http://localhost:8080>。
 
-页面一次运行完整 SQL 脚本，每次运行都从空的内存数据库回放脚本。这样与当前 C++ 编译器
-的 Catalog 行为一致；重启或刷新页面不会获得磁盘持久化数据。
+页面复用一个持久化引擎。每次执行前，Java 会把持久化 Catalog 提供给 C++ 计划导出器，
+因此重启后可直接执行 SELECT、INSERT 或高级查询，不必重复 CREATE TABLE。
 
 手工启动时需提供 C++ 导出器路径：
 

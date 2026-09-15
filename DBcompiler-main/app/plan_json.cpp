@@ -6,11 +6,13 @@
 #include "minisql/parser.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <locale>
 #include <sstream>
 #include <type_traits>
+#include <vector>
 
 namespace {
 using namespace minisql;
@@ -103,6 +105,53 @@ void stringJson(std::ostream& out, const std::string& value) {
         }
     }
     out << '"';
+}
+
+std::string hexDecode(const std::string& text) {
+    if (text == "-") return {};
+    if (text.size() % 2 != 0) throw std::runtime_error("invalid catalog hex string");
+    std::string result; result.reserve(text.size() / 2);
+    auto digit = [](char ch) -> int { if (ch >= '0' && ch <= '9') return ch - '0'; if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10; if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10; return -1; };
+    for (std::size_t i = 0; i < text.size(); i += 2) { int hi = digit(text[i]), lo = digit(text[i + 1]); if (hi < 0 || lo < 0) throw std::runtime_error("invalid catalog hex string"); result.push_back(static_cast<char>((hi << 4) | lo)); }
+    return result;
+}
+
+DataType catalogType(const std::string& text) {
+    if (text == "INT") return DataType::Int; if (text == "FLOAT") return DataType::Float;
+    if (text == "VARCHAR") return DataType::Varchar; if (text == "BOOL") return DataType::Bool;
+    throw std::runtime_error("invalid catalog column type");
+}
+
+void loadCatalogFile(const std::string& path, MemoryCatalog& catalog) {
+    std::ifstream input(path); if (!input) throw std::runtime_error("cannot open catalog file");
+    std::string tag; CatalogVersion version; std::uint64_t next;
+    if (!(input >> tag >> version >> next) || tag != "M") throw std::runtime_error("invalid catalog header");
+    std::vector<TableSchema> tables;
+    while (input >> tag) {
+        if (tag != "T") throw std::runtime_error("invalid catalog table record");
+        std::uint64_t id; std::string name; std::size_t column_count, constraint_count;
+        if (!(input >> id >> name >> column_count >> constraint_count)) throw std::runtime_error("invalid catalog table");
+        TableSchema table{TableId{id}, hexDecode(name), {}, {}};
+        for (std::size_t i = 0; i < column_count; ++i) {
+            std::uint64_t column_id; std::string column_name, type, default_kind, default_text; long long length; int primary, not_null, unique;
+            if (!(input >> tag >> column_id >> column_name >> type >> length >> primary >> not_null >> unique >> default_kind >> default_text) || tag != "C") throw std::runtime_error("invalid catalog column");
+            ColumnSchema column{ColumnId{column_id}, hexDecode(column_name), catalogType(type)};
+            if (length >= 0) column.varchar_length = length; column.primary_key = primary != 0; column.not_null = not_null != 0; column.unique = unique != 0;
+            const auto decoded = hexDecode(default_text);
+            if (default_kind == "L") column.default_value = static_cast<std::int64_t>(std::stoll(decoded));
+            else if (default_kind == "F") column.default_value = std::stod(decoded);
+            else if (default_kind == "B") column.default_value = decoded == "1";
+            else if (default_kind == "S") column.default_value = decoded;
+            else if (default_kind != "N") throw std::runtime_error("invalid catalog default");
+            table.columns.push_back(std::move(column));
+        }
+        for (std::size_t i = 0; i < constraint_count; ++i) {
+            int primary; std::size_t count; if (!(input >> tag >> primary >> count) || tag != "K") throw std::runtime_error("invalid catalog constraint");
+            TableConstraintSpec constraint{primary != 0, {}}; for (std::size_t j = 0; j < count; ++j) { std::size_t ordinal; if (!(input >> ordinal)) throw std::runtime_error("invalid catalog constraint member"); constraint.columns.push_back(ordinal); } table.table_constraints.push_back(std::move(constraint));
+        }
+        tables.push_back(std::move(table));
+    }
+    catalog.loadSnapshot(version, next, std::move(tables));
 }
 
 void scalarJson(std::ostream& out, const ScalarValue& value) {
@@ -532,7 +581,7 @@ void printDiagnostic(const Diagnostic& error) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     // JSON 数字必须使用点号，不受操作系统区域设置影响。
     std::cout.imbue(std::locale::classic());
     std::ostringstream input;
@@ -542,6 +591,10 @@ int main() {
     auto statements = parse(std::get<TokenStream>(tokens));
     if (const auto* error = std::get_if<Diagnostic>(&statements)) { printDiagnostic(*error); return 1; }
     MemoryCatalog catalog;
+    if (argc == 3 && std::string(argv[1]) == "--catalog-file") {
+        try { loadCatalogFile(argv[2], catalog); }
+        catch (const std::exception& error) { std::cerr << "Compilation failed: " << error.what() << '\n'; return 2; }
+    } else if (argc != 1) { std::cerr << "Usage: minisql_plan_json [--catalog-file path]\n"; return 2; }
     std::cout << "{\"protocolVersion\":1,\"plans\":[";
     bool first = true;
     for (const Statement& statement : std::get<std::vector<Statement>>(statements)) {

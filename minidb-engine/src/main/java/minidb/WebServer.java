@@ -18,6 +18,12 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import minidb.storage.BufferPool;
+import minidb.storage.BufferPoolStats;
+import minidb.storage.FileDiskManager;
+import minidb.storage.FifoBufferPool;
+import minidb.storage.LruBufferPool;
+import minidb.storage.StorageException;
 
 /** Local-only HTTP UI for executing one complete MiniDB SQL script at a time. */
 public final class WebServer implements AutoCloseable {
@@ -26,11 +32,22 @@ public final class WebServer implements AutoCloseable {
     private final HttpServer server;
     private final SqlCompilerRunner compiler;
     private final String compilerPath;
+    private final DatabaseEngine engine;
+    private final PageRecordStore persistentStore;
+    private final Path databasePath;
+    private final int bufferFrames;
+    private final String bufferPolicy;
 
-    private WebServer(HttpServer server, SqlCompilerRunner compiler, String compilerPath) {
+    private WebServer(HttpServer server, SqlCompilerRunner compiler, String compilerPath, DatabaseEngine engine,
+                      PageRecordStore persistentStore, Path databasePath, int bufferFrames, String bufferPolicy) {
         this.server = server;
         this.compiler = compiler;
         this.compilerPath = compilerPath;
+        this.engine = engine;
+        this.persistentStore = persistentStore;
+        this.databasePath = databasePath;
+        this.bufferFrames = bufferFrames;
+        this.bufferPolicy = bufferPolicy;
     }
 
     public static WebServer startFromSystemProperties() throws IOException {
@@ -41,12 +58,21 @@ public final class WebServer implements AutoCloseable {
         if (!Files.isRegularFile(executable) || !Files.isExecutable(executable))
             throw new IOException("C++ plan exporter was not found or is not executable: " + executable);
         int port = port(System.getProperty("minidb.web.port", "8080"));
-        return start(port, new ProcessSqlCompilerRunner(executable, Duration.ofSeconds(10)), executable.toString());
+        int frames = Integer.parseInt(System.getProperty("minidb.buffer.frames", "64"));
+        Path database = Path.of(System.getProperty("minidb.data.path", "data/minidb.db")).toAbsolutePath().normalize();
+        String policy = System.getProperty("minidb.buffer.policy", "LRU").equalsIgnoreCase("FIFO") ? "FIFO" : "LRU";
+        try {
+            BufferPool pool = policy.equals("FIFO")
+                ? new FifoBufferPool(frames, new FileDiskManager(database))
+                : new LruBufferPool(frames, new FileDiskManager(database));
+            PageRecordStore store = new PageRecordStore(pool);
+            return start(port, new ProcessSqlCompilerRunner(executable, Duration.ofSeconds(10)), executable.toString(), new DatabaseEngine(store), store, database, frames, policy);
+        } catch (StorageException problem) { throw new IOException("could not open persistent MiniDB storage", problem); }
     }
 
     static WebServer start(int port, SqlCompilerRunner compiler, String compilerPath) throws IOException {
         HttpServer nativeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
-        WebServer app = new WebServer(nativeServer, compiler, compilerPath);
+        WebServer app = new WebServer(nativeServer, compiler, compilerPath, new DatabaseEngine(), null, null, 0, "NONE");
         nativeServer.createContext("/", app::handle);
         nativeServer.setExecutor(Executors.newFixedThreadPool(4, task -> {
             Thread thread = new Thread(task, "minidb-web");
@@ -57,8 +83,16 @@ public final class WebServer implements AutoCloseable {
         return app;
     }
 
+    private static WebServer start(int port, SqlCompilerRunner compiler, String compilerPath, DatabaseEngine engine,
+                                   PageRecordStore store, Path databasePath, int bufferFrames, String bufferPolicy) throws IOException {
+        HttpServer nativeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+        WebServer app = new WebServer(nativeServer, compiler, compilerPath, engine, store, databasePath, bufferFrames, bufferPolicy);
+        nativeServer.createContext("/", app::handle);
+        nativeServer.setExecutor(Executors.newFixedThreadPool(4)); nativeServer.start(); return app;
+    }
+
     public int port() { return server.getAddress().getPort(); }
-    @Override public void close() { server.stop(0); }
+    @Override public void close() { server.stop(0); if (persistentStore != null) persistentStore.close(); }
 
     private void handle(HttpExchange exchange) throws IOException {
         try {
@@ -78,8 +112,9 @@ public final class WebServer implements AutoCloseable {
     private void health(HttpExchange exchange) throws IOException {
         if (!exchange.getRequestMethod().equals("GET")) { methodNotAllowed(exchange); return; }
         Map<String, Object> response = new LinkedHashMap<>();
-        response.put("ok", true); response.put("mode", "script-replay"); response.put("compilerPath", compilerPath);
+        response.put("ok", true); response.put("mode", persistentStore == null ? "in-memory-test" : "persistent"); response.put("compilerPath", compilerPath);
         response.put("compilerAvailable", Files.isRegularFile(Path.of(compilerPath)));
+        response.put("storage", storageState());
         reply(exchange, 200, response);
     }
 
@@ -93,24 +128,26 @@ public final class WebServer implements AutoCloseable {
         Object rawSql = request.get("sql");
         if (!(rawSql instanceof String sql) || sql.isBlank()) { reply(exchange, 400, error("request", "MissingSql", "request.sql must be a non-empty string", null, null)); return; }
 
+        synchronized (engine) {
         SqlCompilerRunner.CompilerOutput compiled;
-        try { compiled = compiler.compile(sql); }
+        try { compiled = compiler.compile(sql, engine.catalogSnapshotFileText()); }
         catch (IOException problem) { reply(exchange, 502, error("compiler", "CompilerUnavailable", problem.getMessage(), null, null)); return; }
         if (compiled.exitCode() != 0) { reply(exchange, 422, compilerError(compiled.stderr())); return; }
-
         Object plan;
         try { plan = Json.parse(compiled.stdout()); }
         catch (IllegalArgumentException problem) { reply(exchange, 422, error("protocol", "InvalidPlanJson", problem.getMessage(), null, null)); return; }
         try {
-            List<DatabaseEngine.ExecutionResult> results = new DatabaseEngine().executeProgramJson(compiled.stdout());
+            List<DatabaseEngine.ExecutionResult> results = engine.executeProgramJson(compiled.stdout());
             Map<String, Object> response = new LinkedHashMap<>();
-            response.put("ok", true); response.put("mode", "script-replay"); response.put("results", resultMaps(results)); response.put("plan", plan);
+            response.put("ok", true); response.put("mode", persistentStore == null ? "in-memory-test" : "persistent");
+            response.put("storage", storageState()); response.put("results", resultMaps(results)); response.put("plan", plan);
             reply(exchange, 200, response);
         } catch (EngineException problem) {
             String stage = problem.code().equals("ProtocolError") || problem.code().equals("ProtocolMismatch") ? "protocol" : "engine";
             reply(exchange, 422, error(stage, problem.code(), problem.getMessage(), problem.line(), problem.column()));
         } catch (IllegalArgumentException problem) {
             reply(exchange, 422, error("protocol", "InvalidPlan", problem.getMessage(), null, null));
+        }
         }
     }
 
@@ -127,6 +164,22 @@ public final class WebServer implements AutoCloseable {
             mapped.add(item);
         }
         return mapped;
+    }
+
+    private Map<String, Object> storageState() {
+        Map<String, Object> state = new LinkedHashMap<>();
+        boolean persistent = persistentStore != null;
+        state.put("persistent", persistent);
+        if (!persistent) return state;
+        BufferPoolStats stats = persistentStore.bufferPool().stats();
+        state.put("databasePath", databasePath.toString());
+        state.put("bufferFrames", (long) bufferFrames);
+        state.put("bufferPolicy", bufferPolicy);
+        state.put("hits", stats.hits());
+        state.put("misses", stats.misses());
+        state.put("evictions", stats.evictions());
+        state.put("flushes", stats.flushes());
+        return state;
     }
 
     private static Map<String, Object> compilerError(String diagnostic) {

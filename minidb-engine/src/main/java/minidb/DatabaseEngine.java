@@ -76,7 +76,78 @@ public final class DatabaseEngine {
     private PlanRow correlationRow;
 
     public DatabaseEngine() { this(new InMemoryRecordStore()); }
-    public DatabaseEngine(RecordStore records) { this.records = Objects.requireNonNull(records); }
+    public DatabaseEngine(RecordStore records) {
+        this.records = Objects.requireNonNull(records);
+        records.loadCatalog().ifPresent(catalog -> {
+            catalogVersion = catalog.version();
+            nextTableId = catalog.nextTableId();
+            for (TableSchema table : catalog.tables()) {
+                tablesById.put(table.id(), table);
+                tablesByName.put(normalize(table.name()), table);
+            }
+        });
+    }
+
+    /** JSON sidecar consumed by minisql_plan_json --catalog-file. */
+    public String catalogSnapshotJson() {
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("catalogVersion", catalogVersion);
+        root.put("nextTableId", nextTableId);
+        List<Object> tables = new ArrayList<>();
+        for (TableSchema table : tablesById.values()) {
+            Map<String, Object> encoded = new LinkedHashMap<>();
+            encoded.put("id", table.id()); encoded.put("name", table.name());
+            List<Object> columns = new ArrayList<>();
+            for (ColumnSchema column : table.columns()) {
+                Map<String, Object> value = new LinkedHashMap<>();
+                value.put("id", column.id()); value.put("name", column.name()); value.put("type", column.type());
+                value.put("varcharLength", column.varcharLength()); value.put("primaryKey", column.primaryKey());
+                value.put("notNull", column.notNull()); value.put("unique", column.unique());
+                value.put("defaultValue", column.defaultValue()); value.put("hasDefault", column.hasDefault());
+                columns.add(value);
+            }
+            List<Object> constraints = new ArrayList<>();
+            for (TableConstraint constraint : table.constraints())
+                constraints.add(Map.of("kind", constraint.kind(), "columns", constraint.columns()));
+            encoded.put("columns", columns); encoded.put("constraints", constraints); tables.add(encoded);
+        }
+        root.put("tables", tables);
+        return Json.stringify(root);
+    }
+
+    /** Compact line format for the native compiler sidecar, with UTF-8 fields hex encoded. */
+    public String catalogSnapshotFileText() {
+        StringBuilder text = new StringBuilder("M ").append(catalogVersion).append(' ').append(nextTableId).append('\n');
+        for (TableSchema table : tablesById.values()) {
+            text.append("T ").append(table.id()).append(' ').append(hex(table.name())).append(' ')
+                .append(table.columns().size()).append(' ').append(table.constraints().size()).append('\n');
+            for (ColumnSchema column : table.columns()) {
+                String kind = "N", value = "";
+                if (column.hasDefault()) {
+                    Object defaultValue = column.defaultValue();
+                    kind = defaultValue instanceof Long ? "L" : defaultValue instanceof Double ? "F" : defaultValue instanceof Boolean ? "B" : "S";
+                    value = defaultValue instanceof Boolean truth ? (truth ? "1" : "0") : String.valueOf(defaultValue);
+                }
+                text.append("C ").append(column.id()).append(' ').append(hex(column.name())).append(' ').append(column.type()).append(' ')
+                    .append(column.varcharLength() == null ? -1 : column.varcharLength()).append(' ')
+                    .append(column.primaryKey() ? 1 : 0).append(' ').append(column.notNull() ? 1 : 0).append(' ').append(column.unique() ? 1 : 0).append(' ')
+                    .append(kind).append(' ').append(hex(value)).append('\n');
+            }
+            for (TableConstraint constraint : table.constraints()) {
+                text.append("K ").append(constraint.kind().equals("PRIMARY_KEY") ? 1 : 0).append(' ').append(constraint.columns().size());
+                for (int ordinal : constraint.columns()) text.append(' ').append(ordinal);
+                text.append('\n');
+            }
+        }
+        return text.toString();
+    }
+
+    private static String hex(String value) { return value.isEmpty() ? "-" : java.util.HexFormat.of().formatHex(value.getBytes(StandardCharsets.UTF_8)); }
+
+    private void persistCatalog() {
+        records.persistCatalog(new RecordStore.CatalogState(catalogVersion, nextTableId,
+            List.copyOf(tablesById.values())));
+    }
 
     public List<ExecutionResult> executeProgramJson(String json) {
         Map<String, Object> program = map(Json.parse(json), "program");
@@ -491,6 +562,7 @@ public final class DatabaseEngine {
         tablesById.put(schema.id(), schema);
         tablesByName.put(name, schema);
         catalogVersion++;
+        persistCatalog();
         return new CommandResult("CREATE", 0);
     }
 
@@ -592,6 +664,7 @@ public final class DatabaseEngine {
         tablesById.put(changed.id(), changed);
         tablesByName.put(changed.name(), changed);
         catalogVersion++;
+        persistCatalog();
         return new CommandResult("ALTER", 0);
     }
 
@@ -617,7 +690,10 @@ public final class DatabaseEngine {
             tablesById.remove(table.id());
             removed++;
         }
-        if (removed > 0) catalogVersion++;
+        if (removed > 0) {
+            catalogVersion++;
+            persistCatalog();
+        }
         return new CommandResult("DROP", removed);
     }
 

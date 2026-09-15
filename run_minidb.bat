@@ -34,17 +34,19 @@ echo [1/3] Building the C++ SQL compiler...
 "%CMAKE_EXE%" --build "%BUILD_DIR%" --config Debug --parallel 1
 if errorlevel 1 exit /b 1
 
-if not exist "%JAR%" (
-    echo [2/3] Building the Java database engine...
-    pushd "%JAVA_DIR%"
-    call mvn "-Dmaven.repo.local=target\maven-repo" "-Dmaven.test.skip=true" package
-    if errorlevel 1 (
-        popd
-        exit /b 1
-    )
+echo [2/3] Building the Java database engine...
+pushd "%JAVA_DIR%"
+call mvn "-Dmaven.repo.local=target\maven-repo" "-Dmaven.test.skip=true" package
+if errorlevel 1 (
     popd
+    exit /b 1
 )
+popd
 
-echo [3/3] Executing "%SQL_FILE%"...
-"%PLAN_EXPORTER%" < "%SQL_FILE%" | java -jar "%JAR%"
-exit /b %errorlevel%
+echo [3/3] Executing "%SQL_FILE%" against persistent storage...
+java --add-modules jdk.httpserver "-Dminidb.compiler.path=%PLAN_EXPORTER%" -jar "%JAR%" sql < "%SQL_FILE%"
+set "EXIT_CODE=%errorlevel%"
+echo.
+echo [DONE] CLI execution complete. This command exits by design.
+echo [TIP] Run run_minidb_web.bat to keep the MiniDB Web service running.
+exit /b %EXIT_CODE%

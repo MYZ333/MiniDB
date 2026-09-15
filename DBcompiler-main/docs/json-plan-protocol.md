@@ -3,6 +3,10 @@
 `minisql_plan_json` 从标准输入读取 SQL，输出一份 UTF-8 JSON 文档。Java 引擎只依赖
 该文档，不链接或反序列化 C++ 内存对象。
 
+当以 `--catalog-file <path>` 启动时，导出器会恢复 Java 提供的持久化 Catalog 快照，
+保留目录版本、表列 ID、约束和默认值；这使重启后的独立 SELECT/INSERT 也能通过语义分析。
+未传该参数时仍以空 Catalog 编译完整建表脚本。
+
 ```json
 {
   "protocolVersion": 1,

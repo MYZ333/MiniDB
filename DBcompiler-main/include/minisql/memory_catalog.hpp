@@ -28,6 +28,9 @@ public:
 
     // 复制名称索引并共享不可变 TableSchema，旧快照不受后续建表影响。
     std::shared_ptr<const CatalogSnapshot> snapshot() const;
+    // Restores a Java-persisted schema snapshot while preserving all IDs and version.
+    void loadSnapshot(CatalogVersion version, std::uint64_t next_table_id,
+                      std::vector<TableSchema> tables);
 
 private:
     // 第一阶段单线程使用，不承诺并发注册/读取的线程安全。

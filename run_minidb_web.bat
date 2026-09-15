@@ -31,4 +31,5 @@ if errorlevel 1 (
 popd
 
 echo [3/3] Starting MiniDB Web at http://localhost:8080
+echo [INFO] The Web service remains running until you press Ctrl+C in this window.
 java --add-modules jdk.httpserver "-Dminidb.compiler.path=%PLAN_EXPORTER%" -Dminidb.web.openBrowser=true -jar "%JAR%" web

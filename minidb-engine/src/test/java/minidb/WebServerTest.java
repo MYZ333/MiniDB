@@ -26,13 +26,17 @@ public final class WebServerTest {
             HttpClient client = HttpClient.newHttpClient();
             String base = "http://127.0.0.1:" + server.port();
             HttpResponse<String> index = client.send(HttpRequest.newBuilder(URI.create(base + "/")).GET().build(), HttpResponse.BodyHandlers.ofString());
-            require(index.statusCode() == 200 && index.body().contains("MiniDB"), "page should be served");
+            require(index.statusCode() == 200 && index.body().contains("MiniDB") && index.body().contains("PERSISTENT STORAGE") &&
+                !index.body().contains("空内存数据库"), "page should describe persistent storage");
             HttpResponse<String> health = client.send(HttpRequest.newBuilder(URI.create(base + "/api/health")).GET().build(), HttpResponse.BodyHandlers.ofString());
             require(health.statusCode() == 200, "health should succeed");
+            require(health.body().contains("\"mode\":\"in-memory-test\"") && health.body().contains("\"storage\""),
+                "health should expose its storage mode");
             HttpResponse<String> success = post(client, base, "SELECT name FROM student;");
             Map<String, Object> body = object(Json.parse(success.body()));
             require(success.statusCode() == 200 && Boolean.TRUE.equals(body.get("ok")), "execution should succeed");
-            require(success.body().contains("Alice") && success.body().contains("\"plan\""), "result should contain rows and plan");
+            require(success.body().contains("Alice") && success.body().contains("\"plan\"") && success.body().contains("\"storage\""),
+                "result should contain rows, plan and storage state");
             HttpResponse<String> compilerError = post(client, base, "compiler-error");
             require(compilerError.statusCode() == 422 && compilerError.body().contains("CompilationFailed") && compilerError.body().contains("\"line\":2"), "compiler diagnostics should retain location");
             HttpResponse<String> protocolError = post(client, base, "invalid-plan");

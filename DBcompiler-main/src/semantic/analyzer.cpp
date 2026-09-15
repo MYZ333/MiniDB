@@ -329,6 +329,13 @@ private:
                      location(name.span, statement_span_));
     }
 
+    Result<std::shared_ptr<const IndexSchema>> findIndex(const Identifier& name) const {
+        auto index = catalog_.findIndex(normalizeName(name.text));
+        if (index) return index;
+        return error(ErrorCode::IndexNotFound, "index '" + name.text + "' does not exist",
+                     location(name.span, statement_span_));
+    }
+
     Result<ColumnSpec> bindColumnDefinition(const ColumnDefinition& column) const {
         if (column.type == DataType::Null)
             return error(ErrorCode::UnsupportedType, "NULL is not a declarable column type",
@@ -448,6 +455,38 @@ private:
                                         std::move(constraints), stmt.if_not_exists});
     }
 
+    Result<BoundStatement> bindStatement(const CreateIndexStmt& stmt) {
+        const auto index_name = normalizeName(stmt.index.text);
+        if (catalog_.findIndex(index_name))
+            return error(ErrorCode::DuplicateIndex,
+                         "index '" + stmt.index.text + "' already exists",
+                         location(stmt.index.span, statement_span_));
+        auto lookup = findTable(stmt.table);
+        if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
+        auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        const auto column_name = normalizeName(stmt.column.text);
+        std::size_t ordinal = table->columns.size();
+        for (std::size_t i = 0; i < table->columns.size(); ++i)
+            if (table->columns[i].name == column_name) ordinal = i;
+        if (ordinal == table->columns.size())
+            return error(ErrorCode::ColumnNotFound,
+                         "column '" + stmt.column.text + "' does not exist",
+                         location(stmt.column.span, statement_span_));
+        const auto& column = table->columns[ordinal];
+        if (column.type != DataType::Int)
+            return error(ErrorCode::UnsupportedIndex,
+                         "CREATE INDEX only supports INT columns in this version",
+                         location(stmt.column.span, statement_span_));
+        if (!column.not_null && !column.primary_key)
+            return error(ErrorCode::UnsupportedIndex,
+                         "CREATE INDEX requires a NOT NULL or PRIMARY KEY column",
+                         location(stmt.column.span, statement_span_));
+        const RelationBinding relation{table, table->name, 0};
+        return success(BoundCreateIndex{
+            index_name, table, columnRef(relation, ordinal), catalog_.nextIndexId(),
+            DataType::Int, true, -1});
+    }
+
     Result<BoundStatement> bindStatement(const AlterTableStmt& stmt) {
         auto lookup = findTable(stmt.table);
         if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
@@ -481,6 +520,10 @@ private:
                         if (member == ordinal)
                             return error(ErrorCode::InvalidAst,
                                 "cannot drop a column used by a table constraint", action.column.span);
+                for (const auto& index : table->indexes)
+                    if (index.column_id.value == table->columns[ordinal].id.value)
+                        return error(ErrorCode::UnsupportedIndex,
+                            "cannot drop a column used by an index", action.column.span);
                 return success(BoundAlterTable{table,
                     BoundAlterDropColumn{ordinal, name}});
             } else if constexpr (std::is_same_v<T, AlterRenameTable>) {
@@ -524,6 +567,16 @@ private:
             names.push_back(std::move(name));
         }
         return success(BoundDropTable{std::move(names), stmt.if_exists});
+    }
+
+    Result<BoundStatement> bindStatement(const DropIndexStmt& stmt) {
+        const auto name = normalizeName(stmt.index.text);
+        auto lookup = catalog_.findIndex(name);
+        if (!lookup && !stmt.if_exists)
+            return error(ErrorCode::IndexNotFound,
+                         "index '" + stmt.index.text + "' does not exist",
+                         location(stmt.index.span, statement_span_));
+        return success(BoundDropIndex{name, std::move(lookup), stmt.if_exists});
     }
 
     Result<BoundStatement> bindStatement(const ExplainStmt& stmt) {

@@ -109,6 +109,12 @@ struct CreateTableStmt {
     bool if_not_exists = false; // A 只保留 IF NOT EXISTS；B 后续决定已存在时的 no-op 表示。
 };
 
+struct CreateIndexStmt {
+    Identifier index;
+    Identifier table;
+    Identifier column;
+};
+
 struct AlterAddColumn {
     ColumnDefinition column;
     bool column_keyword = false; // 记录是否显式写了 COLUMN；B 通常只需读取 column。
@@ -138,6 +144,11 @@ struct AlterTableStmt {
 struct DropTableStmt {
     std::vector<Identifier> tables;
     bool if_exists = false; // true 时 B/Catalog/执行层忽略不存在的表。
+};
+
+struct DropIndexStmt {
+    Identifier index;
+    bool if_exists = false; // true 时 B/Catalog/执行层忽略不存在的索引。
 };
 
 struct InsertStmt {
@@ -220,7 +231,8 @@ struct DeleteStmt {
 };
 
 // EXPLAIN 只包裹一条基础语句，禁止继续嵌套 EXPLAIN，避免产生含糊的执行语义。
-using ExplainTarget = std::variant<CreateTableStmt, AlterTableStmt, DropTableStmt, InsertStmt,
+using ExplainTarget = std::variant<CreateTableStmt, CreateIndexStmt, AlterTableStmt,
+                                   DropTableStmt, DropIndexStmt, InsertStmt,
                                    SelectStmt, UpdateStmt, DeleteStmt>;
 
 struct ExplainStmt {
@@ -230,7 +242,7 @@ struct ExplainStmt {
 
 struct Statement {
     std::variant<CreateTableStmt, AlterTableStmt, DropTableStmt, InsertStmt, SelectStmt,
-                 UpdateStmt, DeleteStmt, ExplainStmt> node;
+                 UpdateStmt, DeleteStmt, CreateIndexStmt, DropIndexStmt, ExplainStmt> node;
     SourceLocation span;
 };
 

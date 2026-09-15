@@ -4,7 +4,7 @@
 该文档，不链接或反序列化 C++ 内存对象。
 
 当以 `--catalog-file <path>` 启动时，导出器会恢复 Java 提供的持久化 Catalog 快照，
-保留目录版本、表列 ID、约束和默认值；这使重启后的独立 SELECT/INSERT 也能通过语义分析。
+保留目录版本、表列 ID、约束、默认值和索引；这使重启后的独立 SELECT/INSERT 也能通过语义分析。
 未传该参数时仍以空 Catalog 编译完整建表脚本。
 
 ```json
@@ -20,11 +20,17 @@
 导出后模拟 Catalog 变更，因此后续语句看到正确模式；Java 引擎必须采用相同的版本规则。
 `EXPLAIN ANALYZE` 包裹 CREATE/DROP 时也按实际执行处理该变更，普通 EXPLAIN 不改变 Catalog。
 
-节点类型为 `CreateTable`、`AlterTable`、`DropTable`、`Insert`、`SeqScan`、`EmptyResult`、
+Catalog 快照文件继续使用 `M/T/C/K` 记录，并新增索引记录：
+`I <indexId> <hexIndexName> <tableId> <columnId> <keyType> <uniqueFlag> <metadataPageId>`。
+导出器读取全部 `I` 记录后把它们挂回对应表；同一脚本中 CREATE INDEX 的临时 ID 使用
+`max(existing indexId)+1`。
+
+节点类型为 `CreateTable`、`CreateIndex`、`AlterTable`、`DropTable`、`DropIndex`、`Insert`、`SeqScan`、`IndexScan`、`EmptyResult`、
 `DerivedTable`、`NestedLoopJoin`、`Filter`、`GroupBy`、`Aggregate`、`Sort`、`Project`、
 `SetOperation`、`Update`、`Delete` 和 `Explain`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
 `relationId`、`ordinal`、`type`。表列还可含 `varcharLength`、`primaryKey`、`notNull`、
 `unique`、`defaultValue` 和 `hasDefault`；后一个字段用于区分“没有默认值”和 `DEFAULT NULL`。
+索引对象含 `id`、`name`、`tableId`、`columnId`、`keyType`、`unique` 和 `metadataPageId`。
 表达式以 `kind: column|literal|unary|binary|aggregate|case|inSubquery|existsSubquery|scalarSubquery`
 表示，运算名称与
 C++ 的 `UnaryOp`、`BinaryOp` 枚举一致。字符串、整数/浮点、BOOL、NULL 分别使用 JSON
@@ -32,9 +38,13 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
 
 - `CreateTable` 额外使用 `ifNotExists` 和 `tableConstraints`；每个表级约束含
   `kind: PRIMARY_KEY|UNIQUE` 及从 0 开始的 `columns` 序号数组。
+- `CreateIndex` 使用 `indexName`、预测 `indexId`、`table`、`column`、`keyType`、`unique`
+  和 `metadataPageId`。协议 1 的编译器只导出单列 `INT`、`unique=true` 索引。
 - `AlterTable` 使用 `table` 和 `action`。action.type 为 AddColumn、DropColumn、RenameTable、
   RenameColumn；分别携带 column、ordinal/columnName、newName、ordinal/newName。
 - `DropTable` 使用 `tableNames` 和 `ifExists`。至少删除一张表时目录版本增加一次。
+- `DropIndex` 使用 `index`、`indexName` 和 `ifExists`。`DROP INDEX IF EXISTS missing`
+  的 no-op 计划中 `index` 为 null。
 - `Insert` 的 `rows` 是完整记录二维数组；`values` 保留第一行以兼容旧消费者。
 - `NestedLoopJoin` 使用 `left`、`right`、`predicate` 和 `joinType`，输出顺序为左列后接右列。
   joinType 为 INNER/LEFT/RIGHT/FULL；旧计划缺失时按 INNER 处理。
@@ -43,6 +53,11 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
   `columns` 为扫描要物化的精确列引用：缺失或 JSON null 表示全表列，非空数组表示裁剪后的
   子集，空数组表示只产生行数/RowId 而不读取业务列。数组顺序也是运行时行布局顺序；当前
   优化器按表模式 ordinal 升序导出，执行器会逐项校验 tableId、relationId、columnId、ordinal 和 type。
+- `IndexScan` 与 `SeqScan` 拥有相同的 `relationId`、`relationName` 和 `columns` 含义，
+  额外含 `index` 和 `keyRange`。`keyRange` 可含 `lower`/`upper` 以及对应
+  `lowerInclusive`/`upperInclusive`；缺失下界或上界表示无界。原 Filter 节点会保留在
+  IndexScan 上方执行完整谓词校验。IndexScan 的业务列输出布局与同位置 SeqScan 一致，
+  `carriesRowId` 固定为 true，便于后续算子在需要时继续携带稳定 RowId。
 - `EmptyResult` 不含可执行子节点，读取它固定返回零行。`columns` 是与节点 output 对齐的
   列引用数组；`relations` 保存原输入关系的 `table`、`relationId` 和 `relationName`。
   Java 在返回零行前仍校验这些元数据，并在外连接补 NULL 时从 columns 恢复身份布局。

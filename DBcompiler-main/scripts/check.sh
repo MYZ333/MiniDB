@@ -25,11 +25,12 @@ done
 "$compiler" "${flags[@]}" -c src/planner/plan_printer.cpp -o build/direct/plan_printer.o
 "$compiler" "${flags[@]}" -c src/optimizer/constant_fold.cpp -o build/direct/constant_fold.o
 "$compiler" "${flags[@]}" -c src/optimizer/predicate_pushdown.cpp -o build/direct/predicate_pushdown.o
+"$compiler" "${flags[@]}" -c src/optimizer/index_scan.cpp -o build/direct/index_scan.o
 "$compiler" "${flags[@]}" -c src/optimizer/empty_result.cpp -o build/direct/empty_result.o
 "$compiler" "${flags[@]}" -c src/optimizer/column_pruning.cpp -o build/direct/column_pruning.o
 "$compiler" "${flags[@]}" -c src/optimizer/optimizer.cpp -o build/direct/optimizer.o
 "$archiver" rcs build/direct/libminisql_frontend.a build/direct/lexer.o build/direct/parser.o build/direct/ast_optimizer.o
-"$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/type_rules.o build/direct/memory_catalog.o build/direct/plan_builder.o build/direct/plan_printer.o build/direct/constant_fold.o build/direct/predicate_pushdown.o build/direct/empty_result.o build/direct/column_pruning.o build/direct/optimizer.o
+"$archiver" rcs build/direct/libminisql_backend.a build/direct/analyzer.o build/direct/type_rules.o build/direct/memory_catalog.o build/direct/plan_builder.o build/direct/plan_printer.o build/direct/constant_fold.o build/direct/predicate_pushdown.o build/direct/index_scan.o build/direct/empty_result.o build/direct/column_pruning.o build/direct/optimizer.o
 libraries=(build/direct/libminisql_frontend.a build/direct/libminisql_backend.a)
 
 "$compiler" "${flags[@]}" app/main.cpp "${libraries[@]}" -o build/direct/minisql

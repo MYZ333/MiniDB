@@ -1,4 +1,4 @@
-# MiniSQL 文法（接口版本 0.27）
+# MiniSQL 文法（接口版本 0.28）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 已整合 feature-zhangbo 的语法扩展与 B 的聚合实现。下列 EBNF 描述 A 能解析的范围，
@@ -18,7 +18,7 @@
   第一阶段不允许字符串跨行。字符串值保持大小写和 UTF-8 字节内容。
 - 跳过空白、`--` 行注释和不嵌套的 `/* ... */` 块注释。
 - 支持运算符 `= != <> < <= > >= + - * /`；不支持 `==`。
-- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级和表级约束、ALTER TABLE、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、派生表、子查询、UNION/INTERSECT/EXCEPT、CASE、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN、COUNT/SUM/AVG/MIN/MAX 以及 EXPLAIN/EXPLAIN ANALYZE 关键字。
+- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级和表级约束、ALTER TABLE、CREATE/DROP INDEX、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、派生表、子查询、UNION/INTERSECT/EXCEPT、CASE、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN、COUNT/SUM/AVG/MIN/MAX 以及 EXPLAIN/EXPLAIN ANALYZE 关键字。
 - INSERT 值位置不支持 `DEFAULT` 关键字；省略列时由 B 写入列 DEFAULT 或 NULL。
 - COUNT/SUM/AVG/MIN/MAX 由 A 识别为关键字，不能再作为未加引号的普通表名、列名或别名。
 - 每条语句必须以分号结束；空输入合法；单独的空分号不是语句。
@@ -34,8 +34,10 @@ program     = { statement } ;
 statement   = (explain | base_statement), ";" ;
 explain     = EXPLAIN, [ANALYZE], base_statement ;
 base_statement = create | alter | drop | insert | select | update | delete ;
-create      = CREATE, TABLE, [IF, NOT, EXISTS], name, "(", table_element,
-              { ",", table_element }, ")" ;
+create      = create_table | create_index ;
+create_table = CREATE, TABLE, [IF, NOT, EXISTS], name, "(", table_element,
+               { ",", table_element }, ")" ;
+create_index = CREATE, INDEX, name, ON, name, "(", name, ")" ;
 table_element = column_def | table_constraint ;
 column_def  = name, type, { column_constraint } ;
 column_constraint = PRIMARY, KEY | NOT, NULL | UNIQUE | DEFAULT, literal ;
@@ -46,7 +48,9 @@ alter       = ALTER, TABLE, name,
               | DROP, [COLUMN], name
               | RENAME, TO, name
               | RENAME, COLUMN, name, TO, name ) ;
-drop        = DROP, TABLE, [IF, EXISTS], names ;
+drop        = drop_table | drop_index ;
+drop_table  = DROP, TABLE, [IF, EXISTS], names ;
+drop_index  = DROP, INDEX, [IF, EXISTS], name ;
 insert      = INSERT, INTO, name, [ "(", names, ")" ],
               VALUES, value_row, { ",", value_row } ;
 value_row   = "(", literal, { ",", literal }, ")" ;
@@ -127,6 +131,7 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 | SELECT 计算表达式、聚合结果算术、ORDER BY 表达式 | 支持 | 支持 |
 | LIKE/NOT LIKE、VARCHAR(n)、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT | 支持 | 支持 |
 | 多行 INSERT、DROP TABLE（含 IF EXISTS 和多表名） | 支持 | 支持 |
+| CREATE INDEX、DROP INDEX、DROP INDEX IF EXISTS | 支持 | 支持编译器侧计划和 JSON；执行层需实现索引元数据变更 |
 | CREATE IF NOT EXISTS、表级复合 PRIMARY KEY/UNIQUE | 支持 | 支持，Catalog 与写入约束生效 |
 | ALTER TABLE ADD/DROP/RENAME | 支持 | 支持，保留表/行 ID 并迁移已有记录 |
 | IN/NOT IN、EXISTS/NOT EXISTS、标量子查询 | 支持 | 支持，含关联子查询和 SQL 三值逻辑 |
@@ -180,6 +185,12 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
 - CREATE TABLE IF NOT EXISTS 在表已存在时不改变模式和 CatalogVersion。ALTER ADD 为已有行写入
   DEFAULT 或 NULL，并重新检查约束；DROP 不允许删除最后一列或表级约束成员；RENAME 保留表 ID、
   列 ID 和已有 RowId。每个成功改变模式的 ALTER 使 CatalogVersion 增加一次。
+- 第一版索引只支持 `CREATE INDEX index_name ON table_name(column_name)`，不支持
+  `CREATE UNIQUE INDEX`、复合索引、非唯一索引或非 INT 键。B 要求目标列为 INT 且
+  NOT NULL 或 PRIMARY KEY；导出计划固定 `keyType=INT`、`unique=true`。索引名在全库唯一。
+  同一 SQL 脚本中，导出器按 `max(existing indexId)+1` 预测新 indexId，并在 CREATE INDEX
+  计划导出后模拟索引可见性；Java 端必须采用同样规则才能让随后 SELECT 稳定引用该索引。
+  DROP INDEX 无 IF EXISTS 时要求索引存在；带 IF EXISTS 时缺失索引导出 no-op DropIndex。
 - IN 子查询和标量子查询必须返回一列，集合运算两侧必须列数及逐列类型相同。标量子查询零行
   返回 NULL，多于一行报告 ScalarSubqueryCardinality。EXISTS 只检查是否有行；NOT EXISTS 不受
   输出 NULL 影响。IN 无匹配但发生 NULL 比较时返回 UNKNOWN，空子查询返回 FALSE。
@@ -191,6 +202,7 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
   非 NULL 结果类型必须一致。省略 ELSE 等价于 NULL，按书写顺序求值且只执行命中的结果表达式。
 - DROP TABLE 可带多个名字。无 IF EXISTS 时先验证全部表再删除；IF EXISTS 忽略缺失表。
   至少删除一张表时 CatalogVersion 只增加一次，存储中的记录随表删除。
+  DROP INDEX 仅接受单个索引名；成功删除一个索引时 CatalogVersion 增加一次。
 - EXPLAIN 将一条基础语句绑定并优化后包装为 ExplainPlan，返回单列 `QUERY PLAN`
   文本树，不执行目标语句。EXPLAIN ANALYZE 执行相同的目标计划，并为每个算子
   输出累计实际行数、包含子算子的耗时和调用次数。它对 INSERT/UPDATE/DELETE/CREATE/DROP
@@ -203,6 +215,10 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
 - 列裁剪从最终投影反向加入 Filter、JOIN、GROUP/HAVING、ORDER BY 和表达式依赖；SeqScan
   按原表模式顺序只物化这些列。UPDATE 因整行写回和约束检查保留全列，RowId 独立于业务列；
   DELETE 只保留条件列，COUNT(*) 可使用零业务列扫描。
+- 索引选择发生在谓词下推和空结果传播之后、列裁剪之前。当前仅在单表 `Filter -> SeqScan`
+  中，从 AND 合取项按书写顺序选择第一个可用的单列 INT 索引范围；支持 `=`、`<`、`<=`、`>`、
+  `>=` 以及 Parser 展开的 BETWEEN。原 Filter 始终保留在 IndexScan 上方用于完整谓词校验。
+  `<>`、OR、NULL 比较、列列比较、表达式比较、JOIN 条件、派生表和子查询不会触发 IndexScan。
 - 恒假 Filter 和恒假 INNER JOIN 在其输入不会产生副作用或运行期错误时改写为 EmptyResult。
   INNER 任一侧为空、LEFT 左侧为空、RIGHT 右侧为空、FULL 两侧均为空时可以继续传播；另一侧
   可能报错时保持原算子。Project、全局 Aggregate、UPDATE/DELETE 和 Explain 根边界不会删除，
@@ -288,3 +304,5 @@ SELECT * FROM student OFFSET 2; -- OFFSET 当前必须跟在 LIMIT 后
   NULL 扩展；Java 可执行并在 EXPLAIN ANALYZE 中显示零行且不访问被消除的扫描。
 - 0.27：合并 A 的 CREATE IF NOT EXISTS、表级约束、ALTER、子查询、派生表、三类集合运算和
   CASE；B 完成名称与类型绑定、计划节点、JSON 协议、Java 执行、模式迁移和端到端回归。
+- 0.28：新增编译器侧 CREATE/DROP INDEX、Catalog 索引快照、CreateIndex/DropIndex/IndexScan
+  计划节点和 JSON 导出；第一版仅支持单列唯一 NOT NULL INT 索引。

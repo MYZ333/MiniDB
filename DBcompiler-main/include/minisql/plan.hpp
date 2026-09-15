@@ -19,12 +19,26 @@ struct CreateTablePlan {
     std::vector<TableConstraintSpec> table_constraints = {};
     bool if_not_exists = false;
 };
+struct CreateIndexPlan {
+    std::string index_name;
+    std::shared_ptr<const TableSchema> table;
+    BoundColumnRef column;
+    IndexId predicted_index_id;
+    DataType key_type = DataType::Int;
+    bool unique = true;
+    std::int64_t metadata_page_id = -1;
+};
 struct AlterTablePlan {
     std::shared_ptr<const TableSchema> table;
     BoundAlterAction action;
 };
 struct DropTablePlan {
     std::vector<std::string> table_names;
+    bool if_exists = false;
+};
+struct DropIndexPlan {
+    std::string index_name;
+    std::shared_ptr<const IndexSchema> index;
     bool if_exists = false;
 };
 struct InsertPlan {
@@ -37,6 +51,20 @@ struct SeqScanPlan {
     std::uint64_t relation_id = 0;
     std::string relation_name = {};
     // nullopt 兼容旧计划，表示扫描全列；空 vector 表示仅计数而不读取业务列。
+    std::optional<std::vector<BoundColumnRef>> columns = std::nullopt;
+};
+struct IndexRangeBound {
+    std::int64_t value = 0;
+    bool inclusive = true;
+};
+struct IndexScanPlan {
+    std::shared_ptr<const TableSchema> table;
+    std::shared_ptr<const IndexSchema> index;
+    std::uint64_t relation_id = 0;
+    std::string relation_name = {};
+    std::optional<IndexRangeBound> lower = {};
+    std::optional<IndexRangeBound> upper = {};
+    // nullopt 兼容全列；空 vector 表示只需要行标识。
     std::optional<std::vector<BoundColumnRef>> columns = std::nullopt;
 };
 // 空结果仍保存物理列身份和关系来源，供上层表达式及外连接 NULL 扩展恢复布局。
@@ -118,7 +146,8 @@ struct ExplainPlan {
 };
 
 struct PlanNode {
-    std::variant<CreateTablePlan, AlterTablePlan, DropTablePlan, InsertPlan, SeqScanPlan,
+    std::variant<CreateTablePlan, CreateIndexPlan, AlterTablePlan, DropTablePlan,
+                 DropIndexPlan, InsertPlan, SeqScanPlan, IndexScanPlan,
                  EmptyResultPlan, DerivedTablePlan, NestedLoopJoinPlan, FilterPlan, GroupByPlan,
                  AggregatePlan, SortPlan, ProjectPlan, SetOperationPlan,
                  UpdatePlan, DeletePlan, ExplainPlan> node;

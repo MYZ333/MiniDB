@@ -240,6 +240,16 @@ Result<PlanPtr> eliminateNode(const PlanPtr& plan, std::size_t depth) {
                 empty = right_empty && safeToSkip(left);
             } else empty = left_empty && right_empty;
             return empty ? emptyLike(current) : Result<PlanPtr>{current};
+        } else if constexpr (std::is_same_v<T, CreateTablePlan> ||
+                             std::is_same_v<T, CreateIndexPlan> ||
+                             std::is_same_v<T, AlterTablePlan> ||
+                             std::is_same_v<T, DropTablePlan> ||
+                             std::is_same_v<T, DropIndexPlan> ||
+                             std::is_same_v<T, InsertPlan> ||
+                             std::is_same_v<T, SeqScanPlan> ||
+                             std::is_same_v<T, IndexScanPlan> ||
+                             std::is_same_v<T, EmptyResultPlan>) {
+            return plan;
         } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
             auto left_result = eliminateNode(op.left, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;

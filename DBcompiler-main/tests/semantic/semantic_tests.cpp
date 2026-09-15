@@ -129,6 +129,54 @@ int main() {
               "DROP names or IF EXISTS flag were lost");
         failure(f.analyzeNode(DropTableStmt{{id("missing")}, false}), ErrorCode::TableNotFound);
     });
+    suite.run("CREATE INDEX validates name table column type and nullability", [] {
+        MemoryCatalog catalog;
+        value(catalog.createTable("account", {{"id", DataType::Int, {}, true},
+                                               {"name", DataType::Varchar},
+                                               {"age", DataType::Int}}));
+        auto snapshot = catalog.snapshot();
+        auto bound = value(analyze(Statement{
+            CreateIndexStmt{id("IDX_ACCOUNT_ID"), id("account"), id("id")}, span(0, 40)},
+            *snapshot));
+        const auto& create = std::get<BoundCreateIndex>(bound.node);
+        check(create.index_name == "idx_account_id" &&
+              create.table->name == "account" &&
+              create.column.column_id.value == 1 &&
+              create.predicted_index_id.value == 1 &&
+              create.key_type == DataType::Int && create.unique,
+              "CREATE INDEX binding lost metadata");
+
+        failure(analyze(Statement{CreateIndexStmt{id("i"), id("missing"), id("id")}, {}},
+                        *snapshot), ErrorCode::TableNotFound);
+        failure(analyze(Statement{CreateIndexStmt{id("i"), id("account"), id("missing")}, {}},
+                        *snapshot), ErrorCode::ColumnNotFound);
+        failure(analyze(Statement{CreateIndexStmt{id("i"), id("account"), id("name")}, {}},
+                        *snapshot), ErrorCode::UnsupportedIndex);
+        failure(analyze(Statement{CreateIndexStmt{id("i"), id("account"), id("age")}, {}},
+                        *snapshot), ErrorCode::UnsupportedIndex);
+
+        value(catalog.createIndex("idx_account_id", "account", "id"));
+        failure(analyze(Statement{CreateIndexStmt{id("idx_account_id"), id("account"), id("id")}, {}},
+                        *catalog.snapshot()), ErrorCode::DuplicateIndex);
+    });
+    suite.run("DROP INDEX binds existing index and IF EXISTS no-op", [] {
+        MemoryCatalog catalog;
+        value(catalog.createTable("account", {{"id", DataType::Int, {}, true}}));
+        value(catalog.createIndex("idx_account_id", "account", "id"));
+        auto bound = value(analyze(Statement{DropIndexStmt{id("IDX_ACCOUNT_ID"), false}, {}},
+                                   *catalog.snapshot()));
+        const auto& drop = std::get<BoundDropIndex>(bound.node);
+        check(drop.index_name == "idx_account_id" && drop.index &&
+              drop.index->id.value == 1 && !drop.if_exists,
+              "DROP INDEX binding lost target index");
+        failure(analyze(Statement{DropIndexStmt{id("missing"), false}, {}},
+                        *catalog.snapshot()), ErrorCode::IndexNotFound);
+        bound = value(analyze(Statement{DropIndexStmt{id("missing"), true}, {}},
+                              *catalog.snapshot()));
+        const auto& missing = std::get<BoundDropIndex>(bound.node);
+        check(missing.if_exists && !missing.index,
+              "DROP INDEX IF EXISTS should bind as a no-op for missing names");
+    });
     suite.run("INSERT omitted list uses schema order", [] {
         Fixture f;
         auto binding = value(f.analyzeNode(insert()));

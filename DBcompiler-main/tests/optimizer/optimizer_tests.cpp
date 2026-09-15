@@ -62,6 +62,26 @@ const SeqScanPlan& scanBelow(const PlanPtr& plan) {
         check(node != nullptr, "single-input path did not reach SeqScan");
     }
 }
+
+const IndexScanPlan& indexScanBelow(const PlanPtr& plan) {
+    const PlanNode* node = plan.get();
+    for (;;) {
+        if (const auto* scan = std::get_if<IndexScanPlan>(&node->node)) return *scan;
+        node = std::visit([](const auto& op) -> const PlanNode* {
+            using T = std::decay_t<decltype(op)>;
+            if constexpr (std::is_same_v<T, FilterPlan> ||
+                          std::is_same_v<T, GroupByPlan> ||
+                          std::is_same_v<T, AggregatePlan> ||
+                          std::is_same_v<T, SortPlan> ||
+                          std::is_same_v<T, ProjectPlan> ||
+                          std::is_same_v<T, UpdatePlan> ||
+                          std::is_same_v<T, DeletePlan> ||
+                          std::is_same_v<T, ExplainPlan>) return op.input.get();
+            else return nullptr;
+        }, node->node);
+        check(node != nullptr, "single-input path did not reach IndexScan");
+    }
+}
 } // namespace
 
 int main() {
@@ -367,6 +387,48 @@ int main() {
             f.compile("UPDATE student SET age=age+1 WHERE id=1;")));
         check(!scanBelow(update.root).columns,
               "UPDATE must retain the complete old row for validation and writeback");
+    });
+    suite.run("indexed single-table predicates replace only the scan and keep Filter", [] {
+        MemoryCatalog catalog;
+        value(catalog.createTable("account", {{"id", DataType::Int, {}, true},
+                                               {"name", DataType::Varchar},
+                                               {"age", DataType::Int}}));
+        value(catalog.createIndex("idx_account_id", "account", "id"));
+        const auto compile = [&](const std::string& sql) {
+            const auto statements = value(parse(value(lex(sql))));
+            return value(buildPlan(value(analyze(statements[0], *catalog.snapshot()))));
+        };
+
+        auto equality = value(optimizePlan(
+            compile("SELECT name FROM account WHERE id=1;")));
+        const auto& project = std::get<ProjectPlan>(equality.root->node);
+        const auto& filter = std::get<FilterPlan>(project.input->node);
+        const auto& index_scan = std::get<IndexScanPlan>(filter.input->node);
+        check(index_scan.index && index_scan.index->name == "idx_account_id" &&
+              index_scan.lower && index_scan.upper &&
+              index_scan.lower->value == 1 && index_scan.upper->value == 1 &&
+              index_scan.lower->inclusive && index_scan.upper->inclusive,
+              "equality predicate did not become an exact IndexScan range");
+        check(index_scan.columns && index_scan.columns->size() == 2,
+              "IndexScan did not participate in column pruning");
+        check(formatPlan(equality).find("Filter[") != std::string::npos &&
+              formatPlan(equality).find("IndexScan[idx_account_id") != std::string::npos,
+              "IndexScan rewrite should preserve the validating Filter");
+
+        auto range = value(optimizePlan(
+            compile("SELECT name FROM account WHERE id BETWEEN 2 AND 5;")));
+        const auto& range_scan = indexScanBelow(range.root);
+        check(range_scan.lower && range_scan.upper &&
+              range_scan.lower->value == 2 && range_scan.upper->value == 5 &&
+              range_scan.lower->inclusive && range_scan.upper->inclusive,
+              "BETWEEN predicate did not become an inclusive IndexScan range");
+
+        auto unsupported = value(optimizePlan(
+            compile("SELECT name FROM account WHERE id=1 OR id=2;")));
+        check(std::holds_alternative<SeqScanPlan>(
+                  std::get<FilterPlan>(std::get<ProjectPlan>(unsupported.root->node).input->node)
+                      .input->node),
+              "OR predicate should stay on SeqScan");
     });
     suite.run("constant-false JOIN and downstream operators propagate emptiness", [] {
         Fixture f;

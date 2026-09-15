@@ -144,6 +144,13 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                     if (ordinal >= stmt.columns.size() || !members.insert(ordinal).second)
                         return invalid("CREATE table constraint column is invalid");
             }
+        } else if constexpr (std::is_same_v<T, BoundCreateIndex>) {
+            if (stmt.index_name.empty() || !stmt.table || !validRef(stmt.column, *stmt.table))
+                return invalid("CREATE INDEX target is inconsistent");
+            const auto& column = stmt.table->columns[stmt.column.ordinal];
+            if (column.type != DataType::Int || stmt.key_type != DataType::Int ||
+                !(column.not_null || column.primary_key) || !stmt.unique)
+                return invalid("CREATE INDEX only supports unique NOT NULL INT columns");
         } else if constexpr (std::is_same_v<T, BoundAlterTable>) {
             if (!stmt.table || stmt.table->columns.empty())
                 return invalid("ALTER TABLE target schema is missing");
@@ -153,6 +160,10 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
             for (const auto& name : stmt.table_names)
                 if (name.empty() || !names.insert(name).second)
                     return invalid("DROP table names must be non-empty and unique");
+        } else if constexpr (std::is_same_v<T, BoundDropIndex>) {
+            if (stmt.index_name.empty()) return invalid("DROP INDEX requires an index name");
+            if (!stmt.index && !stmt.if_exists)
+                return invalid("DROP INDEX missing target requires IF EXISTS");
         } else if constexpr (std::is_same_v<T, BoundExplain>) {
             if (!stmt.target) return invalid("EXPLAIN target is missing");
             if (stmt.target->catalog_version != statement.catalog_version)
@@ -523,10 +534,16 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
         if constexpr (std::is_same_v<T, BoundCreateTable>) {
             return node(CreateTablePlan{stmt.table_name, stmt.columns,
                                         stmt.table_constraints, stmt.if_not_exists});
+        } else if constexpr (std::is_same_v<T, BoundCreateIndex>) {
+            return node(CreateIndexPlan{stmt.index_name, stmt.table, stmt.column,
+                                        stmt.predicted_index_id, stmt.key_type,
+                                        stmt.unique, stmt.metadata_page_id});
         } else if constexpr (std::is_same_v<T, BoundAlterTable>) {
             return node(AlterTablePlan{stmt.table, stmt.action});
         } else if constexpr (std::is_same_v<T, BoundDropTable>) {
             return node(DropTablePlan{stmt.table_names, stmt.if_exists});
+        } else if constexpr (std::is_same_v<T, BoundDropIndex>) {
+            return node(DropIndexPlan{stmt.index_name, stmt.index, stmt.if_exists});
         } else if constexpr (std::is_same_v<T, BoundInsert>) {
             return node(InsertPlan{stmt.table, stmt.values, stmt.rows});
         } else if constexpr (std::is_same_v<T, BoundSelect>) {

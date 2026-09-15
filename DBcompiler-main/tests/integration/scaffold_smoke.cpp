@@ -3,6 +3,7 @@
 #include "minisql/lexer.hpp"
 #include "minisql/parser.hpp"
 #include "minisql/memory_catalog.hpp"
+#include "minisql/optimizer.hpp"
 #include "minisql/plan_printer.hpp"
 #include "../test_support.hpp"
 
@@ -138,6 +139,40 @@ int main() {
         check(update.input->carries_row_id && deletion.input->carries_row_id, "DML row identity missing");
         check(plans[0].catalog_version == 0 && plans[4].catalog_version == 1 && catalog.snapshot()->version() == 1,
               "compilation changed metadata version unexpectedly");
+    });
+    suite.run("SQL index DDL changes later optimization visibility when catalog is advanced", [] {
+        const auto parsed = statements(
+            "CREATE TABLE account(id INT PRIMARY KEY,name VARCHAR);"
+            "CREATE INDEX idx_account_id ON account(id);"
+            "SELECT name FROM account WHERE id=1;"
+            "DROP INDEX IF EXISTS idx_account_id;"
+            "SELECT name FROM account WHERE id=1;");
+        MemoryCatalog catalog;
+        std::vector<LogicalPlan> plans;
+        for (const auto& statement : parsed) {
+            const auto bound = value(analyze(statement, *catalog.snapshot()));
+            auto plan = value(buildPlan(bound));
+            plans.push_back(value(optimizePlan(plan)));
+            if (const auto* create = std::get_if<BoundCreateTable>(&bound.node)) {
+                value(catalog.createTable(create->table_name, create->columns));
+            } else if (const auto* create_index = std::get_if<BoundCreateIndex>(&bound.node)) {
+                value(catalog.createIndex(
+                    create_index->index_name, create_index->table->name,
+                    create_index->table->columns[create_index->column.ordinal].name,
+                    create_index->key_type, create_index->unique,
+                    create_index->metadata_page_id, create_index->predicted_index_id));
+            } else if (const auto* drop_index = std::get_if<BoundDropIndex>(&bound.node)) {
+                value(catalog.dropIndex(drop_index->index_name, drop_index->if_exists));
+            }
+        }
+        const auto& indexed_filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(plans[2].root->node).input->node);
+        check(std::holds_alternative<IndexScanPlan>(indexed_filter.input->node),
+              "SELECT after CREATE INDEX should use IndexScan");
+        const auto& dropped_filter = std::get<FilterPlan>(
+            std::get<ProjectPlan>(plans[4].root->node).input->node);
+        check(std::holds_alternative<SeqScanPlan>(dropped_filter.input->node),
+              "SELECT after DROP INDEX should return to SeqScan");
     });
     suite.run("SQL boolean precedence survives binding and planning", [] {
         Fixture f;

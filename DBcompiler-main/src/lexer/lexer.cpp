@@ -29,6 +29,7 @@ std::string asciiLower(std::string text) {
 TokenKind keywordOrIdentifier(const std::string& lexeme) {
     static const std::unordered_map<std::string, TokenKind> keywords{
         {"create", TokenKind::Create}, {"table", TokenKind::Table},
+        {"index", TokenKind::Index},
         {"alter", TokenKind::Alter}, {"add", TokenKind::Add}, {"column", TokenKind::Column},
         {"rename", TokenKind::Rename}, {"to", TokenKind::To},
         {"drop", TokenKind::Drop}, {"if", TokenKind::If}, {"exists", TokenKind::Exists},

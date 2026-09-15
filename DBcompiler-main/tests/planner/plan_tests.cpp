@@ -84,6 +84,34 @@ int main() {
         check(drop.if_exists && drop.table_names == std::vector<std::string>({"student", "missing"}) &&
               plan.catalog_version == 1, "DROP plan payload mismatch");
     });
+    suite.run("CREATE and DROP INDEX plans carry stable metadata", [] {
+        MemoryCatalog catalog;
+        value(catalog.createTable("account", {{"id", DataType::Int, {}, true}}));
+        auto create = value(buildPlan(value(analyze(Statement{
+            CreateIndexStmt{id("idx_account_id"), id("account"), id("id")}, {}},
+            *catalog.snapshot()))));
+        const auto& create_index = std::get<CreateIndexPlan>(create.root->node);
+        check(create_index.index_name == "idx_account_id" &&
+              create_index.table->name == "account" &&
+              create_index.column.column_id.value == 1 &&
+              create_index.predicted_index_id.value == 1 &&
+              create_index.key_type == DataType::Int &&
+              create_index.unique &&
+              create.root->output.empty() && !create.root->carries_row_id,
+              "CREATE INDEX plan payload mismatch");
+        check(formatPlan(create).find("CreateIndex[idx_account_id") != std::string::npos,
+              "CREATE INDEX printer omitted the node");
+
+        value(catalog.createIndex("idx_account_id", "account", "id"));
+        auto drop = value(buildPlan(value(analyze(Statement{
+            DropIndexStmt{id("idx_account_id"), false}, {}}, *catalog.snapshot()))));
+        const auto& drop_index = std::get<DropIndexPlan>(drop.root->node);
+        check(drop_index.index && drop_index.index->id.value == 1 &&
+              drop_index.index_name == "idx_account_id" &&
+              !drop_index.if_exists &&
+              drop.root->output.empty() && !drop.root->carries_row_id,
+              "DROP INDEX plan payload mismatch");
+    });
     suite.run("INSERT plan carries already reordered values", [] {
         Fixture f;
         auto plan = f.compile(InsertStmt{id("student"), std::vector<Identifier>{id("name"), id("age"), id("id")},

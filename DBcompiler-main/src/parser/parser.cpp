@@ -60,6 +60,7 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::String: return "string";
     case TokenKind::Create: return "CREATE";
     case TokenKind::Table: return "TABLE";
+    case TokenKind::Index: return "INDEX";
     case TokenKind::Alter: return "ALTER";
     case TokenKind::Add: return "ADD";
     case TokenKind::Column: return "COLUMN";
@@ -483,8 +484,11 @@ private:
         throw unexpected({"INT", "VARCHAR", "BOOL", "FLOAT"});
     }
 
-    CreateTableStmt createStatement() {
-        consume(TokenKind::Table, "TABLE");
+    ExplainTarget createStatement() {
+        if (match(TokenKind::Index)) {
+            return createIndexStatement();
+        }
+        consume(TokenKind::Table, std::vector<std::string>{"TABLE", "INDEX"});
         const bool if_not_exists = createIfNotExists();
         CreateTableStmt stmt{identifier(), {}};
         stmt.if_not_exists = if_not_exists;
@@ -495,6 +499,20 @@ private:
         }
         consume(TokenKind::RightParen, "')'");
         return stmt;
+    }
+
+    CreateIndexStmt createIndexStatement() {
+        Identifier index = identifier();
+        consume(TokenKind::On, "ON");
+        Identifier table = identifier();
+        consume(TokenKind::LeftParen, "'('");
+        Identifier column = identifier();
+        if (match(TokenKind::Comma)) {
+            throw syntaxError("CREATE INDEX supports exactly one column in this version",
+                              locationOf(previous()));
+        }
+        consume(TokenKind::RightParen, "')'");
+        return CreateIndexStmt{std::move(index), std::move(table), std::move(column)};
     }
 
     bool createIfNotExists() {
@@ -559,14 +577,27 @@ private:
         throw unexpected({"ADD", "DROP", "RENAME"});
     }
 
-    DropTableStmt dropStatement() {
-        consume(TokenKind::Table, "TABLE");
+    ExplainTarget dropStatement() {
+        if (match(TokenKind::Index)) {
+            return dropIndexStatement();
+        }
+        consume(TokenKind::Table, std::vector<std::string>{"TABLE", "INDEX"});
         DropTableStmt stmt{{}, false};
         if (match(TokenKind::If)) {
             consume(TokenKind::Exists, "EXISTS after IF");
             stmt.if_exists = true;
         }
         stmt.tables = names();
+        return stmt;
+    }
+
+    DropIndexStmt dropIndexStatement() {
+        DropIndexStmt stmt{{}, false};
+        if (match(TokenKind::If)) {
+            consume(TokenKind::Exists, "EXISTS after IF");
+            stmt.if_exists = true;
+        }
+        stmt.index = identifier();
         return stmt;
     }
 

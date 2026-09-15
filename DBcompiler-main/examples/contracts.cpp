@@ -59,6 +59,12 @@ public:
         return key == table_->name ? table_ : nullptr;
     }
 
+    std::shared_ptr<const IndexSchema> findIndex(std::string_view) const override {
+        return nullptr;
+    }
+
+    IndexId nextIndexId() const noexcept override { return IndexId{1}; }
+
 private:
     const std::shared_ptr<const TableSchema> table_ =
         std::make_shared<const TableSchema>(TableSchema{
@@ -99,10 +105,13 @@ void printOutline(const PlanNode& plan) {
     std::visit([](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan>) std::cout << "CreateTable";
+        else if constexpr (std::is_same_v<T, CreateIndexPlan>) std::cout << "CreateIndex";
         else if constexpr (std::is_same_v<T, AlterTablePlan>) std::cout << "AlterTable";
         else if constexpr (std::is_same_v<T, DropTablePlan>) std::cout << "DropTable";
+        else if constexpr (std::is_same_v<T, DropIndexPlan>) std::cout << "DropIndex";
         else if constexpr (std::is_same_v<T, InsertPlan>) std::cout << "Insert";
         else if constexpr (std::is_same_v<T, SeqScanPlan>) std::cout << "SeqScan";
+        else if constexpr (std::is_same_v<T, IndexScanPlan>) std::cout << "IndexScan";
         else if constexpr (std::is_same_v<T, EmptyResultPlan>) std::cout << "EmptyResult";
         else if constexpr (std::is_same_v<T, NestedLoopJoinPlan> ||
                            std::is_same_v<T, SetOperationPlan>) {

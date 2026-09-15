@@ -133,6 +133,11 @@ EXPLAIN 的包装结构、采样点和演示脚本见 [EXPLAIN ANALYZE 实现讲
 可直接用于答辩的 SQL、前后计划和量化结果见
 [规则优化效果演示](DBcompiler-main/docs/optimizer-demo.md)。
 
+面向学习和答辩的两份简明材料：
+[B 语法、边界与演示案例](DBcompiler-main/docs/b-syntax-boundary-demo-guide.md)汇总可执行语法、
+异常输入和优化展示；[B 模块代码学习指南](DBcompiler-main/docs/b-module-study-guide.md)解释模块目标、
+运行流程、核心结构、实现算法、模块交互和修改影响。
+
 ## 后续工作
 
 1. 接入 Java 页式存储系统，实现页分配、读写与 Row/Page 映射。

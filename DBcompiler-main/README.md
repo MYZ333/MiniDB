@@ -33,6 +33,8 @@ DBcompiler/
 │   ├── explain-analyze-walkthrough.md # EXPLAIN 包装、采样与演示讲解
 │   ├── optimizer-walkthrough.md # 安全常量计算、树改写与等价性验证讲解
 │   ├── optimizer-demo.md       # 优化 SQL、前后计划、运行统计与量化效果
+│   ├── b-syntax-boundary-demo-guide.md # B 可执行语法、边界、异常与展示案例
+│   ├── b-module-study-guide.md # B 的流程、结构、算法、交互和修改影响
 │   ├── json-plan-protocol.md # C++ 到 Java 的 JSON 计划字段约定
 │   └── a-merge-notes.md      # A 来源、兼容修复、测试结果与阅读顺序
 ├── include/minisql/           # 跨模块公共头文件
@@ -206,6 +208,8 @@ CMake 构建文件；可通过 CXX/AR 环境变量指定工具路径。
    version2 的接口取舍及兼容修复见 [合并说明](docs/a-version2-merge-notes.md)。
 3. B 先按 memory_catalog → type_rules → analyzer 阅读 [语义代码讲解](docs/semantic-walkthrough.md)，
    再按 bindWhere → UPDATE/DELETE → buildPlan → formatPlan 阅读 [计划代码讲解](docs/planner-walkthrough.md)。
+   若希望先形成整体认识，可先阅读 [B 模块代码学习指南](docs/b-module-study-guide.md)；准备功能、
+   边界和异常展示时使用 [B 语法边界与演示指南](docs/b-syntax-boundary-demo-guide.md)。
    JOIN/GROUP/ORDER 按 resolveColumn → bindStatement(SelectStmt) → selectSource → printNode 阅读
    [高级查询代码讲解](docs/advanced-query-walkthrough.md)。
    A 扩展功能按公共结构 → analyzer → plan_builder/optimizer → JSON/Java 阅读

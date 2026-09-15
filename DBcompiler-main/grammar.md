@@ -1,4 +1,4 @@
-# MiniSQL 文法（接口版本 0.26）
+# MiniSQL 文法（接口版本 0.27）
 
 本文由 B 维护，供 A 的 Lexer/Parser、B 的语义分析以及执行层共同使用。
 已整合 feature-zhangbo 的语法扩展与 B 的聚合实现。下列 EBNF 描述 A 能解析的范围，
@@ -18,7 +18,7 @@
   第一阶段不允许字符串跨行。字符串值保持大小写和 UTF-8 字节内容。
 - 跳过空白、`--` 行注释和不嵌套的 `/* ... */` 块注释。
 - 支持运算符 `= != <> < <= > >= + - * /`；不支持 `==`。
-- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、INNER/LEFT/RIGHT/FULL OUTER JOIN、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN、COUNT/SUM/AVG/MIN/MAX 以及 EXPLAIN/EXPLAIN ANALYZE 关键字。
+- 支持 TRUE/FALSE、NULL、BOOL/FLOAT、`VARCHAR(n)`、列级和表级约束、ALTER TABLE、INSERT 多行 VALUES、DROP TABLE、JOIN/ON、派生表、子查询、UNION/INTERSECT/EXCEPT、CASE、SELECT 表达式项、SELECT DISTINCT、GROUP BY、HAVING、ORDER BY 表达式 ASC/DESC、LIMIT/OFFSET、AS、IS、LIKE/NOT LIKE、BETWEEN/NOT BETWEEN、IN/NOT IN、COUNT/SUM/AVG/MIN/MAX 以及 EXPLAIN/EXPLAIN ANALYZE 关键字。
 - INSERT 值位置不支持 `DEFAULT` 关键字；省略列时由 B 写入列 DEFAULT 或 NULL。
 - COUNT/SUM/AVG/MIN/MAX 由 A 识别为关键字，不能再作为未加引号的普通表名、列名或别名。
 - 每条语句必须以分号结束；空输入合法；单独的空分号不是语句。
@@ -33,24 +33,33 @@
 program     = { statement } ;
 statement   = (explain | base_statement), ";" ;
 explain     = EXPLAIN, [ANALYZE], base_statement ;
-base_statement = create | drop | insert | select | update | delete ;
-create      = CREATE, TABLE, name, "(", column_def,
-              { ",", column_def }, ")" ;
+base_statement = create | alter | drop | insert | select | update | delete ;
+create      = CREATE, TABLE, [IF, NOT, EXISTS], name, "(", table_element,
+              { ",", table_element }, ")" ;
+table_element = column_def | table_constraint ;
 column_def  = name, type, { column_constraint } ;
 column_constraint = PRIMARY, KEY | NOT, NULL | UNIQUE | DEFAULT, literal ;
+table_constraint = (PRIMARY, KEY | UNIQUE), "(", names, ")" ;
 type        = INT | VARCHAR, ["(", INTEGER, ")"] | BOOL | FLOAT ;
+alter       = ALTER, TABLE, name,
+              ( ADD, [COLUMN], column_def
+              | DROP, [COLUMN], name
+              | RENAME, TO, name
+              | RENAME, COLUMN, name, TO, name ) ;
 drop        = DROP, TABLE, [IF, EXISTS], names ;
 insert      = INSERT, INTO, name, [ "(", names, ")" ],
               VALUES, value_row, { ",", value_row } ;
 value_row   = "(", literal, { ",", literal }, ")" ;
-select      = SELECT, [DISTINCT], ("*" | select_items), FROM, table_ref,
+select      = select_core, { set_operator, [ALL], select_core } ;
+select_core = SELECT, [DISTINCT], ("*" | select_items), FROM, table_ref,
               { join }, [where], [group_by], [having], [order_by], [limit] ;
+set_operator = UNION | INTERSECT | EXCEPT ;
 update      = UPDATE, table_ref, SET, assignment, { ",", assignment }, [where] ;
 delete      = DELETE, FROM, table_ref, [where] ;
 assignment  = name, "=", expr ;
 join        = [join_type], JOIN, table_ref, ON, expr ;
 join_type   = INNER | LEFT, [OUTER] | RIGHT, [OUTER] | FULL, [OUTER] ;
-table_ref   = name, [ alias ] ;
+table_ref   = name, [ alias ] | "(", select, ")", alias ;
 select_items = select_item, { ",", select_item } ;
 select_item = expr, [ alias ] ;
 aggregate_call = aggregate_func, "(", ("*" | name), ")" ;
@@ -73,12 +82,18 @@ comparison  = additive, [ (comp_op, additive) | (LIKE, additive) |
                           (NOT, BETWEEN, additive, AND, additive) |
                           (IN, "(", literal, { ",", literal }, ")") |
                           (NOT, IN, "(", literal, { ",", literal }, ")") |
+                          (IN, "(", select, ")") |
+                          (NOT, IN, "(", select, ")") |
                           (IS, [NOT], NULL) ] ;
 comp_op     = "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ;
 additive    = term, { ("+" | "-"), term } ;
 term        = unary, { ("*" | "/"), unary } ;
 unary       = "-", unary | primary ;
-primary     = aggregate_call | name | INTEGER | FLOAT_LITERAL | STRING | TRUE | FALSE | NULL | "(", expr, ")" ;
+primary     = aggregate_call | case_expr | EXISTS, "(", select, ")" |
+              name | INTEGER | FLOAT_LITERAL | STRING | TRUE | FALSE | NULL |
+              "(", select, ")" | "(", expr, ")" ;
+case_expr   = CASE, [expr], WHEN, expr, THEN, expr,
+              { WHEN, expr, THEN, expr }, [ELSE, expr], END ;
 literal     = ["-"], (INTEGER | FLOAT_LITERAL) | STRING | TRUE | FALSE | NULL ;
 name        = IDENTIFIER, { ".", IDENTIFIER } ;
 ```
@@ -93,9 +108,10 @@ LiteralExpr；FLOAT_LITERAL 同样可带负号。整数在应用符号后检查�
 例如 `NOT age > 18` 为 `NOT (age > 18)`，`a < b < c` 是语法错误。
 这是对 PPT 第 16 页文法与优先级文字不一致的明确取舍。
 
-递归下降的 statement 可以以 EXPLAIN 开始，base_statement 分支分别以 CREATE / DROP /
-INSERT / SELECT / UPDATE / DELETE 开始；where 的 FIRST 为 WHERE；SELECT 中其后允许 GROUP/HAVING/ORDER/LIMIT 或分号。not_expr 的 FIRST
-包括 NOT、负号、标识符、整数、浮点数、字符串、TRUE/FALSE、NULL 和左括号。
+递归下降的 statement 可以以 EXPLAIN 开始，base_statement 分支分别以 CREATE / ALTER /
+DROP / INSERT / SELECT / UPDATE / DELETE 开始；where 的 FIRST 为 WHERE；SELECT 中其后允许
+GROUP/HAVING/ORDER/LIMIT、集合操作符或分号。not_expr 的 FIRST 包括 NOT、EXISTS、CASE、负号、
+标识符、整数、浮点数、字符串、TRUE/FALSE、NULL 和左括号。
 SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY → LIMIT/OFFSET。
 
 ## 3. 语义限制与执行支持
@@ -111,6 +127,12 @@ SELECT 子句顺序固定为 JOIN → WHERE → GROUP BY → HAVING → ORDER BY
 | SELECT 计算表达式、聚合结果算术、ORDER BY 表达式 | 支持 | 支持 |
 | LIKE/NOT LIKE、VARCHAR(n)、列级 PRIMARY KEY/NOT NULL/UNIQUE/DEFAULT | 支持 | 支持 |
 | 多行 INSERT、DROP TABLE（含 IF EXISTS 和多表名） | 支持 | 支持 |
+| CREATE IF NOT EXISTS、表级复合 PRIMARY KEY/UNIQUE | 支持 | 支持，Catalog 与写入约束生效 |
+| ALTER TABLE ADD/DROP/RENAME | 支持 | 支持，保留表/行 ID 并迁移已有记录 |
+| IN/NOT IN、EXISTS/NOT EXISTS、标量子查询 | 支持 | 支持，含关联子查询和 SQL 三值逻辑 |
+| FROM/JOIN 派生表 | 支持 | 支持，子查询输出重新绑定为别名关系 |
+| UNION/INTERSECT/EXCEPT 及 ALL | 支持 | 支持，ALL 按重复次数执行 |
+| 搜索型与简单型 CASE | 支持 | 支持，按 WHEN 顺序短路求值 |
 | EXPLAIN / EXPLAIN ANALYZE | 支持包裹六类基础语句 | 展示优化后计划；ANALYZE 额外执行并采样 |
 | 谓词下推、空结果传播与列裁剪 | 不改变 SQL 文法 | B 改写逻辑计划，Java 执行精简后的算子和扫描布局 |
 
@@ -153,7 +175,20 @@ B 把上述字段显式保存在 Bound 和 LogicalPlan 中；JSON 执行计划�
   需要确定同类型操作数的普通运算；检查空值使用 IS NULL/IS NOT NULL。
 - DISTINCT 在最终投影后去重，两个相同位置的 NULL 视为相等；随后应用 OFFSET/LIMIT。
 - VARCHAR(n) 按 Unicode 码点数限制。PRIMARY KEY 等价于 NOT NULL + UNIQUE，一张表只允许一个；
-  UNIQUE 允许多个 NULL。INSERT 与 UPDATE 在写入前针对最终表状态检查，失败不留下部分写入。
+  表级 PRIMARY KEY/UNIQUE 可以包含多列；复合主键成员均为 NOT NULL，复合 UNIQUE 的任一成员
+  为 NULL 时允许重复。INSERT 与 UPDATE 在写入前针对最终表状态检查，失败不留下部分写入。
+- CREATE TABLE IF NOT EXISTS 在表已存在时不改变模式和 CatalogVersion。ALTER ADD 为已有行写入
+  DEFAULT 或 NULL，并重新检查约束；DROP 不允许删除最后一列或表级约束成员；RENAME 保留表 ID、
+  列 ID 和已有 RowId。每个成功改变模式的 ALTER 使 CatalogVersion 增加一次。
+- IN 子查询和标量子查询必须返回一列，集合运算两侧必须列数及逐列类型相同。标量子查询零行
+  返回 NULL，多于一行报告 ScalarSubqueryCardinality。EXISTS 只检查是否有行；NOT EXISTS 不受
+  输出 NULL 影响。IN 无匹配但发生 NULL 比较时返回 UNKNOWN，空子查询返回 FALSE。
+- 关联子查询可以引用所有可见外层关系；内层同名列优先，限定名可显式访问外层别名。派生表
+  当前不是 LATERAL，不能引用外层关系，而且必须有别名，其输出列名在派生关系内必须唯一。
+- UNION 默认去重、UNION ALL 保留两侧全部行；INTERSECT/EXCEPT 默认集合语义，ALL 版本按
+  两侧重复计数求最小值或做减法。集合比较把同位置 NULL 视为相等，最终列名取左分支。
+- 搜索型 CASE 的 WHEN 必须为 BOOL；简单型 CASE 的操作数与 WHEN 值类型一致；所有 THEN/ELSE
+  非 NULL 结果类型必须一致。省略 ELSE 等价于 NULL，按书写顺序求值且只执行命中的结果表达式。
 - DROP TABLE 可带多个名字。无 IF EXISTS 时先验证全部表再删除；IF EXISTS 忽略缺失表。
   至少删除一张表时 CatalogVersion 只增加一次，存储中的记录随表删除。
 - EXPLAIN 将一条基础语句绑定并优化后包装为 ExplainPlan，返回单列 `QUERY PLAN`
@@ -194,6 +229,12 @@ SELECT age, COUNT(*) AS rows, SUM(id)+1 FROM student
   GROUP BY age HAVING COUNT(*)>0 ORDER BY SUM(id) DESC LIMIT 10;
 SELECT DISTINCT s.name FROM student s LEFT JOIN student t ON s.id=t.id
   WHERE s.name LIKE 'A%' ORDER BY s.age+1;
+SELECT s.name FROM student s
+  WHERE EXISTS (SELECT * FROM score x WHERE x.student_id=s.id);
+SELECT d.name FROM (SELECT name, age FROM student WHERE age>=18) d WHERE d.age<30;
+SELECT id FROM student UNION ALL SELECT student_id FROM score;
+SELECT CASE WHEN age>=18 THEN 'adult' ELSE 'minor' END FROM student;
+ALTER TABLE student ADD COLUMN nickname VARCHAR(20) DEFAULT 'unknown';
 EXPLAIN SELECT name FROM student WHERE age >= 18 ORDER BY id;
 EXPLAIN ANALYZE SELECT age, COUNT(*) FROM student GROUP BY age;
 DELETE FROM student s WHERE s.id <> 1;
@@ -245,3 +286,5 @@ SELECT * FROM student OFFSET 2; -- OFFSET 当前必须跟在 LIMIT 后
   聚合和排序依赖的列裁剪；SeqScan 精确列集合贯通 JSON、Java 执行和 EXPLAIN 展示。
 - 0.26：新增 EmptyResult 逻辑算子和安全空结果传播。空节点保留列身份及关系来源，支持外连接
   NULL 扩展；Java 可执行并在 EXPLAIN ANALYZE 中显示零行且不访问被消除的扫描。
+- 0.27：合并 A 的 CREATE IF NOT EXISTS、表级约束、ALTER、子查询、派生表、三类集合运算和
+  CASE；B 完成名称与类型绑定、计划节点、JSON 协议、Java 执行、模式迁移和端到端回归。

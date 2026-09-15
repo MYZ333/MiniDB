@@ -78,13 +78,28 @@ std::optional<Diagnostic> checkExpr(const BoundExprPtr& expr, const Relations& r
         } else if constexpr (std::is_same_v<T, BoundBinary>) {
             if (auto error = checkExpr(node.left, relations, depth + 1)) return error;
             return checkExpr(node.right, relations, depth + 1);
-        } else {
+        } else if constexpr (std::is_same_v<T, BoundAggregate>) {
             if (node.argument && !validRef(*node.argument, relations))
                 return invalid("aggregate argument does not match visible schemas", node.span);
             if (!node.argument && node.kind != AggregateKind::Count)
                 return invalid("only COUNT may omit its argument", node.span);
             if (node.type != expr->type)
                 return invalid("aggregate expression result type is inconsistent", node.span);
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            if (node.operand)
+                if (auto error = checkExpr(node.operand, relations, depth + 1)) return error;
+            if (node.branches.empty()) return invalid("CASE requires branches", expr->span);
+            for (const auto& branch : node.branches) {
+                if (auto error = checkExpr(branch.condition, relations, depth + 1)) return error;
+                if (auto error = checkExpr(branch.result, relations, depth + 1)) return error;
+            }
+            if (node.else_result)
+                return checkExpr(node.else_result, relations, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            if (!node.query) return invalid("IN subquery is missing", expr->span);
+            return checkExpr(node.value, relations, depth + 1);
+        } else {
+            if (!node.query) return invalid("subquery is missing", expr->span);
         }
         return std::nullopt;
     }, expr->node);
@@ -119,6 +134,19 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
                         static_cast<std::size_t>(*column.varchar_length))
                     return invalid("DEFAULT exceeds VARCHAR length");
             }
+            bool table_primary = has_primary_key;
+            for (const auto& constraint : stmt.table_constraints) {
+                if (constraint.columns.empty() || (constraint.primary_key && table_primary))
+                    return invalid("CREATE table constraint is invalid");
+                table_primary = table_primary || constraint.primary_key;
+                std::unordered_set<std::size_t> members;
+                for (const auto ordinal : constraint.columns)
+                    if (ordinal >= stmt.columns.size() || !members.insert(ordinal).second)
+                        return invalid("CREATE table constraint column is invalid");
+            }
+        } else if constexpr (std::is_same_v<T, BoundAlterTable>) {
+            if (!stmt.table || stmt.table->columns.empty())
+                return invalid("ALTER TABLE target schema is missing");
         } else if constexpr (std::is_same_v<T, BoundDropTable>) {
             if (stmt.table_names.empty()) return invalid("DROP requires table names");
             std::unordered_set<std::string> names;
@@ -232,6 +260,16 @@ std::optional<Diagnostic> validate(const BoundStatement& statement) {
             }
             if (stmt.limit && *stmt.limit < 0) return invalid("LIMIT must be non-negative");
             if (stmt.offset < 0) return invalid("OFFSET must be non-negative");
+            for (const auto& operation : stmt.set_operations) {
+                if (!operation.query) return invalid("set operation query is missing");
+                const auto output_count = !operation.query->aggregate_items.empty()
+                    ? operation.query->aggregate_items.size()
+                    : !operation.query->projection_expressions.empty()
+                        ? operation.query->projection_expressions.size()
+                        : operation.query->columns.size();
+                if (output_count != stmt.output_names.size())
+                    return invalid("set operation output count is inconsistent");
+            }
         } else {
             if (!stmt.table || stmt.table->columns.empty()) return invalid("target table schema is missing or empty");
             if constexpr (std::is_same_v<T, BoundInsert>) {
@@ -288,6 +326,81 @@ PlanPtr node(T op, std::vector<OutputColumn> output = {}, bool row_id = false) {
     return std::make_shared<const PlanNode>(PlanNode{std::move(op), std::move(output), row_id});
 }
 
+PlanPtr buildSelectPlan(const BoundSelect& select);
+
+// 计划表达式与 BoundExpr 共用标量结构；这里只为每个子查询补上可执行子计划。
+BoundExprPtr planExpression(const BoundExprPtr& expression) {
+    if (!expression) return nullptr;
+    return std::visit([&](const auto& item) -> BoundExprPtr {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, BoundUnary>) {
+            auto operand = planExpression(item.operand);
+            if (operand == item.operand) return expression;
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                BoundUnary{item.op, std::move(operand), item.operator_span},
+                expression->type, expression->span});
+        } else if constexpr (std::is_same_v<T, BoundBinary>) {
+            auto left = planExpression(item.left);
+            auto right = planExpression(item.right);
+            if (left == item.left && right == item.right) return expression;
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                BoundBinary{item.op, std::move(left), std::move(right),
+                            item.operator_span}, expression->type, expression->span});
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            std::vector<BoundCaseWhen> branches;
+            bool changed = false;
+            for (const auto& branch : item.branches) {
+                auto condition = planExpression(branch.condition);
+                auto result = planExpression(branch.result);
+                changed = changed || condition != branch.condition || result != branch.result;
+                branches.push_back({std::move(condition), std::move(result)});
+            }
+            auto operand = planExpression(item.operand);
+            auto else_result = planExpression(item.else_result);
+            changed = changed || operand != item.operand || else_result != item.else_result;
+            if (!changed) return expression;
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                BoundCase{std::move(operand), std::move(branches),
+                          std::move(else_result)}, expression->type, expression->span});
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            auto copy = item;
+            copy.value = planExpression(item.value);
+            copy.plan = buildSelectPlan(*item.query);
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                std::move(copy), expression->type, expression->span});
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery>) {
+            auto copy = item;
+            copy.plan = buildSelectPlan(*item.query);
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                std::move(copy), expression->type, expression->span});
+        } else if constexpr (std::is_same_v<T, BoundScalarSubquery>) {
+            auto copy = item;
+            copy.plan = buildSelectPlan(*item.query);
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                std::move(copy), expression->type, expression->span});
+        } else return expression;
+    }, expression->node);
+}
+
+BoundSelect prepareSelect(const BoundSelect& input) {
+    auto result = input;
+    result.where = planExpression(input.where);
+    result.having = planExpression(input.having);
+    for (auto& expression : result.projection_expressions)
+        expression = planExpression(expression);
+    for (auto& join : result.joins) join.on = planExpression(join.on);
+    for (auto& item : result.expression_order_by)
+        if (auto* expression = std::get_if<BoundExprPtr>(&item.key))
+            *expression = planExpression(*expression);
+    for (auto& item : result.aggregate_items)
+        if (auto* expression = std::get_if<BoundExprPtr>(&item.value))
+            *expression = planExpression(*expression);
+    for (auto& item : result.aggregate_order_by)
+        if (auto* expression = std::get_if<BoundExprPtr>(&item.key))
+            *expression = planExpression(*expression);
+    return result;
+}
+
 // 所有查询/修改共用同一条输入流水线；生成阶段扫描全列，后续优化器再做列裁剪。
 PlanPtr source(const std::shared_ptr<const TableSchema>& table, const BoundExprPtr& where,
                bool row_id) {
@@ -324,13 +437,23 @@ std::vector<OutputColumn> referencedOutput(const std::vector<BoundColumnRef>& re
     return output;
 }
 
+// 物理表直接扫描；派生表先执行子查询，再把输出重新绑定为当前别名关系。
+PlanPtr relationSource(const std::shared_ptr<const TableSchema>& table,
+                       const BoundSelectPtr& query, std::uint64_t relation_id,
+                       const std::string& relation_name) {
+    const auto name = relation_name.empty() ? table->name : relation_name;
+    if (query)
+        return node(DerivedTablePlan{buildSelectPlan(*query), table, relation_id, name},
+                    scanOutput(table));
+    return node(SeqScanPlan{table, relation_id, name}, scanOutput(table));
+}
+
 PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
-    auto input = node(SeqScanPlan{stmt.table, stmt.relation_id,
-        stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}, scanOutput(stmt.table));
+    auto input = relationSource(stmt.table, stmt.source_query, stmt.relation_id,
+                                stmt.relation_name);
     for (const auto& join : stmt.joins) {
-        auto right = node(SeqScanPlan{join.table, join.relation_id,
-            join.relation_name.empty() ? join.table->name : join.relation_name},
-            scanOutput(join.table));
+        auto right = relationSource(join.table, join.subquery, join.relation_id,
+                                    join.relation_name);
         auto output = input->output;
         output.insert(output.end(), right->output.begin(), right->output.end());
         input = node(NestedLoopJoinPlan{input, right, join.on, join.type}, std::move(output));
@@ -345,6 +468,43 @@ PlanPtr selectSource(const BoundSelect& stmt, Relations& relations) {
     if (!stmt.order_by.empty() || !stmt.expression_order_by.empty())
         input = node(SortPlan{stmt.order_by, input, stmt.expression_order_by}, input->output);
     return input;
+}
+
+// 构造一个 SELECT 主体，再按 SQL 顺序组合 UNION/INTERSECT/EXCEPT。
+PlanPtr buildSelectPlan(const BoundSelect& original) {
+    const auto stmt = prepareSelect(original);
+    Relations relations{{stmt.table, stmt.relation_id,
+        stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}};
+    auto input = selectSource(stmt, relations);
+    PlanPtr root;
+    if (!stmt.aggregate_items.empty()) {
+        std::vector<OutputColumn> output;
+        for (std::size_t i = 0; i < stmt.aggregate_items.size(); ++i) {
+            const auto type = std::visit([](const auto& item) {
+                using I = std::decay_t<decltype(item)>;
+                if constexpr (std::is_same_v<I, BoundExprPtr>) return item->type;
+                else return item.type;
+            }, stmt.aggregate_items[i].value);
+            output.push_back({stmt.output_names[i], type});
+        }
+        root = node(AggregatePlan{stmt.group_by, stmt.aggregate_items,
+                                  stmt.aggregate_order_by, input, stmt.having,
+                                  stmt.distinct, stmt.limit, stmt.offset}, std::move(output));
+    } else {
+        std::vector<OutputColumn> output;
+        if (!stmt.projection_expressions.empty()) {
+            for (std::size_t i = 0; i < stmt.projection_expressions.size(); ++i)
+                output.push_back({stmt.output_names[i], stmt.projection_expressions[i]->type});
+        } else output = referencedOutput(stmt.columns, relations, stmt.output_names);
+        root = node(ProjectPlan{stmt.columns, input, stmt.projection_expressions,
+                                stmt.distinct, stmt.limit, stmt.offset}, std::move(output));
+    }
+    for (const auto& operation : original.set_operations) {
+        auto right = buildSelectPlan(*operation.query);
+        root = node(SetOperationPlan{root, std::move(right), operation.op, operation.all},
+                    root->output);
+    }
+    return root;
 }
 } // namespace
 
@@ -361,41 +521,26 @@ Result<LogicalPlan> buildPlan(const BoundStatement& statement) {
     auto root = std::visit([](const auto& stmt) -> PlanPtr {
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, BoundCreateTable>) {
-            return node(CreateTablePlan{stmt.table_name, stmt.columns});
+            return node(CreateTablePlan{stmt.table_name, stmt.columns,
+                                        stmt.table_constraints, stmt.if_not_exists});
+        } else if constexpr (std::is_same_v<T, BoundAlterTable>) {
+            return node(AlterTablePlan{stmt.table, stmt.action});
         } else if constexpr (std::is_same_v<T, BoundDropTable>) {
             return node(DropTablePlan{stmt.table_names, stmt.if_exists});
         } else if constexpr (std::is_same_v<T, BoundInsert>) {
             return node(InsertPlan{stmt.table, stmt.values, stmt.rows});
         } else if constexpr (std::is_same_v<T, BoundSelect>) {
-            Relations relations{{stmt.table, stmt.relation_id,
-                stmt.relation_name.empty() ? stmt.table->name : stmt.relation_name}};
-            auto input = selectSource(stmt, relations);
-            if (!stmt.aggregate_items.empty()) {
-                std::vector<OutputColumn> output;
-                for (std::size_t i = 0; i < stmt.aggregate_items.size(); ++i) {
-                    const auto type = std::visit([](const auto& item) {
-                        using I = std::decay_t<decltype(item)>;
-                        if constexpr (std::is_same_v<I, BoundExprPtr>) return item->type;
-                        else return item.type;
-                    }, stmt.aggregate_items[i].value);
-                    output.push_back({stmt.output_names[i], type});
-                }
-                return node(AggregatePlan{stmt.group_by, stmt.aggregate_items,
-                                          stmt.aggregate_order_by, input, stmt.having,
-                                          stmt.distinct, stmt.limit, stmt.offset}, std::move(output));
-            }
-            std::vector<OutputColumn> output;
-            if (!stmt.projection_expressions.empty()) {
-                for (std::size_t i = 0; i < stmt.projection_expressions.size(); ++i)
-                    output.push_back({stmt.output_names[i], stmt.projection_expressions[i]->type});
-            } else output = referencedOutput(stmt.columns, relations, stmt.output_names);
-            return node(ProjectPlan{stmt.columns, input, stmt.projection_expressions,
-                                    stmt.distinct, stmt.limit, stmt.offset}, std::move(output));
+            return buildSelectPlan(stmt);
         } else if constexpr (std::is_same_v<T, BoundUpdate>) {
             // 修改操作的输入携带行标识，根只返回影响行数（执行结果，不是业务列）。
-            return node(UpdatePlan{stmt.table, stmt.assignments, source(stmt.table, stmt.where, true)});
+            auto assignments = stmt.assignments;
+            for (auto& assignment : assignments)
+                assignment.value = planExpression(assignment.value);
+            return node(UpdatePlan{stmt.table, std::move(assignments),
+                source(stmt.table, planExpression(stmt.where), true)});
         } else if constexpr (std::is_same_v<T, BoundDelete>) {
-            return node(DeletePlan{stmt.table, source(stmt.table, stmt.where, true)});
+            return node(DeletePlan{stmt.table,
+                source(stmt.table, planExpression(stmt.where), true)});
         } else return nullptr; // BoundExplain 已在访问 variant 前递归生成。
     }, statement.node);
     return LogicalPlan{statement.catalog_version, std::move(root)};

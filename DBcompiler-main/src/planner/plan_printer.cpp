@@ -59,6 +59,15 @@ const char* joinName(JoinType type) {
     return "UNKNOWN";
 }
 
+const char* setName(SetOperator op) {
+    switch (op) {
+    case SetOperator::Union: return "UNION";
+    case SetOperator::Intersect: return "INTERSECT";
+    case SetOperator::Except: return "EXCEPT";
+    }
+    return "UNKNOWN";
+}
+
 std::string literal(const ScalarValue& value) {
     return std::visit([](const auto& item) -> std::string {
         using T = std::decay_t<decltype(item)>;
@@ -115,9 +124,13 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
     if (!plan || depth >= 256) return;
     std::visit([&](const auto& op) {
         using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
+        if constexpr (std::is_same_v<T, NestedLoopJoinPlan> ||
+                      std::is_same_v<T, SetOperationPlan>) {
             collectRelations(op.left, relations, depth + 1);
             collectRelations(op.right, relations, depth + 1);
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            addRelation(relations, op.table, op.relation_id, op.relation_name);
+            collectRelations(op.input, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, FilterPlan> ||
                              std::is_same_v<T, GroupByPlan> ||
                              std::is_same_v<T, AggregatePlan> ||
@@ -133,6 +146,7 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
                             relation.relation_name);
         } else if constexpr (!std::is_same_v<T, CreateTablePlan> &&
                              !std::is_same_v<T, DropTablePlan> &&
+                             !std::is_same_v<T, AlterTablePlan> &&
                              !std::is_same_v<T, EmptyResultPlan>) {
             addRelation(relations, op.table, 0, op.table ? op.table->name : std::string{});
         }
@@ -168,11 +182,27 @@ std::string expression(const BoundExprPtr& expr, const Relations& relations,
         } else if constexpr (std::is_same_v<T, BoundBinary>)
             return "(" + expression(node.left, relations, depth + 1) + " " + opName(node.op) + " " +
                    expression(node.right, relations, depth + 1) + ")";
-        else {
+        else if constexpr (std::is_same_v<T, BoundAggregate>) {
             std::string result = aggregateName(node.kind);
             result += '(';
             result += node.argument ? columnName(*node.argument, relations) : "*";
             return result + ')';
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            std::string result = "CASE";
+            if (node.operand) result += " " + expression(node.operand, relations, depth + 1);
+            for (const auto& branch : node.branches)
+                result += " WHEN " + expression(branch.condition, relations, depth + 1) +
+                          " THEN " + expression(branch.result, relations, depth + 1);
+            if (node.else_result)
+                result += " ELSE " + expression(node.else_result, relations, depth + 1);
+            return result + " END";
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            return "(" + expression(node.value, relations, depth + 1) +
+                   (node.negated ? " NOT IN (SUBQUERY))" : " IN (SUBQUERY))");
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery>) {
+            return node.negated ? "NOT EXISTS (SUBQUERY)" : "EXISTS (SUBQUERY)";
+        } else {
+            return "(SCALAR SUBQUERY)";
         }
     }, expr->node);
 }
@@ -190,6 +220,7 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan>) {
             out << "CreateTable[" << op.table_name << "; ";
+            if (op.if_not_exists) out << "IF NOT EXISTS; ";
             for (std::size_t i = 0; i < op.columns.size(); ++i) {
                 if (i) out << ", ";
                 const auto& column = op.columns[i];
@@ -202,6 +233,26 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 }
                 if (column.default_value) out << " DEFAULT " << literal(*column.default_value);
             }
+            for (const auto& constraint : op.table_constraints) {
+                out << ", " << (constraint.primary_key ? "PRIMARY KEY(" : "UNIQUE(");
+                for (std::size_t i = 0; i < constraint.columns.size(); ++i) {
+                    if (i) out << ", ";
+                    out << op.columns[constraint.columns[i]].name;
+                }
+                out << ')';
+            }
+        } else if constexpr (std::is_same_v<T, AlterTablePlan>) {
+            out << "AlterTable[" << tableName(op.table) << "; ";
+            std::visit([&](const auto& action) {
+                using A = std::decay_t<decltype(action)>;
+                if constexpr (std::is_same_v<A, BoundAlterAddColumn>)
+                    out << "ADD COLUMN " << action.column.name;
+                else if constexpr (std::is_same_v<A, BoundAlterDropColumn>)
+                    out << "DROP COLUMN " << action.column_name;
+                else if constexpr (std::is_same_v<A, BoundAlterRenameTable>)
+                    out << "RENAME TO " << action.new_name;
+                else out << "RENAME COLUMN #" << action.ordinal << " TO " << action.new_name;
+            }, op.action);
         } else if constexpr (std::is_same_v<T, DropTablePlan>) {
             out << "DropTable[";
             if (op.if_exists) out << "IF EXISTS ";
@@ -241,11 +292,19 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 if (i) out << ", ";
                 out << columnName(op.columns[i], relations);
             }
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            input = op.input;
+            out << "DerivedTable[" << op.relation_name;
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             left = op.left;
             right = op.right;
             out << "NestedLoopJoin[" << joinName(op.type) << "; "
                 << expression(op.predicate, relations);
+        } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
+            left = op.left;
+            right = op.right;
+            out << "SetOperation[" << setName(op.op);
+            if (op.all) out << " ALL";
         } else {
             input = op.input;
             if constexpr (std::is_same_v<T, ExplainPlan>) {

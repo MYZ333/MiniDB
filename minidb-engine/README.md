@@ -1,17 +1,18 @@
 # MiniDB Java 数据库引擎
 
 本模块不调用 C++ 对象。它只读取 `protocolVersion: 1` 的 JSON 执行计划，执行
-CREATE、DROP、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是存储系统
+CREATE、ALTER、DROP、INSERT、SELECT、UPDATE 和 DELETE。当前 `InMemoryRecordStore` 是存储系统
 完成前的替身；后续 Java 页式存储只需实现 `RecordStore`。
 引擎还支持 Explain 计划：普通模式返回算子树，ANALYZE 模式执行目标并采集实际行数、
 包含子算子的耗时和调用次数。
 
 执行器支持 `INT/FLOAT/VARCHAR/BOOL` 和可存储的 `NULL`，并能执行 SeqScan、EmptyResult、
-NestedLoopJoin、Filter、GroupBy、Aggregate、Sort、Project。GroupBy 用于纯分组去重，
+DerivedTable、NestedLoopJoin、Filter、GroupBy、Aggregate、Sort、Project 和 SetOperation。GroupBy 用于纯分组去重，
 Aggregate 执行 COUNT/SUM/AVG/MIN/MAX、HAVING、聚合表达式以及聚合后排序。
 Project/Aggregate 处理 DISTINCT 和 LIMIT/OFFSET；NestedLoopJoin 支持四种连接类型。
 写入边界检查 VARCHAR(n)、PRIMARY KEY、NOT NULL、UNIQUE，并保证批量 INSERT 和 UPDATE
-在约束失败时不留下部分结果。
+在约束失败时不留下部分结果。新增执行路径支持复合主键/唯一约束、ALTER 数据迁移、关联子查询、
+标量子查询基数检查、CASE 短路，以及 UNION/INTERSECT/EXCEPT 的集合与 ALL 语义。
 内部算子通过带列身份的 `PlanRow` 传行，因此 JOIN 后按
 `relationId + tableId + columnId` 精确取列，并支持同一物理表自连接。
 SeqScan 接受编译器导出的精确列集合，只物化投影、筛选、连接、分组和排序真正依赖的列；

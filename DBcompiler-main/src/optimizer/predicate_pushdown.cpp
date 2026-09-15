@@ -35,6 +35,19 @@ void collectRefs(const BoundExprPtr& expression, std::vector<BoundColumnRef>& re
         } else if constexpr (std::is_same_v<T, BoundBinary>) {
             collectRefs(node.left, refs, depth + 1);
             collectRefs(node.right, refs, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            collectRefs(node.operand, refs, depth + 1);
+            for (const auto& branch : node.branches) {
+                collectRefs(branch.condition, refs, depth + 1);
+                collectRefs(branch.result, refs, depth + 1);
+            }
+            collectRefs(node.else_result, refs, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            collectRefs(node.value, refs, depth + 1);
+            for (const auto& ref : node.correlated_columns) addRef(refs, ref);
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery> ||
+                             std::is_same_v<T, BoundScalarSubquery>) {
+            for (const auto& ref : node.correlated_columns) addRef(refs, ref);
         }
     }, expression->node);
 }
@@ -47,10 +60,14 @@ bool safeToMove(const BoundExprPtr& expression, std::size_t depth = 0) {
         using T = std::decay_t<decltype(node)>;
         if constexpr (std::is_same_v<T, BoundColumnRef> ||
                       std::is_same_v<T, BoundLiteral>) return true;
-        else if constexpr (std::is_same_v<T, BoundAggregate>) return false;
+        else if constexpr (std::is_same_v<T, BoundAggregate> ||
+                           std::is_same_v<T, BoundCase> ||
+                           std::is_same_v<T, BoundInSubquery> ||
+                           std::is_same_v<T, BoundExistsSubquery> ||
+                           std::is_same_v<T, BoundScalarSubquery>) return false;
         else if constexpr (std::is_same_v<T, BoundUnary>) {
             return node.op != UnaryOp::Negate && safeToMove(node.operand, depth + 1);
-        } else {
+        } else if constexpr (std::is_same_v<T, BoundBinary>) {
             const bool arithmetic = node.op == BinaryOp::Add || node.op == BinaryOp::Subtract ||
                 node.op == BinaryOp::Multiply || node.op == BinaryOp::Divide;
             return !arithmetic && safeToMove(node.left, depth + 1) &&
@@ -97,6 +114,12 @@ bool relationOccurs(const PlanPtr& plan, const BoundColumnRef& ref,
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             return relationOccurs(op.left, ref, depth + 1) ||
                    relationOccurs(op.right, ref, depth + 1);
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            return op.table && op.table->id.value == ref.table_id.value &&
+                   op.relation_id == ref.relation_id;
+        } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
+            return relationOccurs(op.left, ref, depth + 1) ||
+                   relationOccurs(op.right, ref, depth + 1);
         } else if constexpr (std::is_same_v<T, FilterPlan> ||
                              std::is_same_v<T, GroupByPlan> ||
                              std::is_same_v<T, AggregatePlan> ||
@@ -141,6 +164,7 @@ Result<PlanPtr> pushNode(const PlanPtr& plan, std::size_t depth) {
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan> ||
+                      std::is_same_v<T, AlterTablePlan> ||
                       std::is_same_v<T, DropTablePlan> ||
                       std::is_same_v<T, InsertPlan> ||
                       std::is_same_v<T, SeqScanPlan> ||
@@ -154,6 +178,21 @@ Result<PlanPtr> pushNode(const PlanPtr& plan, std::size_t depth) {
             auto right = std::get<PlanPtr>(std::move(right_result));
             if (left == op.left && right == op.right) return plan;
             return replaceInput(plan, NestedLoopJoinPlan{left, right, op.predicate, op.type});
+        } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
+            auto left_result = pushNode(op.left, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;
+            auto right_result = pushNode(op.right, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&right_result)) return *error;
+            auto left = std::get<PlanPtr>(std::move(left_result));
+            auto right = std::get<PlanPtr>(std::move(right_result));
+            if (left == op.left && right == op.right) return plan;
+            return replaceInput(plan, SetOperationPlan{left, right, op.op, op.all});
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            auto child_result = pushNode(op.input, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&child_result)) return *error;
+            auto input = std::get<PlanPtr>(std::move(child_result));
+            return input == op.input ? plan : replaceInput(plan,
+                DerivedTablePlan{input, op.table, op.relation_id, op.relation_name});
         } else {
             auto child_result = pushNode(op.input, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&child_result)) return *error;

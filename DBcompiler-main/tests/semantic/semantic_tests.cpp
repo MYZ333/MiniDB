@@ -85,6 +85,41 @@ int main() {
         check(columns[0].type == DataType::Bool && columns[1].type == DataType::Float,
               "extended CREATE types lost");
     });
+    suite.run("CREATE IF NOT EXISTS and table constraints bind explicit DDL metadata", [] {
+        Fixture f;
+        CreateTableStmt create_if_missing{id("newtable"), {{id("id"), DataType::Int, {}}}};
+        create_if_missing.if_not_exists = true;
+        value(f.analyzeNode(create_if_missing));
+
+        CreateTableStmt create_existing{id("student", span(20, 7)), {{id("id"), DataType::Int, {}}}};
+        create_existing.if_not_exists = true;
+        const auto existing = value(f.analyzeNode(create_existing));
+        check(std::get<BoundCreateTable>(existing.node).if_not_exists,
+              "CREATE IF NOT EXISTS flag was lost");
+
+        CreateTableStmt constrained{id("constrained"),
+            {{id("id"), DataType::Int, {}}, {id("code"), DataType::Int, {}}}};
+        constrained.table_constraints.push_back(
+            {TableConstraintKind::PrimaryKey, {id("id", span(42, 2))}, span(30, 15)});
+        const auto bound = value(f.analyzeNode(constrained));
+        const auto& create = std::get<BoundCreateTable>(bound.node);
+        check(create.table_constraints.size() == 1 &&
+              create.table_constraints[0].primary_key &&
+              create.table_constraints[0].columns == std::vector<std::size_t>{0} &&
+              create.columns[0].not_null,
+              "table constraint binding or PRIMARY KEY nullability was lost");
+    });
+    suite.run("ALTER TABLE binds target schema and action payload", [] {
+        Fixture f;
+        AlterTableStmt alter{id("student", span(12, 7)),
+            AlterAddColumn{{id("email"), DataType::Varchar, span(30, 13)}, true}};
+        const auto bound = value(f.analyzeNode(std::move(alter)));
+        const auto& operation = std::get<BoundAlterTable>(bound.node);
+        const auto& add = std::get<BoundAlterAddColumn>(operation.action);
+        check(operation.table->name == "student" && add.column.name == "email" &&
+              add.column.type == DataType::Varchar,
+              "ALTER TABLE ADD binding lost schema or column metadata");
+    });
     suite.run("DROP TABLE binds names and IF EXISTS policy", [] {
         Fixture f;
         const auto bound = value(f.analyzeNode(
@@ -419,6 +454,87 @@ int main() {
                          ErrorCode::InvalidGrouping);
         check(e.message.find("only allowed") != std::string::npos,
               "aggregate clause diagnostic changed");
+    });
+    suite.run("IN subqueries bind value query and boolean result", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), std::vector<Identifier>{id("id")}, nullptr});
+        auto predicate = std::make_shared<const Expr>(Expr{
+            InSubqueryExpr{col("id"), query, false, span(20, 2)}, span(10, 35)});
+        const auto bound = value(f.where(predicate));
+        const auto& select = std::get<BoundSelect>(bound.node);
+        const auto& in = std::get<BoundInSubquery>(select.where->node);
+        check(select.where->type == DataType::Bool && in.query && !in.negated &&
+              std::get<BoundColumnRef>(in.value->node).ordinal == 0,
+              "IN subquery binding is incomplete");
+    });
+    suite.run("EXISTS subqueries bind as boolean expressions", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), AllColumns{}, nullptr});
+        auto predicate = std::make_shared<const Expr>(Expr{
+            ExistsSubqueryExpr{query, false, span(20, 6)}, span(20, 35)});
+        const auto bound = value(f.where(predicate));
+        const auto& exists = std::get<BoundExistsSubquery>(
+            std::get<BoundSelect>(bound.node).where->node);
+        check(exists.query && !exists.negated,
+              "EXISTS subquery binding is incomplete");
+    });
+    suite.run("derived tables expose synthetic aliased schemas", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), std::vector<Identifier>{id("id")}, nullptr});
+        SelectStmt select{id(""), AllColumns{}, nullptr};
+        select.from = TableRef{Identifier{}, query, id("d"), span(14, 35)};
+        const auto bound = value(f.analyzeNode(select));
+        const auto& derived = std::get<BoundSelect>(bound.node);
+        check(derived.source_query && derived.relation_name == "d" &&
+              derived.table->columns.size() == 1 &&
+              derived.table->columns[0].name == "id",
+              "derived table did not expose its output schema");
+    });
+    suite.run("scalar subqueries bind one-column result types", [] {
+        Fixture f;
+        auto query = std::make_shared<const SelectStmt>(
+            SelectStmt{id("student"), std::vector<Identifier>{id("age")}, nullptr});
+        auto predicate = bin(BinaryOp::Greater, col("age"),
+                             std::make_shared<const Expr>(Expr{
+                                 ScalarSubqueryExpr{query, span(20, 30)}, span(20, 30)}));
+        const auto bound = value(f.where(predicate));
+        const auto& comparison = std::get<BoundBinary>(
+            std::get<BoundSelect>(bound.node).where->node);
+        const auto& scalar = std::get<BoundScalarSubquery>(comparison.right->node);
+        check(scalar.query && comparison.right->type == DataType::Int,
+              "scalar subquery type or query was lost");
+    });
+    suite.run("set operations bind every compatible branch", [] {
+        Fixture f;
+        SelectStmt select{id("student"), std::vector<Identifier>{id("id")}, nullptr};
+        select.set_operations.push_back(SetOperation{
+            SetOperator::Intersect, true,
+            std::make_shared<const SelectStmt>(
+                SelectStmt{id("student"), std::vector<Identifier>{id("id")}, nullptr}),
+            span(20, 9)});
+        const auto bound = value(f.analyzeNode(select));
+        const auto& operation = std::get<BoundSelect>(bound.node).set_operations[0];
+        check(operation.op == SetOperator::Intersect && operation.all && operation.query,
+              "set operation branch or modifier was lost");
+    });
+    suite.run("CASE expressions bind branches and infer result type", [] {
+        Fixture f;
+        auto case_expr = std::make_shared<const Expr>(Expr{
+            CaseExpr{nullptr,
+                     {CaseWhenClause{bin(BinaryOp::Greater, col("age"), num(18)),
+                                     truth(), span(10, 20)}},
+                     bin(BinaryOp::NotEqual, num(1), num(1)),
+                     span(5, 30)},
+            span(5, 30)});
+        const auto bound = value(f.where(case_expr));
+        const auto& expression = std::get<BoundSelect>(bound.node).where;
+        const auto& case_node = std::get<BoundCase>(expression->node);
+        check(expression->type == DataType::Bool && case_node.branches.size() == 1 &&
+              case_node.else_result,
+              "CASE branch or inferred type was lost");
     });
     suite.run("semantic analysis checks both logical branches and left error first", [] {
         Fixture f;

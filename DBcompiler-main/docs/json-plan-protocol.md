@@ -12,18 +12,24 @@
 }
 ```
 
-每个计划执行前都必须比较 `catalogVersion`。同一输入中，导出器会在 CREATE/DROP 的计划
+每个计划执行前都必须比较 `catalogVersion`。同一输入中，导出器会在 CREATE/ALTER/DROP 的计划
 导出后模拟 Catalog 变更，因此后续语句看到正确模式；Java 引擎必须采用相同的版本规则。
 `EXPLAIN ANALYZE` 包裹 CREATE/DROP 时也按实际执行处理该变更，普通 EXPLAIN 不改变 Catalog。
 
-节点类型为 `CreateTable`、`DropTable`、`Insert`、`SeqScan`、`EmptyResult`、`NestedLoopJoin`、`Filter`、
-`GroupBy`、`Aggregate`、`Sort`、`Project`、`Update`、`Delete` 和 `Explain`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
+节点类型为 `CreateTable`、`AlterTable`、`DropTable`、`Insert`、`SeqScan`、`EmptyResult`、
+`DerivedTable`、`NestedLoopJoin`、`Filter`、`GroupBy`、`Aggregate`、`Sort`、`Project`、
+`SetOperation`、`Update`、`Delete` 和 `Explain`。表对象含 `id`、`name`、`columns`，列引用含 `tableId`、`columnId`、
 `relationId`、`ordinal`、`type`。表列还可含 `varcharLength`、`primaryKey`、`notNull`、
 `unique`、`defaultValue` 和 `hasDefault`；后一个字段用于区分“没有默认值”和 `DEFAULT NULL`。
-表达式以 `kind: column|literal|unary|binary|aggregate` 表示，运算名称与
+表达式以 `kind: column|literal|unary|binary|aggregate|case|inSubquery|existsSubquery|scalarSubquery`
+表示，运算名称与
 C++ 的 `UnaryOp`、`BinaryOp` 枚举一致。字符串、整数/浮点、BOOL、NULL 分别使用 JSON
 string、number、boolean、null；表达式附带可选 `span` 以便 Java 报告 SQL 行列。
 
+- `CreateTable` 额外使用 `ifNotExists` 和 `tableConstraints`；每个表级约束含
+  `kind: PRIMARY_KEY|UNIQUE` 及从 0 开始的 `columns` 序号数组。
+- `AlterTable` 使用 `table` 和 `action`。action.type 为 AddColumn、DropColumn、RenameTable、
+  RenameColumn；分别携带 column、ordinal/columnName、newName、ordinal/newName。
 - `DropTable` 使用 `tableNames` 和 `ifExists`。至少删除一张表时目录版本增加一次。
 - `Insert` 的 `rows` 是完整记录二维数组；`values` 保留第一行以兼容旧消费者。
 - `NestedLoopJoin` 使用 `left`、`right`、`predicate` 和 `joinType`，输出顺序为左列后接右列。
@@ -36,18 +42,22 @@ string、number、boolean、null；表达式附带可选 `span` 以便 Java 报�
 - `EmptyResult` 不含可执行子节点，读取它固定返回零行。`columns` 是与节点 output 对齐的
   列引用数组；`relations` 保存原输入关系的 `table`、`relationId` 和 `relationName`。
   Java 在返回零行前仍校验这些元数据，并在外连接补 NULL 时从 columns 恢复身份布局。
+- `DerivedTable` 使用 `input`、合成 `table`、`relationId` 和 `relationName`。执行器完整运行
+  input，再按输出位置生成合成关系的 ColumnSlot；合成表 ID 保证落在 Java long 正数范围。
 - `GroupBy` 使用 `keys` 和 `input`，当前表示按键去重。
 - `Sort` 使用有序 `items` 和 `input`；每项用 `kind` 区分 `column` 或 `expression`，
   并包含 `ASC`/`DESC` direction。
 - `Project` 可用 `expressions` 计算输出；空数组时沿用 `columns`。它还携带
   `distinct`、`limit` 和 `offset`，执行顺序为投影、去重、分页。
+- `SetOperation` 使用 `left`、`right`、`operation` 和 `all`。operation 为 UNION、INTERSECT、
+  EXCEPT；两侧逐列类型一致，根 output 和最终列名取左侧。
 - `Explain` 使用 `analyze: boolean` 和 `input: <statement-root>`。根节点的 output 固定为
   `[ {"name":"QUERY PLAN","type":"VARCHAR"} ]`，`carriesRowId` 为 false。
 
 这些字段是协议 1 的向后兼容扩展：旧计划缺少 relationId 时，Java 引擎回退到 tableId；
 旧计划缺少 columns 时，Java 引擎扫描全列。
 当前 Java 引擎已执行全部上述节点，并以 Project.output 或 Aggregate.output 中的名称展示列别名。
-旧引擎不能执行新增 Aggregate/EmptyResult/Explain 节点；相关 SQL 计划需同步更新编译器和引擎。
+旧引擎不能执行新增节点；相关 SQL 计划需同步更新编译器和引擎。
 
 `carriesRowId` 为 true 时，Java 存储适配层必须让扫描结果携带稳定 RowId；UPDATE
 和 DELETE 使用该 RowId 定位原记录，不能按业务列值猜测记录身份。
@@ -77,6 +87,19 @@ Unary 表达式的 op 新增 IsNull 和 IsNotNull。两者先求值 operand，�
 UPDATE/DELETE 的表别名在 B 绑定时消解，仍用 relationId=0 传递行身份。
 LIKE 使用 `BinaryOp::Like`，`%` 匹配任意 Unicode 码点序列，`_` 匹配一个码点。
 执行表达式以 JSON/Java null 表示 SQL UNKNOWN；筛选类算子只接受 TRUE。
+
+## CASE 与子查询表达式
+
+- case：`operand` 为简单 CASE 的表达式，搜索型 CASE 为 null；`branches` 中每项含 `when`
+  和 `then`；`else` 可为 null。执行器按顺序短路，只求值首个命中分支。
+- inSubquery：含 `value`、`negated` 和 `plan`。plan 是完整查询根，必须返回一列。
+- existsSubquery：含 `negated` 和 `plan`，仅以 plan 是否返回至少一行为结果。
+- scalarSubquery：含 `plan`，零行产生 null，一行产生该值，多行报 ScalarSubqueryCardinality。
+
+子查询 plan 中的列引用可指向外层 relationId。Java 执行器在表达式求值期间安装当前 PlanRow
+作为关联上下文，内层本地列优先，未在本地布局命中的列从外层行读取；嵌套结束后必须恢复原上下文。
+IN 在没有相等项但至少发生一次 NULL 比较时返回 UNKNOWN，空输入返回 FALSE；NOT 只翻转确定的
+TRUE/FALSE。集合操作比较完整行，NULL 在集合相等中与 NULL 相等，ALL 使用重复计数。
 
 ## Explain 根节点
 

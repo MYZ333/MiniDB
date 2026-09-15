@@ -22,7 +22,10 @@ struct BoundAggregate {
 };
 
 struct BoundExpr;
+struct BoundSelect;
+struct PlanNode;
 using BoundExprPtr = std::shared_ptr<const BoundExpr>;
+using BoundSelectPtr = std::shared_ptr<const BoundSelect>;
 
 struct BoundLiteral { ScalarValue value; };
 struct BoundUnary {
@@ -37,8 +40,42 @@ struct BoundBinary {
     SourceLocation operator_span;
 };
 
+struct BoundCaseWhen {
+    BoundExprPtr condition;
+    BoundExprPtr result;
+};
+
+struct BoundCase {
+    BoundExprPtr operand;
+    std::vector<BoundCaseWhen> branches;
+    BoundExprPtr else_result;
+};
+
+// 子查询先保存绑定树；计划生成再填充 plan。correlated_columns 是外层列裁剪契约。
+struct BoundInSubquery {
+    BoundExprPtr value;
+    BoundSelectPtr query;
+    std::shared_ptr<const PlanNode> plan;
+    std::vector<BoundColumnRef> correlated_columns;
+    bool negated = false;
+};
+
+struct BoundExistsSubquery {
+    BoundSelectPtr query;
+    std::shared_ptr<const PlanNode> plan;
+    std::vector<BoundColumnRef> correlated_columns;
+    bool negated = false;
+};
+
+struct BoundScalarSubquery {
+    BoundSelectPtr query;
+    std::shared_ptr<const PlanNode> plan;
+    std::vector<BoundColumnRef> correlated_columns;
+};
+
 struct BoundExpr {
-    std::variant<BoundColumnRef, BoundLiteral, BoundUnary, BoundBinary, BoundAggregate> node;
+    std::variant<BoundColumnRef, BoundLiteral, BoundUnary, BoundBinary, BoundAggregate,
+                 BoundCase, BoundInSubquery, BoundExistsSubquery, BoundScalarSubquery> node;
     DataType type; // 每个表达式均有确定类型，运算结果也不例外。
     SourceLocation span;
 };
@@ -46,6 +83,20 @@ struct BoundExpr {
 struct BoundCreateTable {
     std::string table_name;
     std::vector<ColumnSpec> columns; // ID 留给执行建表的 Catalog 分配。
+    std::vector<TableConstraintSpec> table_constraints = {};
+    bool if_not_exists = false;
+};
+
+struct BoundAlterAddColumn { ColumnSpec column; };
+struct BoundAlterDropColumn { std::size_t ordinal; std::string column_name; };
+struct BoundAlterRenameTable { std::string new_name; };
+struct BoundAlterRenameColumn { std::size_t ordinal; std::string new_name; };
+using BoundAlterAction = std::variant<BoundAlterAddColumn, BoundAlterDropColumn,
+    BoundAlterRenameTable, BoundAlterRenameColumn>;
+
+struct BoundAlterTable {
+    std::shared_ptr<const TableSchema> table;
+    BoundAlterAction action;
 };
 
 struct BoundDropTable {
@@ -65,6 +116,7 @@ struct BoundJoin {
     std::string relation_name = {}; // 已归一化的表别名或真实表名。
     std::uint64_t relation_id = 0;
     JoinType type = JoinType::Inner;
+    BoundSelectPtr subquery = {}; // 非空表示由派生表查询提供该关系。
 };
 
 struct BoundOrderBy {
@@ -87,6 +139,12 @@ struct BoundAggregateOrder {
     SortDirection direction;
 };
 
+struct BoundSetOperation {
+    SetOperator op = SetOperator::Union;
+    bool all = false;
+    BoundSelectPtr query;
+};
+
 struct BoundSelect {
     std::shared_ptr<const TableSchema> table;
     std::vector<BoundColumnRef> columns; // 星号已展开，显式重复列保留。
@@ -106,6 +164,8 @@ struct BoundSelect {
     bool distinct = false;
     std::optional<std::int64_t> limit = {};
     std::int64_t offset = 0;
+    BoundSelectPtr source_query = {}; // FROM 派生表的已绑定查询。
+    std::vector<BoundSetOperation> set_operations = {};
 };
 
 struct BoundAssignment {
@@ -134,7 +194,7 @@ struct BoundExplain {
 
 struct BoundStatement {
     CatalogVersion catalog_version;
-    std::variant<BoundCreateTable, BoundDropTable, BoundInsert, BoundSelect,
+    std::variant<BoundCreateTable, BoundAlterTable, BoundDropTable, BoundInsert, BoundSelect,
                  BoundUpdate, BoundDelete, BoundExplain> node;
 };
 

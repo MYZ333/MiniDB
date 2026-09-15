@@ -53,6 +53,7 @@ using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullVa
 enum class UnaryOp { Negate, Not, IsNull, IsNotNull };
 enum class SortDirection { Asc, Desc };
 enum class JoinType { Inner, Left, Right, Full };
+enum class SetOperator { Union, Intersect, Except };
 enum class AggregateKind { Count, Sum, Avg, Min, Max };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
@@ -98,6 +99,12 @@ struct ColumnSpec {
     bool not_null = false;
     bool unique = false;
     std::optional<ScalarValue> default_value = {};
+};
+
+// 表级主键/唯一约束按列序号保存；复合约束不能降级成多个单列 UNIQUE。
+struct TableConstraintSpec {
+    bool primary_key = false;
+    std::vector<std::size_t> columns;
 };
 
 } // namespace minisql

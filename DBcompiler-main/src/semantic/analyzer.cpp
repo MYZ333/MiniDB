@@ -36,6 +36,7 @@ struct RelationBinding {
     std::shared_ptr<const TableSchema> table;
     std::string name;
     std::uint64_t id;
+    std::size_t level = 0; // 0 是当前 SELECT；更大的值来自相关子查询外层。
 };
 
 BoundColumnRef columnRef(const RelationBinding& relation, std::size_t index) {
@@ -73,6 +74,14 @@ bool containsAggregate(const BoundExprPtr& expression) {
         else if constexpr (std::is_same_v<T, BoundUnary>) return containsAggregate(node.operand);
         else if constexpr (std::is_same_v<T, BoundBinary>)
             return containsAggregate(node.left) || containsAggregate(node.right);
+        else if constexpr (std::is_same_v<T, BoundCase>) {
+            if (containsAggregate(node.operand) || containsAggregate(node.else_result)) return true;
+            for (const auto& branch : node.branches)
+                if (containsAggregate(branch.condition) || containsAggregate(branch.result)) return true;
+            return false;
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            return containsAggregate(node.value);
+        }
         else return false;
     }, expression->node);
 }
@@ -86,7 +95,26 @@ bool groupingCompatible(const BoundExprPtr& expression,
         if constexpr (std::is_same_v<T, BoundColumnRef>) return containsColumn(group_by, node);
         else if constexpr (std::is_same_v<T, BoundAggregate> || std::is_same_v<T, BoundLiteral>) return true;
         else if constexpr (std::is_same_v<T, BoundUnary>) return groupingCompatible(node.operand, group_by);
-        else return groupingCompatible(node.left, group_by) && groupingCompatible(node.right, group_by);
+        else if constexpr (std::is_same_v<T, BoundBinary>)
+            return groupingCompatible(node.left, group_by) && groupingCompatible(node.right, group_by);
+        else if constexpr (std::is_same_v<T, BoundCase>) {
+            if (!groupingCompatible(node.operand, group_by) ||
+                !groupingCompatible(node.else_result, group_by)) return false;
+            for (const auto& branch : node.branches)
+                if (!groupingCompatible(branch.condition, group_by) ||
+                    !groupingCompatible(branch.result, group_by)) return false;
+            return true;
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            if (!groupingCompatible(node.value, group_by)) return false;
+            for (const auto& ref : node.correlated_columns)
+                if (!containsColumn(group_by, ref)) return false;
+            return true;
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery> ||
+                             std::is_same_v<T, BoundScalarSubquery>) {
+            for (const auto& ref : node.correlated_columns)
+                if (!containsColumn(group_by, ref)) return false;
+            return true;
+        } else return true;
     }, expression->node);
 }
 
@@ -119,6 +147,119 @@ std::string aggregateName(AggregateKind kind) {
     return "aggregate";
 }
 
+std::vector<DataType> selectOutputTypes(const BoundSelect& select) {
+    std::vector<DataType> types;
+    if (!select.aggregate_items.empty()) {
+        for (const auto& item : select.aggregate_items) {
+            types.push_back(std::visit([](const auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, BoundExprPtr>) return value->type;
+                else return value.type;
+            }, item.value));
+        }
+    } else if (!select.projection_expressions.empty()) {
+        for (const auto& expression : select.projection_expressions) types.push_back(expression->type);
+    } else {
+        for (const auto& column : select.columns) types.push_back(column.type);
+    }
+    return types;
+}
+
+const RelationBinding* relationFor(const BindingScope& scope, std::uint64_t relation_id) {
+    for (const auto& relation : scope) if (relation.id == relation_id) return &relation;
+    return nullptr;
+}
+
+void collectSelectRefs(const BoundSelect& select, std::vector<BoundColumnRef>& result,
+                       std::size_t depth);
+
+void collectExprRefs(const BoundExprPtr& expression, std::vector<BoundColumnRef>& result,
+                     std::size_t depth = 0) {
+    if (!expression || depth >= 256) return;
+    std::visit([&](const auto& node) {
+        using T = std::decay_t<decltype(node)>;
+        if constexpr (std::is_same_v<T, BoundColumnRef>) {
+            if (!containsColumn(result, node)) result.push_back(node);
+        } else if constexpr (std::is_same_v<T, BoundAggregate>) {
+            if (node.argument && !containsColumn(result, *node.argument))
+                result.push_back(*node.argument);
+        } else if constexpr (std::is_same_v<T, BoundUnary>) {
+            collectExprRefs(node.operand, result, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundBinary>) {
+            collectExprRefs(node.left, result, depth + 1);
+            collectExprRefs(node.right, result, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            collectExprRefs(node.operand, result, depth + 1);
+            for (const auto& branch : node.branches) {
+                collectExprRefs(branch.condition, result, depth + 1);
+                collectExprRefs(branch.result, result, depth + 1);
+            }
+            collectExprRefs(node.else_result, result, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            collectExprRefs(node.value, result, depth + 1);
+            if (node.query) collectSelectRefs(*node.query, result, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery> ||
+                             std::is_same_v<T, BoundScalarSubquery>) {
+            if (node.query) collectSelectRefs(*node.query, result, depth + 1);
+        }
+    }, expression->node);
+}
+
+void collectSelectRefs(const BoundSelect& select, std::vector<BoundColumnRef>& result,
+                       std::size_t depth) {
+    if (depth >= 256) return;
+    for (const auto& ref : select.columns)
+        if (!containsColumn(result, ref)) result.push_back(ref);
+    for (const auto& ref : select.group_by)
+        if (!containsColumn(result, ref)) result.push_back(ref);
+    for (const auto& item : select.order_by)
+        if (!containsColumn(result, item.column)) result.push_back(item.column);
+    collectExprRefs(select.where, result, depth + 1);
+    collectExprRefs(select.having, result, depth + 1);
+    for (const auto& expression : select.projection_expressions)
+        collectExprRefs(expression, result, depth + 1);
+    for (const auto& join : select.joins) collectExprRefs(join.on, result, depth + 1);
+    for (const auto& item : select.expression_order_by)
+        if (const auto* ref = std::get_if<BoundColumnRef>(&item.key)) {
+            if (!containsColumn(result, *ref)) result.push_back(*ref);
+        } else collectExprRefs(std::get<BoundExprPtr>(item.key), result, depth + 1);
+    for (const auto& item : select.aggregate_items)
+        std::visit([&](const auto& value) {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, BoundColumnRef>) {
+                if (!containsColumn(result, value)) result.push_back(value);
+            } else if constexpr (std::is_same_v<T, BoundAggregate>) {
+                if (value.argument && !containsColumn(result, *value.argument))
+                    result.push_back(*value.argument);
+            } else collectExprRefs(value, result, depth + 1);
+        }, item.value);
+    for (const auto& item : select.aggregate_order_by)
+        if (const auto* ref = std::get_if<BoundColumnRef>(&item.key)) {
+            if (!containsColumn(result, *ref)) result.push_back(*ref);
+        } else if (const auto* expression = std::get_if<BoundExprPtr>(&item.key))
+            collectExprRefs(*expression, result, depth + 1);
+    if (select.source_query) collectSelectRefs(*select.source_query, result, depth + 1);
+    for (const auto& join : select.joins)
+        if (join.subquery) collectSelectRefs(*join.subquery, result, depth + 1);
+    for (const auto& operation : select.set_operations)
+        if (operation.query) collectSelectRefs(*operation.query, result, depth + 1);
+}
+
+// 只记录子查询真实读取的外层列，既保证列裁剪正确，也避免无关列影响 GROUP BY 检查。
+std::vector<BoundColumnRef> correlatedColumns(const BoundSelect& query,
+                                              const BindingScope& visible_outer) {
+    std::vector<BoundColumnRef> all;
+    collectSelectRefs(query, all, 0);
+    std::vector<BoundColumnRef> result;
+    for (const auto& ref : all)
+        for (const auto& relation : visible_outer)
+            if (ref.relation_id == relation.id) {
+                if (!containsColumn(result, ref)) result.push_back(ref);
+                break;
+            }
+    return result;
+}
+
 // 限定名精确选择表；非限定名在全部可见表中查找，命中多次必须报歧义。
 Result<BoundColumnRef> resolveColumn(const Identifier& name, const BindingScope& scope,
                                     SourceLocation fallback) {
@@ -135,16 +276,21 @@ Result<BoundColumnRef> resolveColumn(const Identifier& name, const BindingScope&
     }
 
     std::optional<BoundColumnRef> match;
+    std::optional<std::size_t> matched_level;
     for (const auto& relation : scope) {
         if (qualifier && relation.name != *qualifier) continue;
         for (std::size_t index = 0; index < relation.table->columns.size(); ++index) {
             if (relation.table->columns[index].name != normalized) continue;
-            if (match) {
+            if (!matched_level || relation.level < *matched_level) {
+                match = columnRef(relation, index);
+                matched_level = relation.level;
+                continue;
+            }
+            if (relation.level == *matched_level) {
                 return error(ErrorCode::AmbiguousColumn,
                     "column '" + name.text + "' is ambiguous; qualify it with a table alias",
                     location(name.span, fallback));
             }
-            match = columnRef(relation, index);
         }
     }
     if (match) return *match;
@@ -166,6 +312,10 @@ public:
 private:
     const CatalogSnapshot& catalog_;
     SourceLocation statement_span_;
+    BindingScope outer_scope_;
+    std::uint64_t next_relation_id_ = 1;
+    // JSON/Java 协议使用有符号 long；从 2^62 开始仍与普通 Catalog ID 留有充足隔离。
+    std::uint64_t next_derived_table_id_ = std::uint64_t{1} << 62;
 
     template <typename T>
     Result<BoundStatement> success(T node) const {
@@ -179,8 +329,71 @@ private:
                      location(name.span, statement_span_));
     }
 
+    Result<ColumnSpec> bindColumnDefinition(const ColumnDefinition& column) const {
+        if (column.type == DataType::Null)
+            return error(ErrorCode::UnsupportedType, "NULL is not a declarable column type",
+                         location(column.span, location(column.name.span, statement_span_)));
+        if (column.varchar_length &&
+            (column.type != DataType::Varchar || *column.varchar_length <= 0))
+            return error(ErrorCode::UnsupportedType, "VARCHAR length must be a positive integer",
+                         location(column.span, statement_span_));
+        std::optional<ScalarValue> default_value;
+        if (column.default_value) {
+            const auto actual = literalType(column.default_value->value);
+            if ((column.not_null || column.primary_key) && actual == DataType::Null)
+                return error(ErrorCode::TypeMismatch, "NOT NULL column cannot default to NULL",
+                             column.default_value->span);
+            if (actual != DataType::Null && actual != column.type)
+                return error(ErrorCode::TypeMismatch,
+                    std::string("DEFAULT expects ") + typeName(column.type) + ", but " +
+                    typeName(actual) + " found", column.default_value->span);
+            if (column.varchar_length && actual == DataType::Varchar &&
+                utf8Length(std::get<std::string>(column.default_value->value)) >
+                    static_cast<std::size_t>(*column.varchar_length))
+                return error(ErrorCode::TypeMismatch, "DEFAULT exceeds VARCHAR length",
+                             column.default_value->span);
+            default_value = scalar(column.default_value->value);
+        }
+        return ColumnSpec{normalizeName(column.name.text), column.type, column.varchar_length,
+                          column.primary_key, column.not_null || column.primary_key,
+                          column.unique || column.primary_key, std::move(default_value)};
+    }
+
+    Result<BoundSelectPtr> bindNestedSelect(const SelectStmt& query,
+                                            BindingScope visible_outer) {
+        for (auto& relation : visible_outer) ++relation.level;
+        auto saved = std::move(outer_scope_);
+        outer_scope_ = std::move(visible_outer);
+        auto result = bindStatement(query);
+        outer_scope_ = std::move(saved);
+        if (const auto* failure = std::get_if<Diagnostic>(&result)) return *failure;
+        auto bound = std::get<BoundStatement>(std::move(result));
+        const auto* select = std::get_if<BoundSelect>(&bound.node);
+        if (!select) return error(ErrorCode::InvalidAst, "subquery must be a SELECT", statement_span_);
+        return std::make_shared<const BoundSelect>(*select);
+    }
+
+    Result<std::shared_ptr<const TableSchema>> derivedSchema(
+        const BoundSelect& query, const Identifier& alias) {
+        const auto types = selectOutputTypes(query);
+        if (types.empty() || types.size() != query.output_names.size())
+            return error(ErrorCode::InvalidAst, "derived table output metadata is inconsistent",
+                         alias.span);
+        std::unordered_set<std::string> names;
+        std::vector<ColumnSchema> columns;
+        for (std::size_t i = 0; i < types.size(); ++i) {
+            const auto name = normalizeName(query.output_names[i]);
+            if (!names.insert(name).second)
+                return error(ErrorCode::DuplicateColumn,
+                    "derived table contains duplicate output column '" + name + "'", alias.span);
+            columns.push_back({ColumnId{static_cast<std::uint64_t>(i + 1)}, name, types[i]});
+        }
+        return std::make_shared<const TableSchema>(TableSchema{
+            TableId{next_derived_table_id_++}, normalizeName(alias.text), std::move(columns)});
+    }
+
     Result<BoundStatement> bindStatement(const CreateTableStmt& stmt) {
-        if (catalog_.findTable(normalizeName(stmt.table.text))) {
+        if (catalog_.findTable(normalizeName(stmt.table.text)) && !stmt.if_not_exists) {
             return error(ErrorCode::TableAlreadyExists, "table '" + stmt.table.text + "' already exists",
                          location(stmt.table.span, statement_span_));
         }
@@ -196,43 +409,103 @@ private:
                 return error(ErrorCode::DuplicateColumn, "duplicate column '" + column.name.text + "'",
                              location(column.name.span, statement_span_));
             }
-            if (column.type == DataType::Null) {
-                return error(ErrorCode::UnsupportedType, "NULL is not a declarable column type",
-                             location(column.span, location(column.name.span, statement_span_)));
-            }
-            if (column.varchar_length &&
-                (column.type != DataType::Varchar || *column.varchar_length <= 0)) {
-                return error(ErrorCode::UnsupportedType,
-                    "VARCHAR length must be a positive integer", location(column.span, statement_span_));
-            }
             if (column.primary_key && has_primary_key)
                 return error(ErrorCode::InvalidAst,
                     "table may contain only one PRIMARY KEY column",
                     location(column.span, statement_span_));
             has_primary_key = has_primary_key || column.primary_key;
-            std::optional<ScalarValue> default_value;
-            if (column.default_value) {
-                const auto actual = literalType(column.default_value->value);
-                if ((column.not_null || column.primary_key) && actual == DataType::Null)
-                    return error(ErrorCode::TypeMismatch,
-                        "NOT NULL column cannot default to NULL", column.default_value->span);
-                if (actual != DataType::Null && actual != column.type)
-                    return error(ErrorCode::TypeMismatch,
-                        std::string("DEFAULT expects ") + typeName(column.type) + ", but " +
-                        typeName(actual) + " found", column.default_value->span);
-                if (column.varchar_length && actual == DataType::Varchar &&
-                    utf8Length(std::get<std::string>(column.default_value->value)) >
-                        static_cast<std::size_t>(*column.varchar_length))
-                    return error(ErrorCode::TypeMismatch,
-                        "DEFAULT exceeds VARCHAR length", column.default_value->span);
-                default_value = scalar(column.default_value->value);
+            auto spec = bindColumnDefinition(column);
+            if (const auto* failure = std::get_if<Diagnostic>(&spec)) return *failure;
+            columns.push_back(std::get<ColumnSpec>(std::move(spec)));
+        }
+        std::vector<TableConstraintSpec> constraints;
+        for (const auto& constraint : stmt.table_constraints) {
+            const bool primary = constraint.kind == TableConstraintKind::PrimaryKey;
+            if (primary && has_primary_key)
+                return error(ErrorCode::InvalidAst, "table may contain only one PRIMARY KEY",
+                             location(constraint.span, statement_span_));
+            has_primary_key = has_primary_key || primary;
+            std::unordered_set<std::size_t> members;
+            TableConstraintSpec bound{primary, {}};
+            for (const auto& name : constraint.columns) {
+                const auto normalized = normalizeName(name.text);
+                std::size_t ordinal = columns.size();
+                for (std::size_t i = 0; i < columns.size(); ++i)
+                    if (columns[i].name == normalized) ordinal = i;
+                if (ordinal == columns.size())
+                    return error(ErrorCode::ColumnNotFound,
+                        "constraint column '" + name.text + "' does not exist", name.span);
+                if (!members.insert(ordinal).second)
+                    return error(ErrorCode::DuplicateColumn,
+                        "duplicate constraint column '" + name.text + "'", name.span);
+                if (primary) columns[ordinal].not_null = true;
+                bound.columns.push_back(ordinal);
             }
-            columns.push_back({std::move(normalized), column.type, column.varchar_length,
-                               column.primary_key, column.not_null || column.primary_key,
-                               column.unique || column.primary_key, std::move(default_value)});
+            constraints.push_back(std::move(bound));
         }
         // 只有描述，没有注册动作，也不分配数据库 ID。
-        return success(BoundCreateTable{normalizeName(stmt.table.text), std::move(columns)});
+        return success(BoundCreateTable{normalizeName(stmt.table.text), std::move(columns),
+                                        std::move(constraints), stmt.if_not_exists});
+    }
+
+    Result<BoundStatement> bindStatement(const AlterTableStmt& stmt) {
+        auto lookup = findTable(stmt.table);
+        if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
+        auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        return std::visit([&](const auto& action) -> Result<BoundStatement> {
+            using T = std::decay_t<decltype(action)>;
+            if constexpr (std::is_same_v<T, AlterAddColumn>) {
+                const auto name = normalizeName(action.column.name.text);
+                for (const auto& column : table->columns)
+                    if (column.name == name)
+                        return error(ErrorCode::DuplicateColumn,
+                            "column '" + action.column.name.text + "' already exists",
+                            action.column.name.span);
+                auto spec = bindColumnDefinition(action.column);
+                if (const auto* failure = std::get_if<Diagnostic>(&spec)) return *failure;
+                return success(BoundAlterTable{table,
+                    BoundAlterAddColumn{std::get<ColumnSpec>(std::move(spec))}});
+            } else if constexpr (std::is_same_v<T, AlterDropColumn>) {
+                const auto name = normalizeName(action.column.text);
+                std::size_t ordinal = table->columns.size();
+                for (std::size_t i = 0; i < table->columns.size(); ++i)
+                    if (table->columns[i].name == name) ordinal = i;
+                if (ordinal == table->columns.size())
+                    return error(ErrorCode::ColumnNotFound,
+                        "column '" + action.column.text + "' does not exist", action.column.span);
+                if (table->columns.size() == 1)
+                    return error(ErrorCode::EmptyColumnList, "cannot drop the last table column",
+                                 action.column.span);
+                for (const auto& constraint : table->table_constraints)
+                    for (const auto member : constraint.columns)
+                        if (member == ordinal)
+                            return error(ErrorCode::InvalidAst,
+                                "cannot drop a column used by a table constraint", action.column.span);
+                return success(BoundAlterTable{table,
+                    BoundAlterDropColumn{ordinal, name}});
+            } else if constexpr (std::is_same_v<T, AlterRenameTable>) {
+                const auto name = normalizeName(action.new_name.text);
+                if (catalog_.findTable(name))
+                    return error(ErrorCode::TableAlreadyExists,
+                        "table '" + action.new_name.text + "' already exists", action.new_name.span);
+                return success(BoundAlterTable{table, BoundAlterRenameTable{name}});
+            } else {
+                const auto old_name = normalizeName(action.old_name.text);
+                const auto new_name = normalizeName(action.new_name.text);
+                std::size_t ordinal = table->columns.size();
+                for (std::size_t i = 0; i < table->columns.size(); ++i) {
+                    if (table->columns[i].name == old_name) ordinal = i;
+                    if (table->columns[i].name == new_name)
+                        return error(ErrorCode::DuplicateColumn,
+                            "column '" + action.new_name.text + "' already exists", action.new_name.span);
+                }
+                if (ordinal == table->columns.size())
+                    return error(ErrorCode::ColumnNotFound,
+                        "column '" + action.old_name.text + "' does not exist", action.old_name.span);
+                return success(BoundAlterTable{table,
+                    BoundAlterRenameColumn{ordinal, new_name}});
+            }
+        }, stmt.action);
     }
 
     Result<BoundStatement> bindStatement(const DropTableStmt& stmt) {
@@ -334,39 +607,74 @@ private:
     }
 
     Result<BoundStatement> bindStatement(const SelectStmt& stmt) {
-        if (stmt.table_alias && stmt.table_alias->text.find('.') != std::string::npos)
+        const BindingScope enclosing_scope = outer_scope_;
+        BoundSelectPtr source_query;
+        std::shared_ptr<const TableSchema> table;
+        std::optional<Identifier> root_alias = stmt.from.alias ? stmt.from.alias : stmt.table_alias;
+        if (root_alias && root_alias->text.find('.') != std::string::npos)
             return error(ErrorCode::InvalidAst, "table alias must be a simple identifier",
-                         location(stmt.table_alias->span, statement_span_));
-        auto lookup = findTable(stmt.table);
-        if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
-        auto table = std::get<std::shared_ptr<const TableSchema>>(lookup);
-        const std::string relation_name = stmt.table_alias
-            ? normalizeName(stmt.table_alias->text) : table->name;
-        BindingScope scope{{table, relation_name, 1}};
+                         location(root_alias->span, statement_span_));
+        if (stmt.from.subquery) {
+            if (!root_alias)
+                return error(ErrorCode::InvalidAst, "derived table requires an alias", stmt.from.span);
+            auto nested = bindNestedSelect(*stmt.from.subquery, {});
+            if (const auto* failure = std::get_if<Diagnostic>(&nested)) return *failure;
+            source_query = std::get<BoundSelectPtr>(std::move(nested));
+            auto schema = derivedSchema(*source_query, *root_alias);
+            if (const auto* failure = std::get_if<Diagnostic>(&schema)) return *failure;
+            table = std::get<std::shared_ptr<const TableSchema>>(std::move(schema));
+        } else {
+            const Identifier& root_table = stmt.from.table.text.empty() ? stmt.table : stmt.from.table;
+            auto lookup = findTable(root_table);
+            if (const auto* failure = std::get_if<Diagnostic>(&lookup)) return *failure;
+            table = std::get<std::shared_ptr<const TableSchema>>(lookup);
+        }
+        const std::string relation_name = root_alias
+            ? normalizeName(root_alias->text) : table->name;
+        const std::uint64_t root_relation_id = next_relation_id_++;
+        BindingScope scope{{table, relation_name, root_relation_id, 0}};
+        scope.insert(scope.end(), outer_scope_.begin(), outer_scope_.end());
         std::vector<BoundJoin> joins;
         for (const auto& join : stmt.joins) {
-            if (join.alias && join.alias->text.find('.') != std::string::npos)
+            BoundSelectPtr join_query;
+            std::shared_ptr<const TableSchema> joined;
+            std::optional<Identifier> joined_alias = join.source.alias ? join.source.alias : join.alias;
+            if (joined_alias && joined_alias->text.find('.') != std::string::npos)
                 return error(ErrorCode::InvalidAst, "JOIN alias must be a simple identifier",
-                             location(join.alias->span, location(join.span, statement_span_)));
-            auto joined_lookup = findTable(join.table);
-            if (const auto* failure = std::get_if<Diagnostic>(&joined_lookup)) return *failure;
-            auto joined = std::get<std::shared_ptr<const TableSchema>>(joined_lookup);
-            const std::string joined_name = join.alias
-                ? normalizeName(join.alias->text) : joined->name;
+                             location(joined_alias->span, location(join.span, statement_span_)));
+            if (join.source.subquery) {
+                if (!joined_alias)
+                    return error(ErrorCode::InvalidAst, "derived table requires an alias",
+                                 join.source.span);
+                auto nested = bindNestedSelect(*join.source.subquery, {});
+                if (const auto* failure = std::get_if<Diagnostic>(&nested)) return *failure;
+                join_query = std::get<BoundSelectPtr>(std::move(nested));
+                auto schema = derivedSchema(*join_query, *joined_alias);
+                if (const auto* failure = std::get_if<Diagnostic>(&schema)) return *failure;
+                joined = std::get<std::shared_ptr<const TableSchema>>(std::move(schema));
+            } else {
+                const Identifier& joined_table =
+                    join.source.table.text.empty() ? join.table : join.source.table;
+                auto joined_lookup = findTable(joined_table);
+                if (const auto* failure = std::get_if<Diagnostic>(&joined_lookup)) return *failure;
+                joined = std::get<std::shared_ptr<const TableSchema>>(joined_lookup);
+            }
+            const std::string joined_name = joined_alias
+                ? normalizeName(joined_alias->text) : joined->name;
             for (const auto& visible : scope) {
-                if (visible.name == joined_name) {
+                if (visible.level == 0 && visible.name == joined_name) {
                     return error(ErrorCode::DuplicateTable,
                         "relation name '" + joined_name + "' occurs more than once",
-                        location(join.alias ? join.alias->span : join.table.span,
+                        location(joined_alias ? joined_alias->span : join.table.span,
                                  location(join.span, statement_span_)));
                 }
             }
-            const std::uint64_t relation_id = scope.size() + 1;
-            scope.push_back({joined, joined_name, relation_id});
+            const std::uint64_t relation_id = next_relation_id_++;
+            scope.push_back({joined, joined_name, relation_id, 0});
             auto condition = bindBoolean(join.on, scope, "JOIN ON", ErrorCode::JoinConditionNotBoolean);
             if (const auto* failure = std::get_if<Diagnostic>(&condition)) return *failure;
             joins.push_back({std::move(joined), std::get<BoundExprPtr>(std::move(condition)),
-                             joined_name, relation_id, join.type});
+                             joined_name, relation_id, join.type, std::move(join_query)});
         }
 
         std::vector<BoundColumnRef> columns;
@@ -379,6 +687,7 @@ private:
                 return error(ErrorCode::InvalidAst,
                              "SELECT * cannot carry column aliases", statement_span_);
             for (const auto& visible : scope) {
+                if (visible.level != 0) continue;
                 for (std::size_t i = 0; i < visible.table->columns.size(); ++i) {
                     columns.push_back(columnRef(visible, i));
                     output_names.push_back(visible.table->columns[i].name);
@@ -406,8 +715,8 @@ private:
                     output_names.push_back(alias);
                     output_aliases.push_back({std::move(alias), i});
                 } else {
-                    output_names.push_back(
-                        scope[ref.relation_id - 1].table->columns[ref.ordinal].name);
+                    const auto* relation = relationFor(scope, ref.relation_id);
+                    output_names.push_back(relation->table->columns[ref.ordinal].name);
                 }
             }
         } else {
@@ -427,7 +736,8 @@ private:
                     auto ref = std::get<BoundColumnRef>(resolved);
                     columns.push_back(ref);
                     expression = std::make_shared<const BoundExpr>(BoundExpr{ref, ref.type, name->span});
-                    default_name = scope[ref.relation_id - 1].table->columns[ref.ordinal].name;
+                    default_name = relationFor(scope, ref.relation_id)
+                        ->table->columns[ref.ordinal].name;
                 } else if (const auto* call = std::get_if<AggregateCall>(&item)) {
                     auto source = std::make_shared<const Expr>(Expr{*call, call->span});
                     auto bound = bindExpr(source, scope, 0, statement_span_, true);
@@ -435,8 +745,8 @@ private:
                     expression = std::get<BoundExprPtr>(std::move(bound));
                     const auto& aggregate = std::get<BoundAggregate>(expression->node);
                     default_name = aggregateName(aggregate.kind) + std::string{"("} +
-                        (aggregate.argument ? scope[aggregate.argument->relation_id - 1]
-                            .table->columns[aggregate.argument->ordinal].name : "*") + ")";
+                        (aggregate.argument ? relationFor(scope, aggregate.argument->relation_id)
+                            ->table->columns[aggregate.argument->ordinal].name : "*") + ")";
                 } else {
                     const auto& source = std::get<ExprPtr>(item);
                     auto bound = bindExpr(source, scope, 0, statement_span_, true);
@@ -444,11 +754,12 @@ private:
                     expression = std::get<BoundExprPtr>(std::move(bound));
                     // 括号只改变解析路径，不应把 `(age)` 或 `(COUNT(*))` 的默认列名变成 exprN。
                     if (const auto* ref = std::get_if<BoundColumnRef>(&expression->node)) {
-                        default_name = scope[ref->relation_id - 1].table->columns[ref->ordinal].name;
+                        default_name = relationFor(scope, ref->relation_id)
+                            ->table->columns[ref->ordinal].name;
                     } else if (const auto* aggregate = std::get_if<BoundAggregate>(&expression->node)) {
                         default_name = aggregateName(aggregate->kind) + std::string{"("} +
-                            (aggregate->argument ? scope[aggregate->argument->relation_id - 1]
-                                .table->columns[aggregate->argument->ordinal].name : "*") + ")";
+                            (aggregate->argument ? relationFor(scope, aggregate->argument->relation_id)
+                                ->table->columns[aggregate->argument->ordinal].name : "*") + ")";
                     } else default_name = "expr" + std::to_string(output_ordinal + 1);
                 }
                 projection_expressions.push_back(expression);
@@ -601,14 +912,29 @@ private:
                 expression_order_by.push_back({expression, pending.direction});
             }
         }
-        return success(BoundSelect{std::move(table), std::move(columns),
-                                   std::get<BoundExprPtr>(std::move(predicate)),
-                                   std::move(joins), std::move(group_by), std::move(order_by),
-                                   relation_name, 1, std::move(output_names),
-                                   std::move(aggregate_items), std::move(aggregate_order_by),
-                                   std::move(projection_expressions),
-                                   std::move(expression_order_by), std::move(having), stmt.distinct,
-                                   stmt.limit, stmt.offset.value_or(0)});
+        BoundSelect result{std::move(table), std::move(columns),
+                           std::get<BoundExprPtr>(std::move(predicate)),
+                           std::move(joins), std::move(group_by), std::move(order_by),
+                           relation_name, root_relation_id, std::move(output_names),
+                           std::move(aggregate_items), std::move(aggregate_order_by),
+                           std::move(projection_expressions),
+                           std::move(expression_order_by), std::move(having), stmt.distinct,
+                           stmt.limit, stmt.offset.value_or(0), std::move(source_query), {}};
+        const auto left_types = selectOutputTypes(result);
+        for (const auto& operation : stmt.set_operations) {
+            if (!operation.query)
+                return error(ErrorCode::InvalidAst, "set operation query is missing",
+                             operation.operator_span);
+            auto branch = bindNestedSelect(*operation.query, enclosing_scope);
+            if (const auto* failure = std::get_if<Diagnostic>(&branch)) return *failure;
+            auto query = std::get<BoundSelectPtr>(std::move(branch));
+            if (selectOutputTypes(*query) != left_types)
+                return error(ErrorCode::TypeMismatch,
+                    "set operation branches must have the same column count and types",
+                    operation.operator_span);
+            result.set_operations.push_back({operation.op, operation.all, std::move(query)});
+        }
+        return success(std::move(result));
     }
 
     Result<BoundStatement> bindStatement(const UpdateStmt& stmt) {
@@ -745,6 +1071,101 @@ private:
                         aggregateName(*kind) + " expects an INT or FLOAT column", span);
                 BoundAggregate aggregate{*kind, argument, result_type, span};
                 return std::make_shared<const BoundExpr>(BoundExpr{aggregate, result_type, span});
+            } else if constexpr (std::is_same_v<T, InSubqueryExpr>) {
+                auto value = bindExpr(node.value, scope, depth + 1, span, allow_aggregate);
+                if (const auto* failure = std::get_if<Diagnostic>(&value)) return *failure;
+                if (!node.query) return error(ErrorCode::InvalidAst, "IN subquery is missing", span);
+                auto nested = bindNestedSelect(*node.query, scope);
+                if (const auto* failure = std::get_if<Diagnostic>(&nested)) return *failure;
+                auto query = std::get<BoundSelectPtr>(std::move(nested));
+                const auto types = selectOutputTypes(*query);
+                auto left = std::get<BoundExprPtr>(std::move(value));
+                if (types.size() != 1)
+                    return error(ErrorCode::ValueCountMismatch,
+                                 "IN subquery must return exactly one column", span);
+                if (left->type != DataType::Null && types[0] != DataType::Null &&
+                    left->type != types[0])
+                    return error(ErrorCode::TypeMismatch,
+                                 "IN value and subquery column must have the same type", span);
+                auto correlations = correlatedColumns(*query, scope);
+                return std::make_shared<const BoundExpr>(BoundExpr{
+                    BoundInSubquery{std::move(left), std::move(query), nullptr,
+                                    std::move(correlations), node.negated},
+                    DataType::Bool, span});
+            } else if constexpr (std::is_same_v<T, ExistsSubqueryExpr>) {
+                if (!node.query) return error(ErrorCode::InvalidAst, "EXISTS subquery is missing", span);
+                auto nested = bindNestedSelect(*node.query, scope);
+                if (const auto* failure = std::get_if<Diagnostic>(&nested)) return *failure;
+                auto query = std::get<BoundSelectPtr>(std::move(nested));
+                auto correlations = correlatedColumns(*query, scope);
+                return std::make_shared<const BoundExpr>(BoundExpr{
+                    BoundExistsSubquery{std::move(query), nullptr,
+                                        std::move(correlations), node.negated},
+                    DataType::Bool, span});
+            } else if constexpr (std::is_same_v<T, ScalarSubqueryExpr>) {
+                if (!node.query) return error(ErrorCode::InvalidAst, "scalar subquery is missing", span);
+                auto nested = bindNestedSelect(*node.query, scope);
+                if (const auto* failure = std::get_if<Diagnostic>(&nested)) return *failure;
+                auto query = std::get<BoundSelectPtr>(std::move(nested));
+                const auto types = selectOutputTypes(*query);
+                if (types.size() != 1)
+                    return error(ErrorCode::ValueCountMismatch,
+                                 "scalar subquery must return exactly one column", span);
+                auto correlations = correlatedColumns(*query, scope);
+                return std::make_shared<const BoundExpr>(BoundExpr{
+                    BoundScalarSubquery{std::move(query), nullptr, std::move(correlations)},
+                    types.front(), span});
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                if (node.branches.empty())
+                    return error(ErrorCode::InvalidAst, "CASE requires at least one WHEN branch", span);
+                BoundExprPtr operand;
+                if (node.operand) {
+                    auto bound = bindExpr(node.operand, scope, depth + 1, span, allow_aggregate);
+                    if (const auto* failure = std::get_if<Diagnostic>(&bound)) return *failure;
+                    operand = std::get<BoundExprPtr>(std::move(bound));
+                }
+                std::vector<BoundCaseWhen> branches;
+                std::optional<DataType> result_type;
+                for (const auto& branch : node.branches) {
+                    auto condition = bindExpr(branch.condition, scope, depth + 1, span, allow_aggregate);
+                    if (const auto* failure = std::get_if<Diagnostic>(&condition)) return *failure;
+                    auto when = std::get<BoundExprPtr>(std::move(condition));
+                    if (operand) {
+                        if (when->type != DataType::Null && operand->type != DataType::Null &&
+                            when->type != operand->type)
+                            return error(ErrorCode::TypeMismatch,
+                                "simple CASE operand and WHEN values must have the same type", when->span);
+                    } else if (when->type != DataType::Bool) {
+                        return error(ErrorCode::WhereNotBoolean,
+                                     "searched CASE WHEN expects BOOL", when->span);
+                    }
+                    auto result = bindExpr(branch.result, scope, depth + 1, span, allow_aggregate);
+                    if (const auto* failure = std::get_if<Diagnostic>(&result)) return *failure;
+                    auto then_value = std::get<BoundExprPtr>(std::move(result));
+                    if (then_value->type != DataType::Null) {
+                        if (result_type && *result_type != then_value->type)
+                            return error(ErrorCode::TypeMismatch,
+                                "CASE result expressions must have the same type", then_value->span);
+                        result_type = then_value->type;
+                    }
+                    branches.push_back({std::move(when), std::move(then_value)});
+                }
+                BoundExprPtr else_result;
+                if (node.else_result) {
+                    auto bound = bindExpr(node.else_result, scope, depth + 1, span, allow_aggregate);
+                    if (const auto* failure = std::get_if<Diagnostic>(&bound)) return *failure;
+                    else_result = std::get<BoundExprPtr>(std::move(bound));
+                    if (else_result->type != DataType::Null) {
+                        if (result_type && *result_type != else_result->type)
+                            return error(ErrorCode::TypeMismatch,
+                                "CASE result expressions must have the same type", else_result->span);
+                        result_type = else_result->type;
+                    }
+                }
+                const DataType type = result_type.value_or(DataType::Null);
+                return std::make_shared<const BoundExpr>(BoundExpr{
+                    BoundCase{std::move(operand), std::move(branches), std::move(else_result)},
+                    type, span});
             } else {
                 const auto op_span = location(node.operator_span, span);
                 auto left = bindExpr(node.left, scope, depth + 1, op_span, allow_aggregate);

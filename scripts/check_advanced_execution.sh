@@ -52,6 +52,15 @@ sources=(
 "$build_dir/minisql_plan_json" \
     < "$engine_dir/src/test/resources/optimizer-rules.sql" \
     > "$engine_dir/target/optimizer-rules-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/a-extension-features.sql" \
+    > "$engine_dir/target/a-extension-features-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/a-extension-constraint-error.sql" \
+    > "$engine_dir/target/a-extension-constraint-error-plan.json"
+"$build_dir/minisql_plan_json" \
+    < "$engine_dir/src/test/resources/a-extension-scalar-error.sql" \
+    > "$engine_dir/target/a-extension-scalar-error-plan.json"
 
 mvn -q -f "$engine_dir/pom.xml" test-compile
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" minidb.EngineTest
@@ -69,3 +78,8 @@ java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     minidb.ExplainAnalyzeEngineTest "$engine_dir/target/explain-analyze-plan.json"
 java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
     minidb.OptimizerRulesEngineTest "$engine_dir/target/optimizer-rules-plan.json"
+java -ea -cp "$engine_dir/target/classes:$engine_dir/target/test-classes" \
+    minidb.AExtensionFeaturesEngineTest \
+    "$engine_dir/target/a-extension-features-plan.json" \
+    "$engine_dir/target/a-extension-constraint-error-plan.json" \
+    "$engine_dir/target/a-extension-scalar-error-plan.json"

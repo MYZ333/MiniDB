@@ -112,5 +112,70 @@ int main() {
                   std::get<LiteralExpr>(comparison.right->node).value) == 18,
               "EXPLAIN target expression was not optimized");
     });
+    suite.run("AST optimizer traverses IN subqueries", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT id FROM t WHERE id IN (SELECT id FROM u WHERE TRUE AND score > 10 + 8);"));
+        const auto& in_subquery = std::get<InSubqueryExpr>(selected(after).where->node);
+        const auto& comparison = std::get<BinaryExpr>(in_subquery.query->where->node);
+        const auto& folded = std::get<LiteralExpr>(comparison.right->node).value;
+        check(comparison.op == BinaryOp::Greater && std::get<std::int64_t>(folded) == 18,
+              "IN subquery WHERE was not optimized");
+    });
+    suite.run("AST optimizer traverses EXISTS subqueries", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT id FROM t WHERE EXISTS (SELECT * FROM u WHERE TRUE AND score > 10 + 8);"));
+        const auto& exists_subquery = std::get<ExistsSubqueryExpr>(selected(after).where->node);
+        const auto& comparison = std::get<BinaryExpr>(exists_subquery.query->where->node);
+        const auto& folded = std::get<LiteralExpr>(comparison.right->node).value;
+        check(comparison.op == BinaryOp::Greater && std::get<std::int64_t>(folded) == 18,
+              "EXISTS subquery WHERE was not optimized");
+    });
+    suite.run("AST optimizer traverses derived tables", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT d.id FROM (SELECT id FROM u WHERE TRUE AND score > 10 + 8) d;"));
+        const auto& source = selected(after).from;
+        check(source.subquery != nullptr, "derived table subquery was lost");
+        const auto& comparison = std::get<BinaryExpr>(source.subquery->where->node);
+        const auto& folded = std::get<LiteralExpr>(comparison.right->node).value;
+        check(comparison.op == BinaryOp::Greater && std::get<std::int64_t>(folded) == 18,
+              "derived table WHERE was not optimized");
+    });
+    suite.run("AST optimizer traverses scalar subqueries", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT id FROM t WHERE age > (SELECT score FROM u WHERE TRUE AND score > 10 + 8);"));
+        const auto& comparison = std::get<BinaryExpr>(selected(after).where->node);
+        const auto& scalar = std::get<ScalarSubqueryExpr>(comparison.right->node);
+        const auto& subquery_comparison = std::get<BinaryExpr>(scalar.query->where->node);
+        const auto& folded = std::get<LiteralExpr>(subquery_comparison.right->node).value;
+        check(subquery_comparison.op == BinaryOp::Greater &&
+                  std::get<std::int64_t>(folded) == 18,
+              "scalar subquery WHERE was not optimized");
+    });
+    suite.run("AST optimizer traverses set operation branches", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT id FROM t EXCEPT ALL SELECT id FROM u WHERE TRUE AND score > 10 + 8;"));
+        const auto& operations = selected(after).set_operations;
+        check(operations.size() == 1 && operations[0].op == SetOperator::Except &&
+                  operations[0].all,
+              "set operation was not retained");
+        const auto& comparison = std::get<BinaryExpr>(operations[0].query->where->node);
+        const auto& folded = std::get<LiteralExpr>(comparison.right->node).value;
+        check(comparison.op == BinaryOp::Greater && std::get<std::int64_t>(folded) == 18,
+              "set operation branch WHERE was not optimized");
+    });
+    suite.run("AST optimizer traverses CASE expressions", [] {
+        const auto after = optimizeAstStatement(parsed(
+            "SELECT CASE WHEN TRUE AND active THEN 10 + 8 ELSE 1 + 2 END FROM t;"));
+        const auto& items = std::get<std::vector<SelectItem>>(selected(after).columns);
+        const auto& case_expr = std::get<CaseExpr>(std::get<ExprPtr>(items[0])->node);
+        check(std::holds_alternative<IdentifierExpr>(case_expr.branches[0].condition->node),
+              "CASE WHEN condition was not optimized");
+        check(std::get<std::int64_t>(
+                  std::get<LiteralExpr>(case_expr.branches[0].result->node).value) == 18,
+              "CASE THEN result was not optimized");
+        check(std::get<std::int64_t>(
+                  std::get<LiteralExpr>(case_expr.else_result->node).value) == 3,
+              "CASE ELSE result was not optimized");
+    });
     return suite.finish();
 }

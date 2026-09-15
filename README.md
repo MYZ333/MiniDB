@@ -23,9 +23,10 @@ C++ SQL 编译器 ── JSON 逻辑执行计划 ──► Java 数据库引擎
 
 - C++ 编译器负责 SQL 的词法、语法、语义、逻辑计划和规则优化，并输出 JSON 计划；
   编译侧支持约束 DDL、多行 INSERT、计算与聚合表达式、内外连接、分组、HAVING、
-  DISTINCT、表达式排序、LIMIT/OFFSET 和 EXPLAIN/EXPLAIN ANALYZE。
-- Java 执行引擎负责 CreateTable、DropTable、Insert、SeqScan、EmptyResult、NestedLoopJoin、
-  Filter、GroupBy、Aggregate、Sort、Project、Update、Delete 的实际执行、表达式求值、运行期错误和结果集生成。
+  DISTINCT、表达式排序、LIMIT/OFFSET、子查询、派生表、集合运算、CASE、ALTER TABLE 和
+  EXPLAIN/EXPLAIN ANALYZE。
+- Java 执行引擎负责 AlterTable、DerivedTable、SetOperation 等全部计划节点的实际执行、
+  表模式和记录迁移、关联表达式求值、运行期错误和结果集生成。
 - `RecordStore` 是执行层与存储层的边界；后续页式存储只需实现该接口，不需改动执行器。
 - Web 演示台负责 SQL 编辑、结果表格、错误定位、执行历史和 JSON 计划展示。
 
@@ -64,14 +65,16 @@ DELETE FROM student WHERE id = 1;
 - 编译器数据类型：`INT`、`VARCHAR(n)`、`BOOL`、`FLOAT`，INSERT 支持 `NULL` 和多行 VALUES
 - 编译器表达式：同类型数值运算和比较、字符串/布尔判等、LIKE、空值判定和三值逻辑
 - 编译器查询：表/列别名、内外连接、GROUP BY/HAVING、五类聚合、DISTINCT、表达式排序与分页
+- 编译器扩展：关联/非关联子查询、FROM/JOIN 派生表、UNION/INTERSECT/EXCEPT 及 ALL、CASE
+- 编译器 DDL：CREATE IF NOT EXISTS、列级/复合约束、ALTER TABLE ADD/DROP/RENAME
 - 计划观测：EXPLAIN 展示优化后树，EXPLAIN ANALYZE 展示每个算子的实际行数、耗时和调用次数
 - 计划优化：常量折叠、外连接安全的谓词下推、空结果传播，以及覆盖查询和 DML 依赖的列裁剪
 - Java 引擎执行类型：`INT`、`FLOAT`、`VARCHAR`、`BOOL`，记录可保存 `NULL`
 - Java 引擎高级查询：内外连接、分组/HAVING、计算投影、多列排序、DISTINCT、分页和规定的 NULL 顺序
 - 错误处理：词法/语法/语义错误，以及除零、整数溢出、类型不匹配等执行期错误
 
-feature-zhangbo 提供的扩展语法已接通 B 和 Java 执行层，包括 HAVING、DISTINCT、
-LIMIT/OFFSET、外连接、计算投影、LIKE、列约束、多行 INSERT 和 DROP TABLE。
+feature-zhangbo 提供的扩展语法已接通 B 和 Java 执行层，包括子查询、派生表、集合运算、
+CASE、ALTER TABLE，以及此前的 HAVING、DISTINCT、外连接和约束 DDL。
 项目扩展还支持 EXPLAIN 和带真实执行统计的 EXPLAIN ANALYZE。
 完整边界见 [文法支持表](DBcompiler-main/grammar.md)。聚合函数内部 DISTINCT、索引、事务和并发控制尚不支持。
 整合过程与代码阅读指南见 [A+B 整合说明](DBcompiler-main/docs/zhangbo-merge-notes.md)。
@@ -120,7 +123,8 @@ bash scripts/check_advanced_execution.sh
 ```
 
 该脚本用真实 SQL 构建 C++ JSON 计划，再由 Java 测试检查 JOIN、GROUP BY、ORDER BY、
-FLOAT、BOOL、NULL、五类聚合、HAVING、DISTINCT、分页、LIKE、DDL 约束、多行写入、失败原子性
+FLOAT、BOOL、NULL、五类聚合、HAVING、DISTINCT、分页、LIKE、子查询、派生表、集合运算、
+CASE、ALTER、DDL 约束、多行写入、失败原子性
 以及 EXPLAIN ANALYZE 运行时统计、谓词下推、空结果传播、精确列扫描和零列 `COUNT(*)` 执行。
 
 聚合代码的阅读顺序和答辩示例见 [聚合实现讲解](DBcompiler-main/docs/aggregate-walkthrough.md)。

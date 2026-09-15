@@ -85,6 +85,41 @@ const AggregateCall& asAggregateExpr(const ExprPtr& expr, AggregateFunction func
     return *aggregate;
 }
 
+const InSubqueryExpr& asInSubquery(const ExprPtr& expr, bool negated) {
+    const auto* in_subquery = std::get_if<InSubqueryExpr>(&expr->node);
+    require(in_subquery != nullptr, "expected IN subquery expression");
+    require(in_subquery->negated == negated, "unexpected IN subquery negation");
+    require(in_subquery->query != nullptr, "IN subquery SELECT missing");
+    return *in_subquery;
+}
+
+const ExistsSubqueryExpr& asExistsSubquery(const ExprPtr& expr, bool negated) {
+    const auto* exists_subquery = std::get_if<ExistsSubqueryExpr>(&expr->node);
+    require(exists_subquery != nullptr, "expected EXISTS subquery expression");
+    require(exists_subquery->negated == negated, "unexpected EXISTS subquery negation");
+    require(exists_subquery->query != nullptr, "EXISTS subquery SELECT missing");
+    return *exists_subquery;
+}
+
+const ScalarSubqueryExpr& asScalarSubquery(const ExprPtr& expr) {
+    const auto* scalar_subquery = std::get_if<ScalarSubqueryExpr>(&expr->node);
+    require(scalar_subquery != nullptr, "expected scalar subquery expression");
+    require(scalar_subquery->query != nullptr, "scalar subquery SELECT missing");
+    return *scalar_subquery;
+}
+
+const CaseExpr& asCaseExpr(const ExprPtr& expr) {
+    const auto* case_expr = std::get_if<CaseExpr>(&expr->node);
+    require(case_expr != nullptr, "expected CASE expression");
+    return *case_expr;
+}
+
+const TableRef& asDerivedTable(const TableRef& source, const char* alias) {
+    require(source.subquery != nullptr, "expected derived table subquery");
+    require(source.alias && source.alias->text == alias, "derived table alias not retained");
+    return source;
+}
+
 void testStatements() {
     const auto statements = parseOk(
         "CREATE TABLE student(id INT, name VARCHAR, age INT);"
@@ -394,6 +429,89 @@ void testColumnConstraints() {
     expectSyntaxError("CREATE TABLE t(id INT DEFAULT 1 DEFAULT 2);");
 }
 
+void testCreateTableIfNotExistsAndTableConstraints() {
+    const auto statements = parseOk(
+        "CREATE TABLE IF NOT EXISTS enrollment("
+        "student_id INT,"
+        "course_id INT,"
+        "PRIMARY KEY(student_id, course_id),"
+        "UNIQUE(course_id));");
+    const auto& create = std::get<CreateTableStmt>(statements[0].node);
+    require(create.if_not_exists, "CREATE TABLE IF NOT EXISTS flag not retained");
+    require(create.columns.size() == 2, "CREATE TABLE columns lost around table constraints");
+    require(create.table_constraints.size() == 2, "table constraints not retained");
+    require(create.table_constraints[0].kind == TableConstraintKind::PrimaryKey &&
+                create.table_constraints[0].columns.size() == 2 &&
+                create.table_constraints[0].columns[1].text == "course_id",
+            "table-level PRIMARY KEY columns not retained");
+    require(create.table_constraints[1].kind == TableConstraintKind::Unique &&
+                create.table_constraints[1].columns.size() == 1 &&
+                create.table_constraints[1].columns[0].text == "course_id",
+            "table-level UNIQUE columns not retained");
+
+    expectSyntaxError("CREATE TABLE IF EXISTS t(id INT);");
+    expectSyntaxError("CREATE TABLE IF NOT t(id INT);");
+    expectSyntaxError("CREATE TABLE t(id INT, PRIMARY(id));");
+    expectSyntaxError("CREATE TABLE t(id INT, UNIQUE());");
+}
+
+void testAlterTableAddColumn() {
+    const auto statements = parseOk(
+        "ALTER TABLE student ADD COLUMN email VARCHAR(50) NOT NULL DEFAULT 'x';"
+        "ALTER TABLE student ADD score FLOAT;"
+        "ALTER TABLE student DROP COLUMN email;"
+        "ALTER TABLE student DROP score;"
+        "ALTER TABLE student RENAME TO pupil;"
+        "ALTER TABLE student RENAME COLUMN name TO full_name;");
+    require(statements.size() == 6, "expected six ALTER TABLE statements");
+
+    const auto& explicit_column = std::get<AlterTableStmt>(statements[0].node);
+    require(explicit_column.table.text == "student", "ALTER TABLE target lost");
+    const auto& add_email = std::get<AlterAddColumn>(explicit_column.action);
+    require(add_email.column_keyword, "ALTER TABLE ADD COLUMN keyword marker lost");
+    require(add_email.column.name.text == "email" &&
+                add_email.column.type == DataType::Varchar &&
+                add_email.column.varchar_length &&
+                *add_email.column.varchar_length == 50 &&
+                add_email.column.not_null &&
+                add_email.column.default_value &&
+                std::get<std::string>(add_email.column.default_value->value) == "x",
+            "ALTER TABLE ADD COLUMN definition not retained");
+
+    const auto& implicit_column = std::get<AlterTableStmt>(statements[1].node);
+    const auto& add_score = std::get<AlterAddColumn>(implicit_column.action);
+    require(!add_score.column_keyword &&
+                add_score.column.name.text == "score" &&
+                add_score.column.type == DataType::Float,
+            "ALTER TABLE ADD without COLUMN not retained");
+
+    const auto& explicit_drop = std::get<AlterTableStmt>(statements[2].node);
+    const auto& drop_email = std::get<AlterDropColumn>(explicit_drop.action);
+    require(drop_email.column_keyword && drop_email.column.text == "email",
+            "ALTER TABLE DROP COLUMN not retained");
+
+    const auto& implicit_drop = std::get<AlterTableStmt>(statements[3].node);
+    const auto& drop_score = std::get<AlterDropColumn>(implicit_drop.action);
+    require(!drop_score.column_keyword && drop_score.column.text == "score",
+            "ALTER TABLE DROP without COLUMN not retained");
+
+    const auto& rename_table = std::get<AlterTableStmt>(statements[4].node);
+    const auto& rename_to = std::get<AlterRenameTable>(rename_table.action);
+    require(rename_to.new_name.text == "pupil", "ALTER TABLE RENAME TO not retained");
+
+    const auto& rename_column = std::get<AlterTableStmt>(statements[5].node);
+    const auto& rename_name = std::get<AlterRenameColumn>(rename_column.action);
+    require(rename_name.old_name.text == "name" && rename_name.new_name.text == "full_name",
+            "ALTER TABLE RENAME COLUMN not retained");
+
+    expectSyntaxError("ALTER student ADD COLUMN email INT;");
+    expectSyntaxError("ALTER TABLE student COLUMN email INT;");
+    expectSyntaxError("ALTER TABLE student ADD COLUMN;");
+    expectSyntaxError("ALTER TABLE student DROP COLUMN;");
+    expectSyntaxError("ALTER TABLE student RENAME pupil;");
+    expectSyntaxError("ALTER TABLE student RENAME COLUMN name full_name;");
+}
+
 void testIsNullPredicates() {
     const auto statements = parseOk(
         "SELECT * FROM student WHERE score IS NULL;"
@@ -479,6 +597,202 @@ void testInPredicates() {
     expectSyntaxError("SELECT * FROM student WHERE id IN ();");
     expectSyntaxError("SELECT * FROM student WHERE id IN (1,);");
     expectSyntaxError("SELECT * FROM student WHERE id IN (age);");
+}
+
+void testInSubqueries() {
+    const auto statements = parseOk(
+        "SELECT name FROM student WHERE id IN "
+        "(SELECT student_id FROM score WHERE value > 60);"
+        "SELECT name FROM student WHERE id NOT IN "
+        "(SELECT student_id FROM score);");
+    const auto& in_select = std::get<SelectStmt>(statements[0].node);
+    const auto& in_subquery = asInSubquery(in_select.where, false);
+    require(asIdentifier(in_subquery.value).name.text == "id",
+            "IN subquery left value not retained");
+    require(in_subquery.query->table.text == "score",
+            "IN subquery table not retained");
+    require(std::get<std::vector<Identifier>>(in_subquery.query->columns)[0].text == "student_id",
+            "IN subquery select list not retained");
+    asBinary(in_subquery.query->where, BinaryOp::Greater);
+
+    const auto& not_in_select = std::get<SelectStmt>(statements[1].node);
+    const auto& not_in_subquery = asInSubquery(not_in_select.where, true);
+    require(not_in_subquery.query->table.text == "score",
+            "NOT IN subquery table not retained");
+
+    expectSyntaxError("SELECT * FROM student WHERE id IN (SELECT student_id FROM score;");
+    expectSyntaxError("SELECT * FROM student WHERE id IN (SELECT FROM score);");
+}
+
+void testExistsSubqueries() {
+    const auto statements = parseOk(
+        "SELECT name FROM student WHERE EXISTS "
+        "(SELECT * FROM score WHERE score.student_id = student.id);"
+        "SELECT name FROM student WHERE NOT EXISTS "
+        "(SELECT student_id FROM score);");
+    const auto& exists_select = std::get<SelectStmt>(statements[0].node);
+    const auto& exists = asExistsSubquery(exists_select.where, false);
+    require(exists.query->table.text == "score",
+            "EXISTS subquery table not retained");
+    require(std::holds_alternative<AllColumns>(exists.query->columns),
+            "EXISTS subquery SELECT * not retained");
+    asBinary(exists.query->where, BinaryOp::Equal);
+
+    const auto& not_exists_select = std::get<SelectStmt>(statements[1].node);
+    const auto& not_exists = asExistsSubquery(not_exists_select.where, true);
+    require(not_exists.query->table.text == "score",
+            "NOT EXISTS subquery table not retained");
+
+    expectSyntaxError("SELECT * FROM student WHERE EXISTS SELECT * FROM score;");
+    expectSyntaxError("SELECT * FROM student WHERE EXISTS (SELECT * FROM score;");
+    expectSyntaxError("SELECT * FROM student WHERE NOT EXISTS;");
+}
+
+void testDerivedTables() {
+    const auto statements = parseOk(
+        "SELECT d.name FROM (SELECT name, age FROM student WHERE age > 18) AS d "
+        "WHERE d.age > 20;"
+        "SELECT s.name FROM student s JOIN "
+        "(SELECT student_id FROM score WHERE value > 60) x "
+        "ON s.id = x.student_id;");
+
+    const auto& from_derived_select = std::get<SelectStmt>(statements[0].node);
+    const auto& from_source = asDerivedTable(from_derived_select.from, "d");
+    require(from_derived_select.table.text.empty(),
+            "derived table should not masquerade as a physical table");
+    require(from_source.subquery->table.text == "student",
+            "derived table subquery source not retained");
+    require(std::get<std::vector<Identifier>>(from_source.subquery->columns).size() == 2,
+            "derived table subquery SELECT list not retained");
+    asBinary(from_source.subquery->where, BinaryOp::Greater);
+    asBinary(from_derived_select.where, BinaryOp::Greater);
+
+    const auto& join_derived_select = std::get<SelectStmt>(statements[1].node);
+    require(join_derived_select.table.text == "student" && join_derived_select.table_alias &&
+                join_derived_select.table_alias->text == "s",
+            "base table alias changed while parsing derived JOIN");
+    require(join_derived_select.joins.size() == 1, "derived JOIN not retained");
+    const auto& join_source = asDerivedTable(join_derived_select.joins[0].source, "x");
+    require(join_derived_select.joins[0].table.text.empty(),
+            "derived JOIN should not masquerade as a physical table");
+    require(join_source.subquery->table.text == "score",
+            "derived JOIN subquery source not retained");
+    asBinary(join_derived_select.joins[0].on, BinaryOp::Equal);
+
+    expectSyntaxError("SELECT * FROM (SELECT id FROM student);");
+    expectSyntaxError("SELECT * FROM (SELECT id FROM student;");
+    expectSyntaxError("SELECT * FROM (UPDATE student SET age = 1) d;");
+}
+
+void testScalarSubqueries() {
+    const auto statements = parseOk(
+        "SELECT name FROM student WHERE age > "
+        "(SELECT age FROM score WHERE score.student_id = student.id);"
+        "SELECT (SELECT COUNT(*) FROM score) AS score_count FROM student;");
+
+    const auto& where_select = std::get<SelectStmt>(statements[0].node);
+    const auto& comparison = asBinary(where_select.where, BinaryOp::Greater);
+    const auto& scalar = asScalarSubquery(comparison.right);
+    require(scalar.query->table.text == "score",
+            "scalar subquery table not retained");
+    require(std::get<std::vector<Identifier>>(scalar.query->columns)[0].text == "age",
+            "scalar subquery SELECT list not retained");
+    asBinary(scalar.query->where, BinaryOp::Equal);
+
+    const auto& item_select = std::get<SelectStmt>(statements[1].node);
+    const auto& items = std::get<std::vector<SelectItem>>(item_select.columns);
+    require(items.size() == 1, "scalar subquery SELECT item count changed");
+    asScalarSubquery(std::get<ExprPtr>(items[0]));
+    require(item_select.column_aliases.size() == 1 && item_select.column_aliases[0] &&
+                item_select.column_aliases[0]->text == "score_count",
+            "scalar subquery output alias not retained");
+
+    expectSyntaxError("SELECT name FROM student WHERE age > (SELECT age FROM score;");
+    expectSyntaxError("SELECT name FROM student WHERE age > (SELECT FROM score);");
+}
+
+void testSetOperations() {
+    const auto statements = parseOk(
+        "SELECT id FROM student UNION SELECT student_id FROM score;"
+        "SELECT id FROM student UNION ALL SELECT student_id FROM score "
+        "UNION SELECT id FROM archive;"
+        "SELECT id FROM student INTERSECT SELECT student_id FROM score;"
+        "SELECT id FROM student EXCEPT ALL SELECT student_id FROM score;");
+
+    const auto& distinct_union = std::get<SelectStmt>(statements[0].node);
+    require(distinct_union.table.text == "student", "UNION left SELECT source not retained");
+    require(distinct_union.set_operations.size() == 1, "UNION operation not retained");
+    require(distinct_union.set_operations[0].op == SetOperator::Union,
+            "UNION operator kind not retained");
+    require(!distinct_union.set_operations[0].all, "UNION should default to distinct");
+    require(distinct_union.set_operations[0].query->table.text == "score",
+            "UNION right SELECT source not retained");
+    require(std::get<std::vector<Identifier>>(
+                distinct_union.set_operations[0].query->columns)[0].text == "student_id",
+            "UNION right SELECT list not retained");
+
+    const auto& chained_union = std::get<SelectStmt>(statements[1].node);
+    require(chained_union.set_operations.size() == 2, "UNION chain not retained");
+    require(chained_union.set_operations[0].all, "UNION ALL flag not retained");
+    require(!chained_union.set_operations[1].all, "second UNION should default to distinct");
+    require(chained_union.set_operations[0].query->table.text == "score" &&
+                chained_union.set_operations[1].query->table.text == "archive",
+            "UNION chain right SELECT sources not retained");
+
+    const auto& intersect = std::get<SelectStmt>(statements[2].node);
+    require(intersect.set_operations.size() == 1 &&
+                intersect.set_operations[0].op == SetOperator::Intersect &&
+                !intersect.set_operations[0].all,
+            "INTERSECT operation not retained");
+
+    const auto& except_all = std::get<SelectStmt>(statements[3].node);
+    require(except_all.set_operations.size() == 1 &&
+                except_all.set_operations[0].op == SetOperator::Except &&
+                except_all.set_operations[0].all,
+            "EXCEPT ALL operation not retained");
+
+    expectSyntaxError("SELECT id FROM student UNION;");
+    expectSyntaxError("SELECT id FROM student UNION ALL;");
+    expectSyntaxError("SELECT id FROM student UNION UPDATE student SET id = 1;");
+    expectSyntaxError("SELECT id FROM student INTERSECT;");
+    expectSyntaxError("SELECT id FROM student EXCEPT ALL;");
+}
+
+void testCaseExpressions() {
+    const auto statements = parseOk(
+        "SELECT CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END AS label "
+        "FROM student WHERE CASE WHEN active THEN TRUE ELSE FALSE END;"
+        "SELECT CASE active WHEN TRUE THEN 'yes' WHEN FALSE THEN 'no' ELSE 'unknown' END "
+        "FROM student;");
+
+    const auto& searched_select = std::get<SelectStmt>(statements[0].node);
+    const auto& items = std::get<std::vector<SelectItem>>(searched_select.columns);
+    const auto& searched = asCaseExpr(std::get<ExprPtr>(items[0]));
+    require(searched.operand == nullptr, "searched CASE should not have operand");
+    require(searched.branches.size() == 1 && searched.else_result,
+            "searched CASE branches or ELSE not retained");
+    asBinary(searched.branches[0].condition, BinaryOp::GreaterEqual);
+    require(std::get<std::string>(
+                std::get<LiteralExpr>(searched.branches[0].result->node).value) == "adult",
+            "searched CASE THEN result not retained");
+    require(searched_select.column_aliases.size() == 1 && searched_select.column_aliases[0] &&
+                searched_select.column_aliases[0]->text == "label",
+            "CASE select item alias not retained");
+    const auto& where_case = asCaseExpr(searched_select.where);
+    require(where_case.branches.size() == 1 && where_case.else_result,
+            "CASE in WHERE not retained");
+
+    const auto& simple_select = std::get<SelectStmt>(statements[1].node);
+    const auto& simple_items = std::get<std::vector<SelectItem>>(simple_select.columns);
+    const auto& simple = asCaseExpr(std::get<ExprPtr>(simple_items[0]));
+    require(simple.operand != nullptr, "simple CASE operand not retained");
+    asIdentifier(simple.operand);
+    require(simple.branches.size() == 2 && simple.else_result,
+            "simple CASE WHEN branches not retained");
+
+    expectSyntaxError("SELECT CASE age THEN 1 END FROM student;");
+    expectSyntaxError("SELECT CASE WHEN age > 18 'adult' END FROM student;");
+    expectSyntaxError("SELECT CASE WHEN age > 18 THEN 'adult' FROM student;");
 }
 
 void testAggregateSelectItems() {
@@ -571,7 +885,7 @@ void testSyntaxErrors() {
 }
 
 void testSyntaxErrorMessages() {
-    expectSyntaxMessage("BOGUS;", "expected CREATE, DROP, INSERT, SELECT, UPDATE or DELETE");
+    expectSyntaxMessage("BOGUS;", "expected CREATE, ALTER, DROP, INSERT, SELECT, UPDATE or DELETE");
     expectSyntaxMessage("BOGUS;", "identifier \"BOGUS\"");
     expectSyntaxMessage("SELECT id, * FROM t;", "expected column name, aggregate function or expression");
     expectSyntaxMessage("SELECT * FROM t ORDER BY age GROUP BY id;", "JOIN -> WHERE -> GROUP BY -> HAVING -> ORDER BY -> LIMIT/OFFSET");
@@ -655,11 +969,19 @@ int main() {
         testBoolFloatAndNull();
         testVarcharLength();
         testColumnConstraints();
+        testCreateTableIfNotExistsAndTableConstraints();
+        testAlterTableAddColumn();
         testIsNullPredicates();
         testLimitOffset();
         testLikePredicate();
         testBetweenPredicates();
         testInPredicates();
+        testInSubqueries();
+        testExistsSubqueries();
+        testDerivedTables();
+        testScalarSubqueries();
+        testSetOperations();
+        testCaseExpressions();
         testAggregateSelectItems();
         testAggregateExpressions();
         testHavingClause();

@@ -16,6 +16,12 @@ using PlanPtr = std::shared_ptr<const PlanNode>;
 struct CreateTablePlan {
     std::string table_name;
     std::vector<ColumnSpec> columns;
+    std::vector<TableConstraintSpec> table_constraints = {};
+    bool if_not_exists = false;
+};
+struct AlterTablePlan {
+    std::shared_ptr<const TableSchema> table;
+    BoundAlterAction action;
 };
 struct DropTablePlan {
     std::vector<std::string> table_names;
@@ -42,6 +48,13 @@ struct PlanRelation {
 struct EmptyResultPlan {
     std::vector<BoundColumnRef> columns;
     std::vector<PlanRelation> relations;
+};
+// 派生表把完整子查询结果重新标记为一个有别名的关系实例。
+struct DerivedTablePlan {
+    PlanPtr input;
+    std::shared_ptr<const TableSchema> table;
+    std::uint64_t relation_id = 0;
+    std::string relation_name = {};
 };
 // 所有连接的输出布局都固定为左输入列后接右输入列；外连接缺失侧填 NULL。
 struct NestedLoopJoinPlan {
@@ -84,6 +97,12 @@ struct ProjectPlan {
     std::optional<std::int64_t> limit = {};
     std::int64_t offset = 0;
 };
+struct SetOperationPlan {
+    PlanPtr left;
+    PlanPtr right;
+    SetOperator op = SetOperator::Union;
+    bool all = false;
+};
 struct UpdatePlan {
     std::shared_ptr<const TableSchema> table;
     std::vector<BoundAssignment> assignments;
@@ -99,8 +118,9 @@ struct ExplainPlan {
 };
 
 struct PlanNode {
-    std::variant<CreateTablePlan, DropTablePlan, InsertPlan, SeqScanPlan, EmptyResultPlan,
-                 NestedLoopJoinPlan, FilterPlan, GroupByPlan, AggregatePlan, SortPlan, ProjectPlan,
+    std::variant<CreateTablePlan, AlterTablePlan, DropTablePlan, InsertPlan, SeqScanPlan,
+                 EmptyResultPlan, DerivedTablePlan, NestedLoopJoinPlan, FilterPlan, GroupByPlan,
+                 AggregatePlan, SortPlan, ProjectPlan, SetOperationPlan,
                  UpdatePlan, DeletePlan, ExplainPlan> node;
     std::vector<OutputColumn> output; // 有序业务列；修改类根节点为空。
     bool carries_row_id = false; // 内部行标识不占用 output 的业务列。

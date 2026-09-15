@@ -79,6 +79,50 @@ Result<BoundExprPtr> optimizeExpr(const BoundExprPtr& expr, std::size_t depth = 
             if (lhs == node.left && rhs == node.right) return expr;
             return std::make_shared<const BoundExpr>(BoundExpr{
                 BoundBinary{node.op, lhs, rhs, node.operator_span}, expr->type, expr->span});
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            auto operand = node.operand;
+            bool changed = false;
+            if (operand) {
+                auto optimized = optimizeExpr(operand, depth + 1);
+                if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                operand = std::get<BoundExprPtr>(std::move(optimized));
+                changed = operand != node.operand;
+            }
+            auto branches = node.branches;
+            for (auto& branch : branches) {
+                auto condition = optimizeExpr(branch.condition, depth + 1);
+                if (const auto* error = std::get_if<Diagnostic>(&condition)) return *error;
+                auto result = optimizeExpr(branch.result, depth + 1);
+                if (const auto* error = std::get_if<Diagnostic>(&result)) return *error;
+                auto new_condition = std::get<BoundExprPtr>(std::move(condition));
+                auto new_result = std::get<BoundExprPtr>(std::move(result));
+                changed = changed || new_condition != branch.condition || new_result != branch.result;
+                branch.condition = std::move(new_condition);
+                branch.result = std::move(new_result);
+            }
+            auto else_result = node.else_result;
+            if (else_result) {
+                auto optimized = optimizeExpr(else_result, depth + 1);
+                if (const auto* error = std::get_if<Diagnostic>(&optimized)) return *error;
+                else_result = std::get<BoundExprPtr>(std::move(optimized));
+                changed = changed || else_result != node.else_result;
+            }
+            if (!changed) return expr;
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                BoundCase{operand, std::move(branches), else_result}, expr->type, expr->span});
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            auto value = optimizeExpr(node.value, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&value)) return *error;
+            auto optimized = std::get<BoundExprPtr>(std::move(value));
+            if (optimized == node.value) return expr;
+            auto copy = node;
+            copy.value = std::move(optimized);
+            return std::make_shared<const BoundExpr>(BoundExpr{
+                std::move(copy), expr->type, expr->span});
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery> ||
+                             std::is_same_v<T, BoundScalarSubquery>) {
+            // 子计划由外围优化流水线独立处理；标量表达式层保留其绑定边界。
+            return expr;
         } else {
             return invalid("unknown expression node", expr->span);
         }
@@ -90,6 +134,14 @@ bool sameOutput(const PlanNode& left, const PlanNode& right) {
     for (std::size_t i = 0; i < left.output.size(); ++i) {
         if (left.output[i].name != right.output[i].name || left.output[i].type != right.output[i].type) return false;
     }
+    return true;
+}
+
+bool sameOutputTypes(const PlanNode& left, const PlanNode& right) {
+    if (left.carries_row_id != right.carries_row_id ||
+        left.output.size() != right.output.size()) return false;
+    for (std::size_t i = 0; i < left.output.size(); ++i)
+        if (left.output[i].type != right.output[i].type) return false;
     return true;
 }
 
@@ -117,7 +169,8 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
     if (depth >= 256) return invalid("plan exceeds 256 levels");
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, DropTablePlan> ||
+        if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, AlterTablePlan> ||
+                      std::is_same_v<T, DropTablePlan> ||
                       std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan> ||
                       std::is_same_v<T, EmptyResultPlan>) {
             return plan; // DDL、字面量 INSERT 和扫描没有可折叠的子表达式。
@@ -149,6 +202,26 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
                 return invalid("NestedLoopJoin output must concatenate left and right metadata");
             if (left == op.left && right == op.right && predicate == op.predicate) return plan;
             return replace(plan, NestedLoopJoinPlan{left, right, predicate, op.type});
+        } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
+            auto left_result = optimizeNode(op.left, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;
+            auto right_result = optimizeNode(op.right, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&right_result)) return *error;
+            auto left = std::get<PlanPtr>(std::move(left_result));
+            auto right = std::get<PlanPtr>(std::move(right_result));
+            if (!sameOutputTypes(*left, *right) || !sameOutput(*plan, *left))
+                return invalid("set operation inputs must have identical output metadata");
+            if (left == op.left && right == op.right) return plan;
+            return replace(plan, SetOperationPlan{left, right, op.op, op.all});
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            auto child = optimizeNode(op.input, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&child)) return *error;
+            auto input = std::get<PlanPtr>(std::move(child));
+            if (!op.table || input->output.size() != op.table->columns.size())
+                return invalid("derived table output does not match its schema");
+            if (input == op.input) return plan;
+            return replace(plan, DerivedTablePlan{input, op.table, op.relation_id,
+                                                  op.relation_name});
         } else {
             auto child = optimizeNode(op.input, depth + 1);
             if (const auto* error = std::get_if<Diagnostic>(&child)) return *error;

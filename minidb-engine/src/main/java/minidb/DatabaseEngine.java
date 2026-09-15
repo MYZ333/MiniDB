@@ -23,7 +23,15 @@ public final class DatabaseEngine {
             this(id, name, type, null, false, false, false, null, false);
         }
     }
-    public record TableSchema(long id, String name, List<ColumnSchema> columns) { }
+    /** Table-level PRIMARY KEY/UNIQUE keeps the ordered member-column ordinals. */
+    public record TableConstraint(String kind, List<Integer> columns) { }
+    public record TableSchema(
+        long id, String name, List<ColumnSchema> columns,
+        List<TableConstraint> constraints) {
+        public TableSchema(long id, String name, List<ColumnSchema> columns) {
+            this(id, name, columns, List.of());
+        }
+    }
     public record StoredRow(long id, List<Object> values) { }
     public record CommandResult(String operation, long affectedRows) implements ExecutionResult { }
     public record QueryResult(List<String> columns, List<List<Object>> rows) implements ExecutionResult { }
@@ -64,6 +72,8 @@ public final class DatabaseEngine {
     private long catalogVersion;
     private long nextTableId = 1;
     private Profiler activeProfiler;
+    // 关联子查询执行期间保存外层行；列解析找不到本层槽位时从这里读取。
+    private PlanRow correlationRow;
 
     public DatabaseEngine() { this(new InMemoryRecordStore()); }
     public DatabaseEngine(RecordStore records) { this.records = Objects.requireNonNull(records); }
@@ -99,13 +109,16 @@ public final class DatabaseEngine {
     private ExecutionResult executeNodeRaw(Map<String, Object> node, String type) {
         return switch (type) {
             case "CreateTable" -> createTable(node);
+            case "AlterTable" -> alterTable(node);
             case "DropTable" -> dropTable(node);
             case "Insert" -> insert(node);
             case "Project" -> project(node);
             case "Aggregate" -> aggregate(node);
+            case "SetOperation" -> setOperation(node);
             case "Update" -> update(node);
             case "Delete" -> delete(node);
-            case "SeqScan", "EmptyResult", "NestedLoopJoin", "Filter", "GroupBy", "Sort" ->
+            case "SeqScan", "EmptyResult", "DerivedTable", "NestedLoopJoin", "Filter",
+                 "GroupBy", "Sort" ->
                 throw new EngineException("InvalidPlan", type + " cannot be an execution root");
             default -> throw new EngineException("InvalidPlan", "unknown plan node: " + type);
         };
@@ -124,8 +137,8 @@ public final class DatabaseEngine {
         Map<String, Object> input = map(node.get("input"), "EXPLAIN input");
         boolean analyze = optionalBoolean(node.get("analyze"), false);
         String rootType = string(input.get("type"), "EXPLAIN root type");
-        if (!List.of("CreateTable", "DropTable", "Insert", "Project", "Aggregate",
-                     "Update", "Delete").contains(rootType))
+        if (!List.of("CreateTable", "AlterTable", "DropTable", "Insert", "Project",
+                     "Aggregate", "SetOperation", "Update", "Delete").contains(rootType))
             throw new EngineException("InvalidPlan",
                 rootType + " cannot be an EXPLAIN statement root");
         // Build the outline first so malformed trees fail before ANALYZE can cause a side effect.
@@ -161,13 +174,15 @@ public final class DatabaseEngine {
         String type = string(node.get("type"), "EXPLAIN node type");
         describeNode(node); // Also validates all attributes used by the presentation layer.
         switch (type) {
-            case "NestedLoopJoin" -> {
+            case "NestedLoopJoin", "SetOperation" -> {
                 validateExplainTree(map(node.get("left"), "join left input"), depth + 1);
                 validateExplainTree(map(node.get("right"), "join right input"), depth + 1);
             }
-            case "Filter", "GroupBy", "Aggregate", "Sort", "Project", "Update", "Delete" ->
+            case "Filter", "GroupBy", "Aggregate", "Sort", "Project", "DerivedTable",
+                 "Update", "Delete" ->
                 validateExplainTree(map(node.get("input"), type + " input"), depth + 1);
-            case "CreateTable", "DropTable", "Insert", "SeqScan", "EmptyResult" -> { }
+            case "CreateTable", "AlterTable", "DropTable", "Insert", "SeqScan",
+                 "EmptyResult" -> { }
             default -> throw new EngineException("InvalidPlan",
                 "unknown EXPLAIN plan node: " + type);
         }
@@ -186,13 +201,13 @@ public final class DatabaseEngine {
         }
         lines.add(line.toString());
         String type = string(node.get("type"), "EXPLAIN node type");
-        if (type.equals("NestedLoopJoin")) {
+        if (type.equals("NestedLoopJoin") || type.equals("SetOperation")) {
             appendExplainLines(map(node.get("left"), "join left input"), depth + 1,
                                profiler, lines);
             appendExplainLines(map(node.get("right"), "join right input"), depth + 1,
                                profiler, lines);
         } else if (List.of("Filter", "GroupBy", "Aggregate", "Sort", "Project",
-                           "Update", "Delete").contains(type)) {
+                           "DerivedTable", "Update", "Delete").contains(type)) {
             appendExplainLines(map(node.get("input"), type + " input"), depth + 1,
                                profiler, lines);
         }
@@ -203,6 +218,8 @@ public final class DatabaseEngine {
         return switch (type) {
             case "CreateTable" -> "CreateTable [" +
                 string(node.get("tableName"), "tableName") + "]";
+            case "AlterTable" -> "AlterTable [" + string(
+                map(node.get("table"), "alter table").get("name"), "table name") + "]";
             case "DropTable" -> "DropTable [" + joinStrings(
                 list(node.get("tableNames"), "tableNames"), "table name") + "]";
             case "Insert" -> {
@@ -225,6 +242,8 @@ public final class DatabaseEngine {
                 emptyLayout(node);
                 yield "EmptyResult [columns=" + describeEmptyColumns(node) + "]";
             }
+            case "DerivedTable" -> "DerivedTable [" +
+                string(node.get("relationName"), "derived relation name") + "]";
             case "NestedLoopJoin" -> "NestedLoopJoin [" +
                 (node.get("joinType") == null ? "INNER" :
                     string(node.get("joinType"), "join type")) + "; " +
@@ -240,6 +259,9 @@ public final class DatabaseEngine {
                 list(node.get("items"), "sort items")) + "]";
             case "Project" -> "Project [" + describeOutput(node) +
                 queryModifiers(node) + "]";
+            case "SetOperation" -> "SetOperation [" +
+                string(node.get("operation"), "set operation") +
+                (optionalBoolean(node.get("all"), false) ? " ALL" : "") + "]";
             case "Update" -> "Update [" + string(
                 map(node.get("table"), "update table").get("name"), "table name") +
                 "; assignments=" + list(node.get("assignments"), "assignments").size() + "]";
@@ -342,6 +364,14 @@ public final class DatabaseEngine {
                 displayBinary(string(expression.get("op"), "binary operator")) + " " +
                 describeExpression(map(expression.get("right"), "right expression"),
                                    depth + 1) + ")";
+            case "case" -> "CASE ... END";
+            case "inSubquery" -> "(" + describeExpression(
+                map(expression.get("value"), "IN value"), depth + 1) +
+                (optionalBoolean(expression.get("negated"), false)
+                    ? " NOT IN (SUBQUERY))" : " IN (SUBQUERY))");
+            case "existsSubquery" -> optionalBoolean(expression.get("negated"), false)
+                ? "NOT EXISTS (SUBQUERY)" : "EXISTS (SUBQUERY)";
+            case "scalarSubquery" -> "(SCALAR SUBQUERY)";
             default -> throw new EngineException("InvalidPlan",
                 "unknown expression kind in EXPLAIN: " + kind);
         };
@@ -389,6 +419,8 @@ public final class DatabaseEngine {
 
     private CommandResult createTable(Map<String, Object> node) {
         String name = normalize(string(node.get("tableName"), "tableName"));
+        if (tablesByName.containsKey(name) && optionalBoolean(node.get("ifNotExists"), false))
+            return new CommandResult("CREATE", 0);
         if (tablesByName.containsKey(name))
             throw new EngineException("TableAlreadyExists", "table already exists: " + name);
         List<ColumnSchema> columns = new ArrayList<>();
@@ -421,12 +453,146 @@ public final class DatabaseEngine {
         }
         if (columns.isEmpty())
             throw new EngineException("EmptyColumnList", "table must contain at least one column");
-        TableSchema schema = new TableSchema(nextTableId++, name, List.copyOf(columns));
+        List<TableConstraint> constraints = new ArrayList<>();
+        List<Object> encodedConstraints = node.get("tableConstraints") instanceof List<?>
+            ? list(node.get("tableConstraints"), "table constraints") : List.of();
+        for (Object raw : encodedConstraints) {
+            Map<String, Object> encoded = map(raw, "table constraint");
+            String kind = string(encoded.get("kind"), "constraint kind");
+            if (!kind.equals("PRIMARY_KEY") && !kind.equals("UNIQUE"))
+                throw new EngineException("InvalidPlan", "unknown table constraint: " + kind);
+            if (kind.equals("PRIMARY_KEY") && hasPrimaryKey)
+                throw new EngineException("InvalidPlan", "table may contain only one PRIMARY KEY");
+            List<Integer> members = new ArrayList<>();
+            Set<Integer> uniqueMembers = new HashSet<>();
+            for (Object value : list(encoded.get("columns"), "constraint columns")) {
+                int ordinal = Math.toIntExact(longValue(value, "constraint column ordinal"));
+                if (ordinal < 0 || ordinal >= columns.size() || !uniqueMembers.add(ordinal))
+                    throw new EngineException("InvalidPlan", "invalid table constraint column");
+                members.add(ordinal);
+            }
+            if (members.isEmpty())
+                throw new EngineException("InvalidPlan", "table constraint requires columns");
+            if (kind.equals("PRIMARY_KEY")) {
+                hasPrimaryKey = true;
+                // 复合主键保证每个成员非空，但成员本身不需要单列唯一。
+                for (int ordinal : members) {
+                    ColumnSchema old = columns.get(ordinal);
+                    columns.set(ordinal, new ColumnSchema(old.id(), old.name(), old.type(),
+                        old.varcharLength(), old.primaryKey(), true, old.unique(),
+                        old.defaultValue(), old.hasDefault()));
+                }
+            }
+            constraints.add(new TableConstraint(kind, List.copyOf(members)));
+        }
+        TableSchema schema = new TableSchema(nextTableId++, name, List.copyOf(columns),
+                                             List.copyOf(constraints));
         records.createTable(schema);
         tablesById.put(schema.id(), schema);
         tablesByName.put(name, schema);
         catalogVersion++;
         return new CommandResult("CREATE", 0);
+    }
+
+    /** Applies ALTER atomically from the engine's point of view and preserves table/row IDs. */
+    private CommandResult alterTable(Map<String, Object> node) {
+        TableSchema table = resolveTable(map(node.get("table"), "alter table"));
+        Map<String, Object> action = map(node.get("action"), "alter action");
+        String actionType = string(action.get("type"), "alter action type");
+        List<ColumnSchema> columns = new ArrayList<>(table.columns());
+        List<TableConstraint> constraints = new ArrayList<>(table.constraints());
+        TableSchema changed;
+
+        if (actionType.equals("AddColumn")) {
+            Map<String, Object> encoded = map(action.get("column"), "added column");
+            String name = normalize(string(encoded.get("name"), "column name"));
+            if (columns.stream().anyMatch(column -> column.name().equals(name)))
+                throw new EngineException("DuplicateColumn", "duplicate column: " + name);
+            String type = string(encoded.get("type"), "column type");
+            if (!List.of("INT", "VARCHAR", "BOOL", "FLOAT").contains(type))
+                throw new EngineException("UnsupportedType", "unsupported column type: " + type);
+            Long varcharLength = nodeLong(encoded.get("varcharLength"));
+            if (varcharLength != null && (!type.equals("VARCHAR") || varcharLength <= 0))
+                throw new EngineException("UnsupportedType", "VARCHAR length must be positive");
+            boolean primaryKey = optionalBoolean(encoded.get("primaryKey"), false);
+            boolean alreadyPrimary = columns.stream().anyMatch(ColumnSchema::primaryKey) ||
+                constraints.stream().anyMatch(value -> value.kind().equals("PRIMARY_KEY"));
+            if (primaryKey && alreadyPrimary)
+                throw new EngineException("InvalidPlan", "table may contain only one PRIMARY KEY");
+            boolean notNull = optionalBoolean(encoded.get("notNull"), false) || primaryKey;
+            boolean unique = optionalBoolean(encoded.get("unique"), false) || primaryKey;
+            boolean hasDefault = optionalBoolean(encoded.get("hasDefault"), false);
+            Object defaultValue = hasDefault
+                ? coerceValue(encoded.get("defaultValue"), type, encoded) : null;
+            long nextColumnId = columns.stream().mapToLong(ColumnSchema::id).max().orElse(0L) + 1;
+            ColumnSchema added = new ColumnSchema(nextColumnId, name, type, varcharLength,
+                primaryKey, notNull, unique, defaultValue, hasDefault);
+            validateColumnValue(added, defaultValue, hasDefault, encoded);
+            columns.add(added);
+            changed = new TableSchema(table.id(), table.name(), List.copyOf(columns),
+                                      List.copyOf(constraints));
+            List<StoredRow> oldRows = records.scan(table.id());
+            List<List<Object>> newRows = new ArrayList<>();
+            for (StoredRow row : oldRows) {
+                List<Object> values = new ArrayList<>(row.values());
+                values.add(hasDefault ? defaultValue : null);
+                newRows.add(values);
+            }
+            validateFinalRows(changed, newRows);
+            for (int i = 0; i < oldRows.size(); i++)
+                records.replace(table.id(), oldRows.get(i).id(), newRows.get(i));
+        } else if (actionType.equals("DropColumn")) {
+            int ordinal = Math.toIntExact(longValue(action.get("ordinal"), "column ordinal"));
+            if (ordinal < 0 || ordinal >= columns.size())
+                throw new EngineException("InvalidPlan", "column ordinal is out of range");
+            if (columns.size() == 1)
+                throw new EngineException("EmptyColumnList", "cannot drop the last table column");
+            for (TableConstraint constraint : constraints)
+                if (constraint.columns().contains(ordinal))
+                    throw new EngineException("ConstraintViolation",
+                        "cannot drop a column used by a table constraint");
+            columns.remove(ordinal);
+            List<TableConstraint> adjusted = new ArrayList<>();
+            for (TableConstraint constraint : constraints) {
+                List<Integer> members = new ArrayList<>();
+                for (int member : constraint.columns())
+                    members.add(member > ordinal ? member - 1 : member);
+                adjusted.add(new TableConstraint(constraint.kind(), List.copyOf(members)));
+            }
+            constraints = adjusted;
+            changed = new TableSchema(table.id(), table.name(), List.copyOf(columns),
+                                      List.copyOf(constraints));
+            for (StoredRow row : records.scan(table.id())) {
+                List<Object> values = new ArrayList<>(row.values());
+                values.remove(ordinal);
+                records.replace(table.id(), row.id(), values);
+            }
+        } else if (actionType.equals("RenameTable")) {
+            String newName = normalize(string(action.get("newName"), "new table name"));
+            if (tablesByName.containsKey(newName))
+                throw new EngineException("TableAlreadyExists", "table already exists: " + newName);
+            changed = new TableSchema(table.id(), newName, table.columns(), table.constraints());
+            tablesByName.remove(table.name());
+        } else if (actionType.equals("RenameColumn")) {
+            int ordinal = Math.toIntExact(longValue(action.get("ordinal"), "column ordinal"));
+            String newName = normalize(string(action.get("newName"), "new column name"));
+            if (ordinal < 0 || ordinal >= columns.size())
+                throw new EngineException("InvalidPlan", "column ordinal is out of range");
+            if (columns.stream().anyMatch(column -> column.name().equals(newName)))
+                throw new EngineException("DuplicateColumn", "duplicate column: " + newName);
+            ColumnSchema old = columns.get(ordinal);
+            columns.set(ordinal, new ColumnSchema(old.id(), newName, old.type(),
+                old.varcharLength(), old.primaryKey(), old.notNull(), old.unique(),
+                old.defaultValue(), old.hasDefault()));
+            changed = new TableSchema(table.id(), table.name(), List.copyOf(columns),
+                                      List.copyOf(constraints));
+        } else {
+            throw new EngineException("InvalidPlan", "unknown ALTER action: " + actionType);
+        }
+        tablesById.put(changed.id(), changed);
+        tablesByName.put(changed.name(), changed);
+        catalogVersion++;
+        return new CommandResult("ALTER", 0);
     }
 
     /** DROP mutates catalog and storage together; IF EXISTS with no match is a no-op. */
@@ -733,6 +899,62 @@ public final class DatabaseEngine {
         throw new EngineException("InvalidPlan", "ORDER BY column is not a GROUP BY key");
     }
 
+    /** Executes UNION/INTERSECT/EXCEPT, including duplicate-counting ALL semantics. */
+    private QueryResult setOperation(Map<String, Object> node) {
+        QueryResult left = queryChild(map(node.get("left"), "set left input"));
+        QueryResult right = queryChild(map(node.get("right"), "set right input"));
+        if (left.columns().size() != right.columns().size())
+            throw new EngineException("InvalidPlan", "set inputs have different widths");
+        String operation = string(node.get("operation"), "set operation");
+        boolean all = optionalBoolean(node.get("all"), false);
+        List<List<Object>> rows = new ArrayList<>();
+        if (operation.equals("UNION")) {
+            rows.addAll(left.rows());
+            rows.addAll(right.rows());
+            if (!all) rows = distinctRows(rows);
+        } else if (operation.equals("INTERSECT")) {
+            Map<List<Object>, Integer> available = rowCounts(right.rows());
+            Set<List<Object>> emitted = new HashSet<>();
+            for (List<Object> row : left.rows()) {
+                List<Object> key = new ArrayList<>(row);
+                int count = available.getOrDefault(key, 0);
+                if (count <= 0 || (!all && !emitted.add(key))) continue;
+                rows.add(row);
+                if (all) available.put(key, count - 1);
+            }
+        } else if (operation.equals("EXCEPT")) {
+            Map<List<Object>, Integer> excluded = rowCounts(right.rows());
+            Set<List<Object>> emitted = new HashSet<>();
+            for (List<Object> row : left.rows()) {
+                List<Object> key = new ArrayList<>(row);
+                int count = excluded.getOrDefault(key, 0);
+                if (all && count > 0) {
+                    excluded.put(key, count - 1);
+                    continue;
+                }
+                if (!all && count > 0) continue;
+                if (all || emitted.add(key)) rows.add(row);
+            }
+        } else throw new EngineException("InvalidPlan", "unknown set operation: " + operation);
+        return new QueryResult(left.columns(), List.copyOf(rows));
+    }
+
+    private static Map<List<Object>, Integer> rowCounts(List<List<Object>> rows) {
+        Map<List<Object>, Integer> counts = new LinkedHashMap<>();
+        for (List<Object> row : rows) {
+            List<Object> key = new ArrayList<>(row);
+            counts.put(key, counts.getOrDefault(key, 0) + 1);
+        }
+        return counts;
+    }
+
+    /** Query children are statement-shaped nodes embedded by a set, derived table or subquery. */
+    private QueryResult queryChild(Map<String, Object> node) {
+        ExecutionResult result = executeNode(node);
+        if (result instanceof QueryResult query) return query;
+        throw new EngineException("InvalidPlan", "subquery plan is not a query");
+    }
+
     private CommandResult update(Map<String, Object> node) {
         TableSchema table = resolveTable(map(node.get("table"), "table"));
         Map<String, Object> inputNode = map(node.get("input"), "Update input");
@@ -794,12 +1016,35 @@ public final class DatabaseEngine {
         return switch (type) {
             case "SeqScan" -> scan(node);
             case "EmptyResult" -> emptyResult(node);
+            case "DerivedTable" -> derivedTable(node);
             case "Filter" -> filter(node);
             case "NestedLoopJoin" -> nestedLoopJoin(node);
             case "GroupBy" -> groupBy(node);
             case "Sort" -> sort(node);
             default -> throw new EngineException("InvalidPlan", "unknown relational input node");
         };
+    }
+
+    /** Materializes a child query and gives every output column the derived relation identity. */
+    private List<PlanRow> derivedTable(Map<String, Object> node) {
+        TableSchema table = decodeTable(map(node.get("table"), "derived table"));
+        long relationId = optionalLong(node.get("relationId"), table.id());
+        QueryResult query = queryChild(map(node.get("input"), "derived table input"));
+        if (query.columns().size() != table.columns().size())
+            throw new EngineException("InvalidPlan", "derived query output does not match schema");
+        List<ColumnSlot> layout = new ArrayList<>();
+        for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
+            ColumnSchema column = table.columns().get(ordinal);
+            layout.add(new ColumnSlot(table.id(), column.id(), relationId, ordinal,
+                                      column.type()));
+        }
+        List<PlanRow> rows = new ArrayList<>();
+        for (List<Object> values : query.rows()) {
+            if (values.size() != layout.size())
+                throw new EngineException("InvalidPlan", "derived query row width is inconsistent");
+            rows.add(new PlanRow(Map.of(), layout, new ArrayList<>(values)));
+        }
+        return rows;
     }
 
     private List<PlanRow> scan(Map<String, Object> node) {
@@ -915,6 +1160,17 @@ public final class DatabaseEngine {
             TableSchema table = resolveTable(map(node.get("table"), "layout table"));
             long relationId = optionalLong(node.get("relationId"), table.id());
             return scanLayout(node, table, relationId);
+        }
+        if (type.equals("DerivedTable")) {
+            TableSchema table = decodeTable(map(node.get("table"), "derived table"));
+            long relationId = optionalLong(node.get("relationId"), table.id());
+            List<ColumnSlot> layout = new ArrayList<>();
+            for (int ordinal = 0; ordinal < table.columns().size(); ordinal++) {
+                ColumnSchema column = table.columns().get(ordinal);
+                layout.add(new ColumnSlot(table.id(), column.id(), relationId, ordinal,
+                                          column.type()));
+            }
+            return layout;
         }
         if (type.equals("NestedLoopJoin")) {
             List<ColumnSlot> layout = new ArrayList<>(
@@ -1056,6 +1312,11 @@ public final class DatabaseEngine {
             case "unary" -> unary(string(expression.get("op"), "unary op"),
                 evaluate(map(expression.get("operand"), "operand"), row), expression);
             case "binary" -> binary(expression, row);
+            case "case" -> evaluateCase(expression, row);
+            case "inSubquery" -> inSubquery(expression,
+                evaluate(map(expression.get("value"), "IN value"), row), row);
+            case "existsSubquery" -> existsSubquery(expression, row);
+            case "scalarSubquery" -> scalarSubquery(expression, row);
             case "aggregate" -> throw error("InvalidPlan",
                 "aggregate expression requires a group", expression);
             default -> throw error("InvalidPlan",
@@ -1070,9 +1331,8 @@ public final class DatabaseEngine {
             case "literal" -> coerceValue(expression.get("value"),
                 string(expression.get("type"), "literal type"), expression);
             case "column" -> {
-                if (rows.isEmpty()) throw error("InvalidPlan",
-                    "empty aggregate group cannot read a source column", expression);
-                yield columnValue(map(expression.get("column"), "column"), rows.get(0));
+                yield columnValue(map(expression.get("column"), "column"),
+                                  aggregateContextRow(rows));
             }
             case "aggregate" -> aggregateValue(expression, rows);
             case "unary" -> unary(string(expression.get("op"), "unary op"),
@@ -1085,9 +1345,117 @@ public final class DatabaseEngine {
                 Object right = evaluateAggregate(map(expression.get("right"), "right"), rows);
                 yield binaryValues(op, left, right, expression);
             }
+            case "case" -> evaluateAggregateCase(expression, rows);
+            case "inSubquery" -> inSubquery(expression,
+                evaluateAggregate(map(expression.get("value"), "IN value"), rows),
+                aggregateContextRow(rows));
+            case "existsSubquery" -> existsSubquery(expression, aggregateContextRow(rows));
+            case "scalarSubquery" -> scalarSubquery(expression, aggregateContextRow(rows));
             default -> throw error("InvalidPlan",
                 "unknown aggregate expression kind: " + kind, expression);
         };
+    }
+
+    private Object evaluateCase(Map<String, Object> expression, PlanRow row) {
+        Map<String, Object> operandExpression = expression.get("operand") instanceof Map<?, ?>
+            ? map(expression.get("operand"), "CASE operand") : null;
+        Object operand = operandExpression == null ? null : evaluate(operandExpression, row);
+        for (Object raw : list(expression.get("branches"), "CASE branches")) {
+            Map<String, Object> branch = map(raw, "CASE branch");
+            Object when = evaluate(map(branch.get("when"), "CASE WHEN"), row);
+            boolean matches = operandExpression == null
+                ? Boolean.TRUE.equals(nullableBoolean(when, expression))
+                : operand != null && when != null && equalValues(operand, when);
+            if (matches) return evaluate(map(branch.get("then"), "CASE THEN"), row);
+        }
+        return expression.get("else") instanceof Map<?, ?>
+            ? evaluate(map(expression.get("else"), "CASE ELSE"), row) : null;
+    }
+
+    private Object evaluateAggregateCase(Map<String, Object> expression, List<PlanRow> rows) {
+        Map<String, Object> operandExpression = expression.get("operand") instanceof Map<?, ?>
+            ? map(expression.get("operand"), "CASE operand") : null;
+        Object operand = operandExpression == null
+            ? null : evaluateAggregate(operandExpression, rows);
+        for (Object raw : list(expression.get("branches"), "CASE branches")) {
+            Map<String, Object> branch = map(raw, "CASE branch");
+            Object when = evaluateAggregate(map(branch.get("when"), "CASE WHEN"), rows);
+            boolean matches = operandExpression == null
+                ? Boolean.TRUE.equals(nullableBoolean(when, expression))
+                : operand != null && when != null && equalValues(operand, when);
+            if (matches)
+                return evaluateAggregate(map(branch.get("then"), "CASE THEN"), rows);
+        }
+        return expression.get("else") instanceof Map<?, ?>
+            ? evaluateAggregate(map(expression.get("else"), "CASE ELSE"), rows) : null;
+    }
+
+    private PlanRow aggregateContextRow(List<PlanRow> rows) {
+        if (!rows.isEmpty()) return rows.get(0);
+        return new PlanRow(Map.of(), List.of(), List.of());
+    }
+
+    /** IN follows SQL UNKNOWN rules: NULL comparisons only decide the result after no match. */
+    private Object inSubquery(Map<String, Object> expression, Object value, PlanRow row) {
+        QueryResult query = runSubquery(expression, row);
+        if (query.columns().size() != 1)
+            throw error("InvalidPlan", "IN subquery must return one column", expression);
+        boolean unknown = false;
+        for (List<Object> resultRow : query.rows()) {
+            if (resultRow.size() != 1)
+                throw error("InvalidPlan", "IN subquery row must contain one value", expression);
+            Object candidate = resultRow.get(0);
+            if (value == null || candidate == null) unknown = true;
+            else if (equalValues(value, candidate))
+                return optionalBoolean(expression.get("negated"), false) ? false : true;
+        }
+        if (unknown) return null;
+        return optionalBoolean(expression.get("negated"), false) ? true : false;
+    }
+
+    private Object existsSubquery(Map<String, Object> expression, PlanRow row) {
+        boolean exists = !runSubquery(expression, row).rows().isEmpty();
+        return optionalBoolean(expression.get("negated"), false) ? !exists : exists;
+    }
+
+    private Object scalarSubquery(Map<String, Object> expression, PlanRow row) {
+        QueryResult query = runSubquery(expression, row);
+        if (query.columns().size() != 1)
+            throw error("InvalidPlan", "scalar subquery must return one column", expression);
+        if (query.rows().isEmpty()) return null;
+        if (query.rows().size() != 1)
+            throw error("ScalarSubqueryCardinality",
+                "scalar subquery returned more than one row", expression);
+        if (query.rows().get(0).size() != 1)
+            throw error("InvalidPlan", "scalar subquery row must contain one value", expression);
+        return query.rows().get(0).get(0);
+    }
+
+    /** Installs the current row as the outer scope and restores nesting state on every exit. */
+    private QueryResult runSubquery(Map<String, Object> expression, PlanRow row) {
+        PlanRow saved = correlationRow;
+        correlationRow = mergeCorrelation(saved, row);
+        try {
+            return queryChild(map(expression.get("plan"), "subquery plan"));
+        } finally {
+            correlationRow = saved;
+        }
+    }
+
+    private PlanRow mergeCorrelation(PlanRow outer, PlanRow inner) {
+        if (outer == null) return inner;
+        List<ColumnSlot> layout = new ArrayList<>(outer.layout());
+        List<Object> values = new ArrayList<>(outer.values());
+        for (int i = 0; i < inner.layout().size(); i++) {
+            ColumnSlot slot = inner.layout().get(i);
+            int present = layout.indexOf(slot);
+            if (present >= 0) values.set(present, inner.values().get(i));
+            else {
+                layout.add(slot);
+                values.add(inner.values().get(i));
+            }
+        }
+        return new PlanRow(Map.of(), layout, values);
     }
 
     private Object unary(String op, Object value, Map<String, Object> expression) {
@@ -1241,10 +1609,15 @@ public final class DatabaseEngine {
     private Object columnValue(Map<String, Object> reference, PlanRow row) {
         ColumnSlot slot = columnSlot(reference, row);
         int position = row.layout().indexOf(slot);
-        if (position < 0 || position >= row.values().size())
+        PlanRow source = row;
+        if (position < 0 && correlationRow != null) {
+            position = correlationRow.layout().indexOf(slot);
+            source = correlationRow;
+        }
+        if (position < 0 || position >= source.values().size())
             throw new EngineException("StorageFailure",
                 "row does not match operator layout");
-        return row.values().get(position);
+        return source.values().get(position);
     }
 
     private ColumnSlot columnSlot(Map<String, Object> reference, PlanRow row) {
@@ -1262,6 +1635,16 @@ public final class DatabaseEngine {
                 return slot;
             }
         }
+        if (correlationRow != null && correlationRow != row)
+            for (ColumnSlot slot : correlationRow.layout()) {
+                if (slot.tableId() == tableId && slot.columnId() == columnId
+                    && slot.relationId() == relationId) {
+                    if (slot.ordinal() != ordinal || !slot.type().equals(type))
+                        throw new EngineException("InvalidPlan",
+                            "correlated column metadata does not match catalog");
+                    return slot;
+                }
+            }
         throw new EngineException("InvalidPlan",
             "column is not available from the input plan");
     }
@@ -1294,6 +1677,14 @@ public final class DatabaseEngine {
         List<Set<Object>> uniqueValues = new ArrayList<>();
         for (int ordinal = 0; ordinal < table.columns().size(); ordinal++)
             uniqueValues.add(new HashSet<>());
+        List<Set<List<Object>>> tableKeys = new ArrayList<>();
+        for (TableConstraint constraint : table.constraints()) {
+            if (!constraint.kind().equals("PRIMARY_KEY") && !constraint.kind().equals("UNIQUE"))
+                throw new EngineException("InvalidPlan", "unknown table constraint");
+            if (constraint.columns().isEmpty())
+                throw new EngineException("InvalidPlan", "table constraint requires columns");
+            tableKeys.add(new HashSet<>());
+        }
         for (List<Object> row : rows) {
             if (row.size() != table.columns().size())
                 throw new EngineException("StorageFailure", "stored row does not match table schema");
@@ -1305,6 +1696,26 @@ public final class DatabaseEngine {
                     && !uniqueValues.get(ordinal).add(value))
                     throw new EngineException("ConstraintViolation",
                         "duplicate value for unique column " + table.name() + "." + column.name());
+            }
+            for (int index = 0; index < table.constraints().size(); index++) {
+                TableConstraint constraint = table.constraints().get(index);
+                List<Object> key = new ArrayList<>();
+                boolean containsNull = false;
+                for (int ordinal : constraint.columns()) {
+                    if (ordinal < 0 || ordinal >= row.size())
+                        throw new EngineException("InvalidPlan",
+                            "table constraint column is out of range");
+                    Object value = row.get(ordinal);
+                    containsNull |= value == null;
+                    key.add(value);
+                }
+                if (constraint.kind().equals("PRIMARY_KEY") && containsNull)
+                    throw new EngineException("ConstraintViolation",
+                        "PRIMARY KEY does not allow NULL");
+                // SQL UNIQUE permits multiple tuples when any member is NULL.
+                if (!containsNull && !tableKeys.get(index).add(key))
+                    throw new EngineException("ConstraintViolation",
+                        "duplicate value for table " + constraint.kind());
             }
         }
     }
@@ -1382,6 +1793,27 @@ public final class DatabaseEngine {
             throw new EngineException("TableNotFound",
                 "table does not exist in engine catalog");
         return actual;
+    }
+
+    /** Decodes synthetic derived-table metadata without requiring a physical catalog entry. */
+    private TableSchema decodeTable(Map<String, Object> encoded) {
+        long id = longValue(encoded.get("id"), "table id");
+        String name = normalize(string(encoded.get("name"), "table name"));
+        List<ColumnSchema> columns = new ArrayList<>();
+        for (Object raw : list(encoded.get("columns"), "table columns")) {
+            Map<String, Object> column = map(raw, "table column");
+            columns.add(new ColumnSchema(
+                longValue(column.get("id"), "column id"),
+                normalize(string(column.get("name"), "column name")),
+                string(column.get("type"), "column type"),
+                nodeLong(column.get("varcharLength")),
+                optionalBoolean(column.get("primaryKey"), false),
+                optionalBoolean(column.get("notNull"), false),
+                optionalBoolean(column.get("unique"), false),
+                column.get("defaultValue"),
+                optionalBoolean(column.get("hasDefault"), false)));
+        }
+        return new TableSchema(id, name, List.copyOf(columns));
     }
 
     /** NULL is accepted by the type coercer; SQL constraints are checked separately. */

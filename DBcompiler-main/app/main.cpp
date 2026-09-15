@@ -21,6 +21,11 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::String: return "String";
     case TokenKind::Create: return "Create";
     case TokenKind::Table: return "Table";
+    case TokenKind::Alter: return "Alter";
+    case TokenKind::Add: return "Add";
+    case TokenKind::Column: return "Column";
+    case TokenKind::Rename: return "Rename";
+    case TokenKind::To: return "To";
     case TokenKind::Drop: return "Drop";
     case TokenKind::If: return "If";
     case TokenKind::Exists: return "Exists";
@@ -29,6 +34,10 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::Values: return "Values";
     case TokenKind::Select: return "Select";
     case TokenKind::Distinct: return "Distinct";
+    case TokenKind::Union: return "Union";
+    case TokenKind::Intersect: return "Intersect";
+    case TokenKind::Except: return "Except";
+    case TokenKind::All: return "All";
     case TokenKind::From: return "From";
     case TokenKind::Where: return "Where";
     case TokenKind::Having: return "Having";
@@ -70,6 +79,11 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::Like: return "Like";
     case TokenKind::Between: return "Between";
     case TokenKind::In: return "In";
+    case TokenKind::Case: return "Case";
+    case TokenKind::When: return "When";
+    case TokenKind::Then: return "Then";
+    case TokenKind::Else: return "Else";
+    case TokenKind::End: return "End";
     case TokenKind::Count: return "Count";
     case TokenKind::Sum: return "Sum";
     case TokenKind::Avg: return "Avg";
@@ -188,6 +202,35 @@ std::string joinTypeName(JoinType type) {
     return "Join";
 }
 
+std::string setOperatorName(const SetOperation& operation) {
+    switch (operation.op) {
+    case SetOperator::Union: return operation.all ? "UnionAll" : "Union";
+    case SetOperator::Intersect: return operation.all ? "IntersectAll" : "Intersect";
+    case SetOperator::Except: return operation.all ? "ExceptAll" : "Except";
+    }
+    return "SetOperation";
+}
+
+std::string tableConstraintName(TableConstraintKind kind) {
+    switch (kind) {
+    case TableConstraintKind::PrimaryKey: return "PRIMARY KEY";
+    case TableConstraintKind::Unique: return "UNIQUE";
+    }
+    return "CONSTRAINT";
+}
+
+std::string selectSourceName(const SelectStmt& stmt) {
+    if (stmt.from.subquery) return "<derived>";
+    if (!stmt.from.table.text.empty()) return stmt.from.table.text;
+    return stmt.table.text;
+}
+
+std::string joinSourceName(const JoinClause& join) {
+    if (join.source.subquery) return "<derived>";
+    if (!join.source.table.text.empty()) return join.source.table.text;
+    return join.table.text;
+}
+
 void printIndent(int indent) {
     for (int i = 0; i < indent; ++i) {
         std::cout << "  ";
@@ -207,6 +250,17 @@ void printLiteral(const LiteralValue& value) {
             std::cout << item;
         }
     }, value);
+}
+
+void printColumnDefinition(const ColumnDefinition& column) {
+    std::cout << column.name.text << " " << columnTypeName(column);
+    if (column.primary_key) std::cout << " PRIMARY KEY";
+    if (column.not_null) std::cout << " NOT NULL";
+    if (column.unique) std::cout << " UNIQUE";
+    if (column.default_value) {
+        std::cout << " DEFAULT ";
+        printLiteral(column.default_value->value);
+    }
 }
 
 void printAggregateCall(const AggregateCall& aggregate) {
@@ -269,6 +323,43 @@ void printExpr(const ExprPtr& expr, int indent) {
             std::cout << "AggregateExpr ";
             printAggregateCall(node);
             std::cout << '\n';
+        } else if constexpr (std::is_same_v<T, InSubqueryExpr>) {
+            printIndent(indent);
+            std::cout << (node.negated ? "NotInSubqueryExpr" : "InSubqueryExpr") << '\n';
+            printExpr(node.value, indent + 1);
+            printIndent(indent + 1);
+            std::cout << "SubquerySelect from " << selectSourceName(*node.query) << '\n';
+        } else if constexpr (std::is_same_v<T, ExistsSubqueryExpr>) {
+            printIndent(indent);
+            std::cout << (node.negated ? "NotExistsSubqueryExpr" : "ExistsSubqueryExpr") << '\n';
+            printIndent(indent + 1);
+            std::cout << "SubquerySelect from " << selectSourceName(*node.query) << '\n';
+        } else if constexpr (std::is_same_v<T, ScalarSubqueryExpr>) {
+            printIndent(indent);
+            std::cout << "ScalarSubqueryExpr\n";
+            printIndent(indent + 1);
+            std::cout << "SubquerySelect from " << selectSourceName(*node.query) << '\n';
+        } else if constexpr (std::is_same_v<T, CaseExpr>) {
+            printIndent(indent);
+            std::cout << "CaseExpr\n";
+            if (node.operand) {
+                printIndent(indent + 1);
+                std::cout << "Operand\n";
+                printExpr(node.operand, indent + 2);
+            }
+            for (const auto& branch : node.branches) {
+                printIndent(indent + 1);
+                std::cout << "When\n";
+                printExpr(branch.condition, indent + 2);
+                printIndent(indent + 1);
+                std::cout << "Then\n";
+                printExpr(branch.result, indent + 2);
+            }
+            if (node.else_result) {
+                printIndent(indent + 1);
+                std::cout << "Else\n";
+                printExpr(node.else_result, indent + 2);
+            }
         }
     }, expr->node);
 }
@@ -304,6 +395,15 @@ void printExprInline(const ExprPtr& expr) {
             std::cout << ")";
         } else if constexpr (std::is_same_v<T, AggregateCall>) {
             printAggregateCall(node);
+        } else if constexpr (std::is_same_v<T, InSubqueryExpr>) {
+            printExprInline(node.value);
+            std::cout << (node.negated ? " NOT IN " : " IN ") << "(SELECT ...)";
+        } else if constexpr (std::is_same_v<T, ExistsSubqueryExpr>) {
+            std::cout << (node.negated ? "NOT EXISTS " : "EXISTS ") << "(SELECT ...)";
+        } else if constexpr (std::is_same_v<T, ScalarSubqueryExpr>) {
+            std::cout << "(SELECT ...)";
+        } else if constexpr (std::is_same_v<T, CaseExpr>) {
+            std::cout << "CASE ... END";
         }
     }, expr->node);
 }
@@ -327,19 +427,50 @@ void printStatement(const Statement& statement, int index, bool print_header = t
         using T = std::decay_t<decltype(stmt)>;
         if constexpr (std::is_same_v<T, CreateTableStmt>) {
             printIndent(1);
-            std::cout << "CreateTable " << stmt.table.text << '\n';
+            std::cout << "CreateTable";
+            if (stmt.if_not_exists) std::cout << " IF NOT EXISTS";
+            std::cout << " " << stmt.table.text << '\n';
             for (const auto& column : stmt.columns) {
                 printIndent(2);
-                std::cout << "Column " << column.name.text << " " << columnTypeName(column);
-                if (column.primary_key) std::cout << " PRIMARY KEY";
-                if (column.not_null) std::cout << " NOT NULL";
-                if (column.unique) std::cout << " UNIQUE";
-                if (column.default_value) {
-                    std::cout << " DEFAULT ";
-                    printLiteral(column.default_value->value);
-                }
+                std::cout << "Column ";
+                printColumnDefinition(column);
                 std::cout << '\n';
             }
+            for (const auto& constraint : stmt.table_constraints) {
+                printIndent(2);
+                std::cout << "TableConstraint " << tableConstraintName(constraint.kind) << " (";
+                for (std::size_t i = 0; i < constraint.columns.size(); ++i) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << constraint.columns[i].text;
+                }
+                std::cout << ")\n";
+            }
+        } else if constexpr (std::is_same_v<T, AlterTableStmt>) {
+            printIndent(1);
+            std::cout << "AlterTable " << stmt.table.text << '\n';
+            std::visit([](const auto& action) {
+                using Action = std::decay_t<decltype(action)>;
+                if constexpr (std::is_same_v<Action, AlterAddColumn>) {
+                    printIndent(2);
+                    std::cout << "AddColumn";
+                    if (action.column_keyword) std::cout << " COLUMN";
+                    std::cout << " ";
+                    printColumnDefinition(action.column);
+                    std::cout << '\n';
+                } else if constexpr (std::is_same_v<Action, AlterDropColumn>) {
+                    printIndent(2);
+                    std::cout << "DropColumn";
+                    if (action.column_keyword) std::cout << " COLUMN";
+                    std::cout << " " << action.column.text << '\n';
+                } else if constexpr (std::is_same_v<Action, AlterRenameTable>) {
+                    printIndent(2);
+                    std::cout << "RenameTable TO " << action.new_name.text << '\n';
+                } else if constexpr (std::is_same_v<Action, AlterRenameColumn>) {
+                    printIndent(2);
+                    std::cout << "RenameColumn " << action.old_name.text
+                              << " TO " << action.new_name.text << '\n';
+                }
+            }, stmt.action);
         } else if constexpr (std::is_same_v<T, DropTableStmt>) {
             printIndent(1);
             std::cout << "DropTable";
@@ -385,9 +516,16 @@ void printStatement(const Statement& statement, int index, bool print_header = t
             printIndent(1);
             std::cout << "Select";
             if (stmt.distinct) std::cout << " DISTINCT";
-            std::cout << " from " << stmt.table.text;
-            if (stmt.table_alias) std::cout << " AS " << stmt.table_alias->text;
+            std::cout << " from " << selectSourceName(stmt);
+            const auto& table_alias = stmt.from.alias ? stmt.from.alias : stmt.table_alias;
+            if (table_alias) std::cout << " AS " << table_alias->text;
             std::cout << '\n';
+            if (stmt.from.subquery) {
+                printIndent(2);
+                std::cout << "DerivedTable\n";
+                printIndent(3);
+                std::cout << "SubquerySelect from " << selectSourceName(*stmt.from.subquery) << '\n';
+            }
             printIndent(2);
             std::cout << "Columns";
             if (std::holds_alternative<AllColumns>(stmt.columns)) {
@@ -414,9 +552,17 @@ void printStatement(const Statement& statement, int index, bool print_header = t
                 std::cout << "Joins\n";
                 for (const auto& join : stmt.joins) {
                     printIndent(3);
-                    std::cout << joinTypeName(join.type) << "Join " << join.table.text;
-                    if (join.alias) std::cout << " AS " << join.alias->text;
+                    std::cout << joinTypeName(join.type) << "Join " << joinSourceName(join);
+                    const auto& join_alias = join.source.alias ? join.source.alias : join.alias;
+                    if (join_alias) std::cout << " AS " << join_alias->text;
                     std::cout << "\n";
+                    if (join.source.subquery) {
+                        printIndent(4);
+                        std::cout << "DerivedTable\n";
+                        printIndent(5);
+                        std::cout << "SubquerySelect from "
+                                  << selectSourceName(*join.source.subquery) << '\n';
+                    }
                     printExpr(join.on, 4);
                 }
             }
@@ -449,6 +595,16 @@ void printStatement(const Statement& statement, int index, bool print_header = t
                 if (stmt.offset) {
                     printIndent(2);
                     std::cout << "Offset " << *stmt.offset << '\n';
+                }
+            }
+            if (!stmt.set_operations.empty()) {
+                printIndent(2);
+                std::cout << "SetOperations\n";
+                for (const auto& operation : stmt.set_operations) {
+                    printIndent(3);
+                    std::cout << setOperatorName(operation) << '\n';
+                    printIndent(4);
+                    std::cout << "Select from " << selectSourceName(*operation.query) << '\n';
                 }
             }
         } else if constexpr (std::is_same_v<T, UpdateStmt>) {

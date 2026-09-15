@@ -1,6 +1,7 @@
 // A 负责：按 grammar.md 实现递归下降、优先级、多语句和 AST 构造。
 #include "minisql/parser.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -24,6 +25,11 @@ bool isAggregateFunction(TokenKind kind) {
     return kind == TokenKind::Count || kind == TokenKind::Sum ||
            kind == TokenKind::Avg || kind == TokenKind::Min ||
            kind == TokenKind::Max;
+}
+
+bool isSetOperator(TokenKind kind) {
+    return kind == TokenKind::Union || kind == TokenKind::Intersect ||
+           kind == TokenKind::Except;
 }
 
 SourceLocation locationOf(const Token& token) { return token.span; }
@@ -54,6 +60,11 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::String: return "string";
     case TokenKind::Create: return "CREATE";
     case TokenKind::Table: return "TABLE";
+    case TokenKind::Alter: return "ALTER";
+    case TokenKind::Add: return "ADD";
+    case TokenKind::Column: return "COLUMN";
+    case TokenKind::Rename: return "RENAME";
+    case TokenKind::To: return "TO";
     case TokenKind::Drop: return "DROP";
     case TokenKind::If: return "IF";
     case TokenKind::Exists: return "EXISTS";
@@ -62,6 +73,10 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::Values: return "VALUES";
     case TokenKind::Select: return "SELECT";
     case TokenKind::Distinct: return "DISTINCT";
+    case TokenKind::Union: return "UNION";
+    case TokenKind::Intersect: return "INTERSECT";
+    case TokenKind::Except: return "EXCEPT";
+    case TokenKind::All: return "ALL";
     case TokenKind::From: return "FROM";
     case TokenKind::Where: return "WHERE";
     case TokenKind::Having: return "HAVING";
@@ -103,6 +118,11 @@ std::string tokenName(TokenKind kind) {
     case TokenKind::Like: return "LIKE";
     case TokenKind::Between: return "BETWEEN";
     case TokenKind::In: return "IN";
+    case TokenKind::Case: return "CASE";
+    case TokenKind::When: return "WHEN";
+    case TokenKind::Then: return "THEN";
+    case TokenKind::Else: return "ELSE";
+    case TokenKind::End: return "END";
     case TokenKind::Count: return "COUNT";
     case TokenKind::Sum: return "SUM";
     case TokenKind::Avg: return "AVG";
@@ -163,6 +183,16 @@ AggregateFunction aggregateFunctionFor(TokenKind kind) {
     case TokenKind::Max: return AggregateFunction::Max;
     default: throw Diagnostic{DiagnosticStage::Syntax, ErrorCode::UnexpectedToken,
                               "token is not an aggregate function", std::nullopt};
+    }
+}
+
+SetOperator setOperatorFor(TokenKind kind) {
+    switch (kind) {
+    case TokenKind::Union: return SetOperator::Union;
+    case TokenKind::Intersect: return SetOperator::Intersect;
+    case TokenKind::Except: return SetOperator::Except;
+    default: throw Diagnostic{DiagnosticStage::Syntax, ErrorCode::UnexpectedToken,
+                              "token is not a set operator", std::nullopt};
     }
 }
 
@@ -296,6 +326,19 @@ private:
                 const auto left = depths_.at(node.left.get());
                 const auto right = depths_.at(node.right.get());
                 return (left > right ? left : right) + 1;
+            } else if constexpr (std::is_same_v<T, InSubqueryExpr>) {
+                return depths_.at(node.value.get()) + 1;
+            } else if constexpr (std::is_same_v<T, CaseExpr>) {
+                std::size_t child_depth = node.operand ? depths_.at(node.operand.get()) : 0;
+                for (const auto& branch : node.branches) {
+                    const auto condition = depths_.at(branch.condition.get());
+                    const auto result = depths_.at(branch.result.get());
+                    child_depth = std::max(child_depth, std::max(condition, result));
+                }
+                if (node.else_result) {
+                    child_depth = std::max(child_depth, depths_.at(node.else_result.get()));
+                }
+                return child_depth + 1;
             } else return 1;
         }, expr.node);
         if (depth > 256) {
@@ -357,6 +400,8 @@ private:
     ExplainTarget baseStatement() {
         if (match(TokenKind::Create)) {
             return createStatement();
+        } else if (match(TokenKind::Alter)) {
+            return alterStatement();
         } else if (match(TokenKind::Drop)) {
             return dropStatement();
         } else if (match(TokenKind::Insert)) {
@@ -368,7 +413,7 @@ private:
         } else if (match(TokenKind::Delete)) {
             return deleteStatement();
         }
-        throw unexpected({"CREATE", "DROP", "INSERT", "SELECT", "UPDATE", "DELETE"});
+        throw unexpected({"CREATE", "ALTER", "DROP", "INSERT", "SELECT", "UPDATE", "DELETE"});
     }
 
     Statement statement() {
@@ -440,14 +485,78 @@ private:
 
     CreateTableStmt createStatement() {
         consume(TokenKind::Table, "TABLE");
+        const bool if_not_exists = createIfNotExists();
         CreateTableStmt stmt{identifier(), {}};
+        stmt.if_not_exists = if_not_exists;
         consume(TokenKind::LeftParen, "'('");
-        stmt.columns.push_back(columnDefinition());
+        createTableItem(stmt);
         while (match(TokenKind::Comma)) {
-            stmt.columns.push_back(columnDefinition());
+            createTableItem(stmt);
         }
         consume(TokenKind::RightParen, "')'");
         return stmt;
+    }
+
+    bool createIfNotExists() {
+        if (!match(TokenKind::If)) {
+            return false;
+        }
+        consume(TokenKind::Not, "NOT after IF");
+        consume(TokenKind::Exists, "EXISTS after IF NOT");
+        return true;
+    }
+
+    void createTableItem(CreateTableStmt& stmt) {
+        if (check(TokenKind::Primary) || check(TokenKind::Unique)) {
+            stmt.table_constraints.push_back(tableConstraint());
+            return;
+        }
+        stmt.columns.push_back(columnDefinition());
+    }
+
+    TableConstraint tableConstraint() {
+        const SourceLocation start = locationOf(current());
+        TableConstraintKind kind = TableConstraintKind::Unique;
+        if (match(TokenKind::Primary)) {
+            kind = TableConstraintKind::PrimaryKey;
+            consume(TokenKind::Key, "KEY after PRIMARY");
+        } else {
+            consume(TokenKind::Unique, "UNIQUE");
+        }
+        consume(TokenKind::LeftParen, "'(' after table constraint");
+        std::vector<Identifier> columns = names();
+        const Token& right = consume(TokenKind::RightParen, "')'");
+        return TableConstraint{kind, std::move(columns), merge(start, locationOf(right))};
+    }
+
+    AlterTableStmt alterStatement() {
+        consume(TokenKind::Table, "TABLE");
+        Identifier table = identifier();
+        if (match(TokenKind::Add)) {
+            const bool explicit_column = match(TokenKind::Column);
+            ColumnDefinition column = columnDefinition();
+            return AlterTableStmt{std::move(table),
+                                  AlterAddColumn{std::move(column), explicit_column}};
+        }
+        if (match(TokenKind::Drop)) {
+            const bool explicit_column = match(TokenKind::Column);
+            Identifier column = identifier();
+            return AlterTableStmt{std::move(table),
+                                  AlterDropColumn{std::move(column), explicit_column}};
+        }
+        if (match(TokenKind::Rename)) {
+            if (match(TokenKind::Column)) {
+                Identifier old_name = identifier();
+                consume(TokenKind::To, "TO after renamed column");
+                Identifier new_name = identifier();
+                return AlterTableStmt{std::move(table),
+                                      AlterRenameColumn{std::move(old_name), std::move(new_name)}};
+            }
+            consume(TokenKind::To, "TO after RENAME");
+            Identifier new_name = identifier();
+            return AlterTableStmt{std::move(table), AlterRenameTable{std::move(new_name)}};
+        }
+        throw unexpected({"ADD", "DROP", "RENAME"});
     }
 
     DropTableStmt dropStatement() {
@@ -568,13 +677,32 @@ private:
     }
 
     SelectStmt selectStatement() {
+        SelectStmt stmt = selectCore();
+        while (isSetOperator(current().kind)) {
+            const Token& op = current();
+            ++position_;
+            const bool all = match(TokenKind::All);
+            const SourceLocation operator_span = all
+                ? merge(locationOf(op), locationOf(previous()))
+                : locationOf(op);
+            consume(TokenKind::Select, "SELECT after set operator");
+            auto query = std::make_shared<const SelectStmt>(selectCore());
+            stmt.set_operations.push_back(SetOperation{
+                setOperatorFor(op.kind), all, std::move(query), operator_span});
+        }
+        return stmt;
+    }
+
+    SelectStmt selectCore() {
         const bool distinct = match(TokenKind::Distinct);
         auto [columns, aliases] = selectList();
         consume(TokenKind::From, "FROM");
-        Identifier table = identifier();
-        auto table_alias = optionalAlias();
-        SelectStmt stmt{std::move(table), std::move(columns), nullptr, {}, {}, {},
-                        std::move(table_alias), std::move(aliases)};
+        TableRef from = tableRef();
+        Identifier legacy_table = from.table;
+        auto legacy_alias = from.alias;
+        SelectStmt stmt{std::move(legacy_table), std::move(columns), nullptr, {}, {}, {},
+                        std::move(legacy_alias), std::move(aliases)};
+        stmt.from = std::move(from);
         stmt.distinct = distinct;
         selectTailClauses(stmt);
         rejectMisorderedSelectClause();
@@ -678,6 +806,27 @@ private:
                check(TokenKind::Right) || check(TokenKind::Full);
     }
 
+    TableRef tableRef() {
+        const SourceLocation start = locationOf(current());
+        if (match(TokenKind::LeftParen)) {
+            consume(TokenKind::Select, "SELECT in derived table");
+            auto query = std::make_shared<const SelectStmt>(selectStatement());
+            const Token& right = consume(TokenKind::RightParen, "')' after derived table subquery");
+            auto alias = optionalAlias();
+            if (!alias) {
+                throw syntaxError("derived table requires an alias, expected AS alias or alias",
+                                  locationOf(right));
+            }
+            const SourceLocation span = merge(start, alias->span);
+            return TableRef{Identifier{}, std::move(query), std::move(alias), span};
+        }
+
+        Identifier table = identifier();
+        auto alias = optionalAlias();
+        const SourceLocation span = alias ? merge(table.span, alias->span) : table.span;
+        return TableRef{table, nullptr, std::move(alias), span};
+    }
+
     JoinClause joinClause() {
         const Token& start = current();
         JoinType type = JoinType::Inner;
@@ -699,12 +848,15 @@ private:
             match(TokenKind::Outer);
             consume(TokenKind::Join, "JOIN");
         }
-        Identifier table = identifier();
-        auto alias = optionalAlias();
+        TableRef source = tableRef();
+        Identifier legacy_table = source.table;
+        auto legacy_alias = source.alias;
         consume(TokenKind::On, "ON");
         ExprPtr on = expression();
         const SourceLocation span = merge(start.span, on->span);
-        return JoinClause{std::move(table), std::move(on), span, std::move(alias), type};
+        JoinClause join{std::move(legacy_table), std::move(on), span, std::move(legacy_alias), type};
+        join.source = std::move(source);
+        return join;
     }
 
     void rejectMisorderedSelectClause() const {
@@ -817,6 +969,9 @@ private:
     ExprPtr notExpression() {
         if (match(TokenKind::Not)) {
             const Token& op = previous();
+            if (check(TokenKind::Exists)) {
+                return existsSubquery(&op);
+            }
             const NestingGuard guard(nesting_, op.span);
             ExprPtr operand = notExpression();
             return makeExpr(Expr{
@@ -893,8 +1048,75 @@ private:
         return makeExpr(Expr{LiteralExpr{std::move(value.value)}, value.span});
     }
 
+    ExprPtr caseExpression() {
+        const Token& case_token = consume(TokenKind::Case, "CASE");
+        ExprPtr operand = nullptr;
+        if (!check(TokenKind::When)) {
+            operand = expression();
+        }
+
+        std::vector<CaseWhenClause> branches;
+        while (check(TokenKind::When)) {
+            const SourceLocation when_span = locationOf(consume(TokenKind::When, "WHEN"));
+            ExprPtr condition = expression();
+            consume(TokenKind::Then, "THEN after CASE WHEN condition");
+            ExprPtr result = expression();
+            const SourceLocation branch_span = merge(when_span, result->span);
+            branches.push_back(CaseWhenClause{
+                std::move(condition), std::move(result), branch_span});
+        }
+        if (branches.empty()) {
+            throw unexpected({"WHEN"});
+        }
+
+        ExprPtr else_result = nullptr;
+        if (match(TokenKind::Else)) {
+            else_result = expression();
+        }
+        const Token& end_token = consume(TokenKind::End, "END after CASE expression");
+        const SourceLocation span = merge(locationOf(case_token), locationOf(end_token));
+        return makeExpr(Expr{
+            CaseExpr{std::move(operand), std::move(branches), std::move(else_result), span},
+            span});
+    }
+
+    ExprPtr existsSubquery(const Token* not_token) {
+        const SourceLocation start = not_token ? locationOf(*not_token) : locationOf(current());
+        const Token& exists_token = consume(TokenKind::Exists, "EXISTS");
+        consume(TokenKind::LeftParen, "'(' after EXISTS");
+        consume(TokenKind::Select, "SELECT in EXISTS subquery");
+        auto query = std::make_shared<const SelectStmt>(selectStatement());
+        const Token& right = consume(TokenKind::RightParen, "')' after subquery");
+        const SourceLocation operator_span = not_token
+            ? merge(locationOf(*not_token), locationOf(exists_token))
+            : locationOf(exists_token);
+        return makeExpr(Expr{
+            ExistsSubqueryExpr{std::move(query), not_token != nullptr, operator_span},
+            merge(start, locationOf(right))});
+    }
+
+    ExprPtr scalarSubquery(SourceLocation start) {
+        consume(TokenKind::Select, "SELECT in scalar subquery");
+        auto query = std::make_shared<const SelectStmt>(selectStatement());
+        const Token& right = consume(TokenKind::RightParen, "')' after scalar subquery");
+        const SourceLocation span = merge(start, locationOf(right));
+        return makeExpr(Expr{ScalarSubqueryExpr{std::move(query), span}, span});
+    }
+
     ExprPtr inExpression(ExprPtr value, const Token& in_token, const Token* not_token) {
         consume(TokenKind::LeftParen, "'('");
+        if (match(TokenKind::Select)) {
+            auto query = std::make_shared<const SelectStmt>(selectStatement());
+            const Token& right = consume(TokenKind::RightParen, "')' after subquery");
+            const SourceLocation operator_span = not_token
+                ? merge(locationOf(*not_token), locationOf(in_token))
+                : locationOf(in_token);
+            const SourceLocation span = merge(value->span, locationOf(right));
+            return makeExpr(Expr{
+                InSubqueryExpr{std::move(value), std::move(query), not_token != nullptr,
+                               operator_span},
+                span});
+        }
         if (check(TokenKind::RightParen)) {
             throw unexpected({"literal value"});
         }
@@ -956,6 +1178,12 @@ private:
     }
 
     ExprPtr primary() {
+        if (check(TokenKind::Case)) {
+            return caseExpression();
+        }
+        if (check(TokenKind::Exists)) {
+            return existsSubquery(nullptr);
+        }
         if (isAggregateFunction(current().kind)) {
             AggregateCall aggregate = aggregateCall();
             const SourceLocation span = aggregate.span;
@@ -984,12 +1212,15 @@ private:
         if (match(TokenKind::Null)) return makeExpr(Expr{LiteralExpr{NullValue{}}, previous().span});
         if (match(TokenKind::LeftParen)) {
             const SourceLocation start = locationOf(previous());
+            if (check(TokenKind::Select)) {
+                return scalarSubquery(start);
+            }
             const NestingGuard guard(nesting_, start);
             ExprPtr expr = expression();
             const Token& right = consume(TokenKind::RightParen, "')'");
             return makeExpr(Expr{expr->node, merge(start, locationOf(right))});
         }
-        throw unexpected({"identifier", "integer", "float", "string", "TRUE", "FALSE",
+        throw unexpected({"CASE", "identifier", "integer", "float", "string", "TRUE", "FALSE",
                           "NULL", "'-'", "'('"});
     }
 

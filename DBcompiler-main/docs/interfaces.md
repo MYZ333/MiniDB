@@ -1,4 +1,4 @@
-# 模块接口契约 0.15
+# 模块接口契约 0.16
 
 本文定义 A、B、Catalog 与执行层的衔接。当前 MemoryCatalog、六类基础语句与 EXPLAIN 语义分析、
 逻辑计划生成、规则优化和文本打印已实现；A version2 的扩展 lex/parse 与 AST 展示优化已合入。
@@ -53,8 +53,8 @@ NOT/负号/括号的递归嵌套最多 256 层，生成 AST 的单条路径最�
 
 ## A → B：AST
 
-`ast.hpp` 定义 CreateTableStmt、DropTableStmt、InsertStmt、SelectStmt、UpdateStmt、DeleteStmt
-和 ExplainStmt。ExplainTarget 只允许前六类基础语句，所以语法层不能嵌套 EXPLAIN。
+`ast.hpp` 定义 CreateTableStmt、AlterTableStmt、DropTableStmt、InsertStmt、SelectStmt、
+UpdateStmt、DeleteStmt 和 ExplainStmt。ExplainTarget 允许这些基础语句，语法层不能嵌套 EXPLAIN。
 Statement 保存整条语句范围；Identifier 保存原始拼写及精确范围。
 一元/二元表达式另存运算符范围，便于把类型错误定位到操作符。
 
@@ -70,6 +70,9 @@ SelectStmt 追加 group_by、order_by、joins、FROM 表别名和与选择列平
 并为旧的三字段聚合初始化提供空默认值。JoinClause 可携带右表别名。
 限定名由 Parser 合并为 `table.column` 的 Identifier.text；原始范围覆盖整个限定名。
 字面量允许 int64_t/double/string/bool/NullValue；DataType 增加 Float，Null 仅为内部字面量类型。
+TableRef 统一表示物理表或带必需别名的 SELECT 派生表；SetOperation 保存三种集合操作及 ALL。
+InSubqueryExpr、ExistsSubqueryExpr、ScalarSubqueryExpr 和 CaseExpr 都是显式表达式分支，新增节点
+不能降级成普通字面量或被 visitor 忽略。
 
 A 的展示优化接口声明于 ast_optimizer.hpp：
 
@@ -101,7 +104,17 @@ B 把 version 写入绑定结果，再由计划生成传入 LogicalPlan。
 
 ```cpp
 Result<std::shared_ptr<const TableSchema>> createTable(
-    std::string table_name, const std::vector<ColumnSpec>& columns);
+    std::string table_name, const std::vector<ColumnSpec>& columns,
+    const std::vector<TableConstraintSpec>& table_constraints = {},
+    bool if_not_exists = false);
+Result<std::shared_ptr<const TableSchema>> addColumn(
+    std::string table_name, const ColumnSpec& column);
+Result<std::shared_ptr<const TableSchema>> dropColumn(
+    std::string table_name, std::string column_name);
+Result<std::shared_ptr<const TableSchema>> renameTable(
+    std::string table_name, std::string new_name);
+Result<std::shared_ptr<const TableSchema>> renameColumn(
+    std::string table_name, std::string column_name, std::string new_name);
 Result<std::size_t> dropTables(
     const std::vector<std::string>& table_names, bool if_exists);
 std::shared_ptr<const CatalogSnapshot> snapshot() const;
@@ -115,6 +128,9 @@ snapshot 复制名称索引并共享只读模式，旧快照不会看到新注�
 版本仅在同一 Catalog 实例的历史中比较；该内存容器供第一阶段单线程使用。
 dropTables 在无 IF EXISTS 时先验证全部名字再修改，IF EXISTS 忽略缺失表；实际删除非空时
 版本只递增一次。快照共享的旧 TableSchema 仍可被既有只读计划安全持有。
+ALTER 方法生成新的不可变 TableSchema，保留表 ID 和未删除列的列 ID，每次成功修改递增一次版本。
+TableSchema.table_constraints 用列序号保存复合 PRIMARY KEY/UNIQUE；删列会拒绝约束成员并调整
+其余序号。IF NOT EXISTS 命中已有表时返回现有模式且不递增版本。
 
 CREATE 产生建表描述，不预分配表列 ID，不调用 createTable。
 成功执行后，由执行层负责修改真实 Catalog 并递增版本。
@@ -131,7 +147,7 @@ std::string formatPlan(const LogicalPlan&); // 声明于 plan_printer.hpp。
 
 Result 为 `variant<T, Diagnostic>`，错误时不返回半成品；使用 `get_if` 或
 `holds_alternative` 检查结果。首版每条语句仅报告首个语义错误。
-NotImplemented 保留为后续开发状态错误码，当前基础语句及 EXPLAIN 的四个入口不再返回占位结果。
+NotImplemented 保留为后续开发状态错误码，当前语句及 EXPLAIN 的四个入口不再返回占位结果。
 各类语句的 analyze/buildPlan 均返回真实结果或诊断；表达式支持 INT/FLOAT 同类型
 算术与比较、VARCHAR/BOOL 判等、LIKE、空值判定以及 AND/OR/NOT。
 Diagnostic 包含阶段、稳定错误码、可读消息、SourceSpan。
@@ -155,6 +171,9 @@ NULL 字面量直接参与需要两个同类型操作数的表达式仍会报 In
 输出名称，并可由 ORDER BY 引用；同名输出别名被引用时返回 AmbiguousColumn。
 JOIN ON 必须为 BOOL，否则返回 JoinConditionNotBoolean。聚合外的 SELECT/HAVING/ORDER 列
 必须属于分组键，重复键或不满足约束返回 InvalidGrouping。
+子查询会建立分层作用域：当前层名称优先，未命中时可解析外层关系；派生表使用隔离作用域，
+不具备 LATERAL 行为。IN/标量子查询检查单列及类型，集合分支检查逐列类型；CASE 检查 WHEN
+形式和统一结果类型。Bound 子查询表达式保留相关外层列集合，供后续列裁剪使用。
 
 绑定结果约束：全部列引用已解析；WHERE/JOIN ON 为 BOOL；运算符合法；INSERT 值按
 表列顺序重排并补齐 DEFAULT/NULL；SELECT 的星号已按可见表顺序展开；JOIN 表保持 SQL 顺序；GROUP/ORDER
@@ -172,10 +191,13 @@ GROUP 投影约束、分组键重复、排序键可见性、赋值重复、
 | AST | 绑定结果 | 计划结构 |
 |---|---|---|
 | CreateTableStmt | 规范化名称、列定义 | CreateTable |
+| AlterTableStmt | 目标模式、ADD/DROP/RENAME 动作 | AlterTable |
 | DropTableStmt | 规范化表名、IF EXISTS | DropTable |
 | InsertStmt | 表模式、按模式顺序的多行值 | Insert |
 | SelectStmt | 展开列、JOIN/WHERE/GROUP/ORDER | Project → [Sort] → [GroupBy] → [Filter] → {NestedLoopJoin} → SeqScan |
 | SelectStmt（含聚合） | 分组键、聚合项、最终输出名、聚合后排序 | Aggregate → [Filter] → {NestedLoopJoin} → SeqScan |
+| SelectStmt（派生表） | 子查询、合成模式和关系别名 | Project/Aggregate → DerivedTable → 子查询根 |
+| SelectStmt（集合运算） | 类型兼容的有序分支 | SetOperation(left, right) |
 | UpdateStmt | 目标列、已定型 RHS、可选 BOOL 条件 | Update → [Filter] → SeqScan |
 | DeleteStmt | 表模式、可选 BOOL 条件 | Delete → [Filter] → SeqScan |
 | ExplainStmt | 已绑定目标语句、analyze 标志 | Explain → 目标根计划 |
@@ -198,6 +220,10 @@ RowId 的具体存储格式留给执行/存储层，B 只声明是否需要传�
 EmptyResult 是优化器生成的零行关系叶节点。它的 `columns` 与 output 一一对应，保存列身份；
 `relations` 保存这些列原来的表模式、relation_id 和关系名。它不执行已删除的输入，但作为
 外连接一侧时仍能提供 NULL 扩展所需布局。带 RowId 的 EmptyResult 合法，只表示零个可修改行。
+DerivedTable 执行完整子查询，把输出按位置重新标记为合成表 ID、列 ID 和 relationId。
+SetOperation 有 left/right 两个查询输入，op 为 UNION/INTERSECT/EXCEPT，all 决定集合或多重集语义。
+BoundCase 在表达式层保留 operand、按序 WHEN/THEN 和可选 ELSE。三类 Bound 子查询表达式在
+计划生成时填充只读 PlanPtr，使执行器能在当前外层行上下文中运行子计划。
 
 执行结果约定：SELECT 返回按 output 排列的记录；CREATE/DROP 返回成功状态；
 INSERT/UPDATE/DELETE 返回影响行数（不作为 PlanNode.output 的业务列）。
@@ -210,6 +236,9 @@ BoundUpdate/UpdatePlan 中每个 RHS 都是对原表列的引用；生成器不�
 表达式按左子节点先求值；AND/OR 从左向右短路。执行层检查整数溢出、INT/FLOAT 除零；
 字符串按值判等；LIKE 中 `%` 匹配任意码点序列、`_` 匹配一个码点。
 表达式使用 SQL 三值逻辑，Filter/Join/HAVING 只保留 TRUE。
+标量子查询零行返回 NULL、多行报 ScalarSubqueryCardinality；EXISTS 只读取行存在性；IN 在无
+匹配且有 NULL 比较时返回 UNKNOWN。CASE 只求值首个匹配分支。集合运算按完整行比较并把 NULL
+视作集合相等值，ALL 版本保留或扣减重复计数。
 
 当前生成器固定使用上述树结构，SELECT * 也保留 Project；省略对应子句才省略相应算子。
 恒真/恒假条件在 buildPlan 输出中保留，需显式调用 optimizePlan 优化。未优化 SeqScan 读取全部列；
@@ -249,6 +278,8 @@ buildPlan 不自动调用优化器，调用方可以保存并打印前后两个�
   和排序依赖合并后，在 SeqScan 按原模式顺序输出唯一列。COUNT(*) 可输出零业务列；DELETE
   仅需条件列和独立 RowId；UPDATE 为旧行复制和最终约束校验保留完整表列。
 - 不删除 Update/Delete 根，不选择索引，也不基于统计信息改变连接顺序或算法。
+- CASE 递归优化各分支，但保留短路顺序；子查询表达式和派生/集合边界采用保守规则，避免谓词
+  越过查询作用域。列裁剪会加入子查询记录的相关外层列，派生表内部保留完整位置映射。
 
 入口附加检查空节点、访问路径深度（最多 256 层）、Filter 的 BOOL 条件及输出/RowId
 透传、修改输入的 RowId。失败返回 Plan / InvalidPlan，不返回部分优化结果。

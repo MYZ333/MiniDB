@@ -42,6 +42,19 @@ void require(RequiredColumns& columns, const BoundExprPtr& expression,
         } else if constexpr (std::is_same_v<T, BoundBinary>) {
             require(columns, node.left, depth + 1);
             require(columns, node.right, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundCase>) {
+            require(columns, node.operand, depth + 1);
+            for (const auto& branch : node.branches) {
+                require(columns, branch.condition, depth + 1);
+                require(columns, branch.result, depth + 1);
+            }
+            require(columns, node.else_result, depth + 1);
+        } else if constexpr (std::is_same_v<T, BoundInSubquery>) {
+            require(columns, node.value, depth + 1);
+            for (const auto& ref : node.correlated_columns) require(columns, ref);
+        } else if constexpr (std::is_same_v<T, BoundExistsSubquery> ||
+                             std::is_same_v<T, BoundScalarSubquery>) {
+            for (const auto& ref : node.correlated_columns) require(columns, ref);
         }
     }, expression->node);
 }
@@ -59,6 +72,12 @@ bool relationOccurs(const PlanPtr& plan, const BoundColumnRef& ref,
                 if (sameRef(column, ref)) return true;
             return false;
         } else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
+            return relationOccurs(op.left, ref, depth + 1) ||
+                   relationOccurs(op.right, ref, depth + 1);
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            return op.table && op.table->id.value == ref.table_id.value &&
+                   op.relation_id == ref.relation_id;
+        } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
             return relationOccurs(op.left, ref, depth + 1) ||
                    relationOccurs(op.right, ref, depth + 1);
         } else if constexpr (std::is_same_v<T, FilterPlan> ||
@@ -124,6 +143,7 @@ Result<PlanPtr> pruneNode(const PlanPtr& plan, RequiredColumns required,
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan> ||
+                      std::is_same_v<T, AlterTablePlan> ||
                       std::is_same_v<T, DropTablePlan> ||
                       std::is_same_v<T, InsertPlan>) return plan;
         else if constexpr (std::is_same_v<T, SeqScanPlan>) {
@@ -185,6 +205,24 @@ Result<PlanPtr> pruneNode(const PlanPtr& plan, RequiredColumns required,
                 return plan;
             return rebuild(plan, NestedLoopJoinPlan{left, right, op.predicate, op.type},
                            std::move(output), plan->carries_row_id);
+        } else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            // 派生表的列身份与子查询内部身份不同，保持完整子查询输出并在边界重标记。
+            auto child = pruneNode(op.input, {}, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&child)) return *error;
+            auto input = std::get<PlanPtr>(std::move(child));
+            if (input == op.input) return plan;
+            return rebuild(plan, DerivedTablePlan{input, op.table, op.relation_id,
+                op.relation_name}, plan->output, plan->carries_row_id);
+        } else if constexpr (std::is_same_v<T, SetOperationPlan>) {
+            auto left_result = pruneNode(op.left, {}, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&left_result)) return *error;
+            auto right_result = pruneNode(op.right, {}, depth + 1);
+            if (const auto* error = std::get_if<Diagnostic>(&right_result)) return *error;
+            auto left = std::get<PlanPtr>(std::move(left_result));
+            auto right = std::get<PlanPtr>(std::move(right_result));
+            if (left == op.left && right == op.right) return plan;
+            return rebuild(plan, SetOperationPlan{left, right, op.op, op.all},
+                           plan->output, plan->carries_row_id);
         } else if constexpr (std::is_same_v<T, FilterPlan>) {
             require(required, op.predicate);
             auto child = pruneNode(op.input, std::move(required), depth + 1);

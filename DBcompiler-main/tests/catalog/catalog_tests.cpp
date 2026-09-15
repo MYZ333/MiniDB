@@ -76,6 +76,42 @@ int main() {
         check(value(catalog.dropTables({"missing"}, true)) == 0 &&
               catalog.snapshot()->version() == 3, "missing-only DROP changed version");
     });
+    suite.run("IF NOT EXISTS and composite constraints preserve catalog state", [] {
+        MemoryCatalog catalog;
+        const std::vector<TableConstraintSpec> constraints{
+            {true, {0, 1}}, {false, {0, 2}}};
+        const auto table = value(catalog.createTable("enrollment",
+            {{"student_id", DataType::Int}, {"course_id", DataType::Int},
+             {"grade", DataType::Int}}, constraints));
+        check(table->table_constraints.size() == 2 && table->columns[0].not_null &&
+              table->columns[1].not_null, "composite constraints were not retained");
+        const auto existing = value(catalog.createTable(
+            "ENROLLMENT", {{"ignored", DataType::Int}}, {}, true));
+        check(existing == table && catalog.snapshot()->version() == 1,
+              "IF NOT EXISTS changed or replaced the catalog");
+    });
+    suite.run("ALTER publishes immutable schemas and stable IDs", [] {
+        MemoryCatalog catalog;
+        const auto original = value(catalog.createTable("student",
+            {{"id", DataType::Int}, {"name", DataType::Varchar}}));
+        ColumnSpec age{"age", DataType::Int};
+        age.default_value = ScalarValue{std::int64_t{18}};
+        const auto added = value(catalog.addColumn("student", age));
+        check(added->id.value == original->id.value && added->columns[0].id.value ==
+              original->columns[0].id.value && added->columns[2].name == "age",
+              "ADD changed stable identities");
+        const auto renamedColumn = value(catalog.renameColumn("student", "name", "full_name"));
+        check(renamedColumn->columns[1].name == "full_name" &&
+              original->columns[1].name == "name", "RENAME COLUMN mutated an old snapshot");
+        const auto dropped = value(catalog.dropColumn("student", "age"));
+        check(dropped->columns.size() == 2, "DROP COLUMN did not update the schema");
+        const auto renamedTable = value(catalog.renameTable("student", "person"));
+        check(renamedTable->id.value == original->id.value &&
+              !catalog.snapshot()->findTable("student") &&
+              catalog.snapshot()->findTable("person") == renamedTable &&
+              catalog.snapshot()->version() == 5,
+              "RENAME TABLE changed ID, index, or version incorrectly");
+    });
     suite.run("snapshot outlives mutable catalog", [] {
         std::shared_ptr<const CatalogSnapshot> snapshot;
         {

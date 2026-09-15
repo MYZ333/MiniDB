@@ -4,7 +4,7 @@
 语言目标为 CREATE TABLE、DROP TABLE、INSERT、SELECT、UPDATE、DELETE、EXPLAIN
 和 EXPLAIN ANALYZE，以及条件和标量表达式。
 已合入团队成员的 A version2，实现扩展 Lexer、Parser、AST 优化展示和前端调试入口；结合本地 B，
-六类基础语句与 EXPLAIN 已通过 **SQL → Token → AST → 语义分析 → 逻辑计划** 联调。
+七类基础语句与 EXPLAIN 已通过 **SQL → Token → AST → 语义分析 → 逻辑计划** 联调。
 现已增加 B 的规则优化：安全常量折叠、布尔化简、谓词下推、空结果传播和列裁剪，
 并提供前后计划对照。
 JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和自连接已完成绑定、计划生成、打印、
@@ -14,7 +14,8 @@ JOIN、GROUP BY 与 COUNT/SUM/AVG/MIN/MAX、多列 ORDER BY、表/列别名和�
 
 已整合 feature-zhangbo：语法与 B 聚合 AST 已统一，新增空值判定和 DML 别名执行。
 [整合说明与阅读顺序](docs/zhangbo-merge-notes.md)解释接口冲突的解决方式；
-[grammar.md 0.26](grammar.md)给出当前完整执行边界。
+[grammar.md 0.27](grammar.md)给出当前完整执行边界。A 新增的 CREATE IF NOT EXISTS、复合约束、
+ALTER、子查询、派生表、集合运算和 CASE 已由 B 完成绑定、计划、协议和 Java 执行接入。
 
 ## 1. 目录结构
 
@@ -97,9 +98,9 @@ DBcompiler/
 | 工作 | A：词法与语法 | B：语义与计划 |
 |---|---|---|
 | 输入处理 | lex：关键字、注释、转义、位置、EOF | 不处理字符流 |
-| 语法结构 | parse：基础语句、EXPLAIN、聚合调用、别名、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，检查聚合类型与分组约束，生成 ExplainPlan |
+| 语法结构 | parse：基础语句、EXPLAIN、子查询、集合运算、CASE、JOIN/GROUP/ORDER、表达式优先级、多语句、AST | 使用 A 提供的 AST，检查子查询、CASE、集合与聚合约束，生成完整计划 |
 | 名称与类型 | 保留名称原文和源码范围 | Catalog 查询、关系实例/表列绑定、类型检查、INSERT 重排、UPDATE 规则 |
-| 计划生成 | 提供准确的 AST | 构造增删改查及 NestedLoopJoin/GroupBy/Aggregate/Sort 计划 |
+| 计划生成 | 提供准确的 AST | 构造增删改查及 DerivedTable/SetOperation/NestedLoopJoin/Aggregate 等计划 |
 | 规则优化 | 展示用 AST 折叠，维护原始/优化 AST 对照 | 绑定后计划折叠、谓词下推、空结果传播、列裁剪和等价性测试 |
 | 错误与测试 | 词法/语法诊断，lexer/parser 测试 | 语义/计划诊断，semantic/planner 测试 |
 | 文档 | 文法语法部分、Token 与 AST 接口 | 文法语义部分、Catalog/Bound/Plan 接口；B 汇总维护文档 |
@@ -122,7 +123,7 @@ SQL
 ```
 
 五个入口均返回 `Result<T>`，即成功值或 Diagnostic，调用者遇错应停止该条流程。
-lex、parse、analyze 与 buildPlan 均已实现六类基础语句和 EXPLAIN 的对应阶段。
+lex、parse、analyze 与 buildPlan 均已实现七类基础语句和 EXPLAIN 的对应阶段。
 optimizePlan 显式调用，保持版本、输出和 RowId；除零/溢出运算保留给执行层按需求值时报错。
 `formatPlan(plan)` 返回可读文本树，展示算子参数、业务输出列、模式版本和行标识属性。
 parse 支持多语句，按文法处理优先级，保留实际源码范围。
@@ -148,6 +149,7 @@ A 与 B 的库互不依赖，因此可以独立实现和测试。MemoryCatalog �
 语义分析仍只依赖 CatalogSnapshot，可替换为外部数据库的模式快照。
 BOOL/FLOAT/NULL、约束 DDL、多行 INSERT、查询表达式、内外连接、GROUP/HAVING、
 DISTINCT、ORDER 和 LIMIT 已贯通 B 与 JSON。相邻 Java 引擎执行全部这些节点和字段。
+子查询、派生表、集合运算、CASE 和 ALTER 也已贯通同一跨语言链路。
 
 ## 4. 构建和运行
 

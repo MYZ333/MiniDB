@@ -1,7 +1,7 @@
 # MiniSQL 语法扩展更新记录
 
 > 本文保留 A 分支交付时的设计与历史记录。B 侧适配现已完成；当前状态以
-> [grammar.md 0.23](../grammar.md) 和 [实现讲解](remaining-features-walkthrough.md) 为准。
+> [grammar.md 0.27](../grammar.md) 和 [接口契约](interfaces.md) 为准。
 
 本文档记录合并版 0.6 之后的语法扩展。后续每完成一项扩展，都只追加到这一份文档中。
 
@@ -722,6 +722,21 @@
 - 新增 AST optimizer 测试覆盖 ORDER BY 表达式遍历。
 - 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
 
+## 2026-09-15：A 扩展的 B 侧完整接入
+
+A 本轮交付的 CREATE IF NOT EXISTS、表级 PRIMARY KEY/UNIQUE、ALTER TABLE、IN/EXISTS/标量
+子查询、FROM/JOIN 派生表、UNION/INTERSECT/EXCEPT 及 CASE 已完成 B 侧接入。上文中的
+“B 当前 UnsupportedFeature”保留为 A 交付时的历史记录，不再表示当前实现状态。
+
+- 语义层建立嵌套作用域，解析关联列，并检查子查询列数/类型、集合分支类型和 CASE 结果类型。
+- Bound 层保存子查询绑定树、关联外层列、派生表合成模式、集合分支与 ALTER 动作。
+- 计划层增加 AlterTable、DerivedTable、SetOperation；表达式子查询在生成阶段获得完整子计划。
+- JSON 协议导出以上节点，Java 引擎实现模式迁移、复合约束、关联求值、标量基数检查、
+  SQL IN 三值逻辑、集合/多重集合运算和 CASE 短路。
+- `a-extension-features.sql` 从真实 SQL 覆盖上述功能，`AExtensionFeaturesEngineTest` 校验输出。
+
+详细语法及边界统一见 grammar.md 0.27，跨语言字段见 json-plan-protocol.md。
+
 ## 2026-09-14：INSERT 多行 VALUES
 
 ### 新增内容
@@ -917,3 +932,792 @@
   - `s.id` 作为 UPDATE/DELETE WHERE。
   - 未声明别名时 `student.id` 仍可绑定。
   - 声明别名后 `student.id` 被视为不可见限定名。
+
+## 2026-09-14：更完整 DDL：CREATE IF NOT EXISTS 与表级约束
+
+### 新增内容
+
+- 支持 `CREATE TABLE IF NOT EXISTS`：
+  - `CREATE TABLE IF NOT EXISTS student(id INT);`
+- 支持 CREATE TABLE 中的表级主键约束：
+  - `PRIMARY KEY(id)`
+  - `PRIMARY KEY(student_id, course_id)`
+- 支持 CREATE TABLE 中的表级唯一约束：
+  - `UNIQUE(name)`
+  - `UNIQUE(student_id, course_id)`
+- 表级约束可以和列定义混合出现在括号内：
+  - `CREATE TABLE enrollment(student_id INT, course_id INT, PRIMARY KEY(student_id, course_id));`
+
+### 当前边界
+
+- 暂不支持命名约束：
+  - 不支持 `CONSTRAINT pk_name PRIMARY KEY(id)`。
+- 暂不支持外键：
+  - 不支持 `FOREIGN KEY (...) REFERENCES ...`。
+- 暂不支持 CHECK：
+  - 不支持 `CHECK (age > 0)`。
+- 暂不支持表级 DEFAULT 或复杂表达式默认值。
+- A 不检查表级约束中的列是否存在、不检查列名是否重复、不检查一个表是否声明多个主键。
+- 表级约束当前只保证 Parser/AST 输出正确，B 完整适配前不会真正写入 Catalog。
+
+### 公共接口影响
+
+- `CreateTableStmt` 末尾新增：
+  - `std::vector<TableConstraint> table_constraints = {}`
+  - `bool if_not_exists = false`
+- `ast.hpp` 新增：
+  - `enum class TableConstraintKind { PrimaryKey, Unique }`
+  - `struct TableConstraint`
+- `TableConstraint` 字段：
+  - `kind`：区分 PRIMARY KEY 和 UNIQUE。
+  - `columns`：约束涉及的列名列表，每个列名保留原始文本和位置。
+  - `span`：表级约束整体范围，便于 B 对整条约束报错。
+- 没有新增 TokenKind，因为 `IF / EXISTS / NOT / PRIMARY / KEY / UNIQUE` 都已经存在。
+- 字段放在 `CreateTableStmt` 末尾并带默认值，旧的手写 AST 聚合初始化仍可继续编译。
+
+### B 侧当前处理
+
+- `CREATE TABLE IF NOT EXISTS`：
+  - 当表不存在时，B 仍按普通 CREATE TABLE 绑定，返回现有 `BoundCreateTable`。
+  - 当表已存在时，B 当前返回 `UnsupportedFeature`，因为还没有 DDL no-op 的 Bound/Plan 表示。
+- 表级约束：
+  - `src/semantic/analyzer.cpp` 已增加带注释的保护逻辑。
+  - 只要 `CreateTableStmt::table_constraints` 非空，当前返回 `UnsupportedFeature`。
+  - 这样可以避免约束被静默丢弃后创建出无约束表。
+
+### B 侧后续适配建议
+
+- IF NOT EXISTS：
+  - 可以新增 `BoundNoOp` / `NoOpPlan`，用于表示“表已存在且无需执行”。
+  - 或者在 DDL 执行入口专门处理该语义，不进入普通计划树。
+- 表级约束语义：
+  - 检查约束列是否都存在。
+  - 检查同一个表中 PRIMARY KEY 是否最多一个。
+  - 检查同一条表级约束内是否重复列名。
+  - 决定 PRIMARY KEY 是否隐含 NOT NULL 和 UNIQUE。
+  - 决定列级 PRIMARY KEY 与表级 PRIMARY KEY 同时出现时如何报错。
+- Catalog：
+  - 建议在 `ColumnSpec` / `ColumnSchema` 或新的表级约束结构中保存主键和唯一约束。
+  - 复合主键/复合唯一约束更适合保存在表级结构，而不是单个 ColumnSchema 字段。
+- 执行层：
+  - INSERT/UPDATE 时检查 PRIMARY KEY/UNIQUE 是否冲突。
+  - 如果多行 INSERT 后续接入，需要同时检查新插入行之间的约束冲突。
+
+### 验证
+
+- 新增 Parser 测试覆盖：
+  - `CREATE TABLE IF NOT EXISTS`
+  - 复合 `PRIMARY KEY(...)`
+  - 表级 `UNIQUE(...)`
+  - 列定义与表级约束混合出现。
+- 新增 Parser 错误测试覆盖：
+  - `IF` 后缺少 `NOT`
+  - `IF NOT` 后缺少 `EXISTS`
+  - `PRIMARY` 后缺少 `KEY`
+  - `UNIQUE()` 空列列表。
+- 新增 semantic 测试覆盖：
+  - 表不存在时 `IF NOT EXISTS` 仍可按普通 CREATE 绑定。
+  - 表已存在时 `IF NOT EXISTS` 当前明确返回 `UnsupportedFeature`。
+  - 表级约束当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：ALTER TABLE ADD COLUMN
+
+### 新增内容
+
+- 支持新增列的 ALTER TABLE 语法：
+  - `ALTER TABLE student ADD COLUMN email VARCHAR(50);`
+  - `ALTER TABLE student ADD score FLOAT;`
+- `COLUMN` 关键字可选。
+- 新增列定义复用已有 `column_def`，因此可以携带已有列级约束：
+  - `NOT NULL`
+  - `UNIQUE`
+  - `PRIMARY KEY`
+  - `DEFAULT literal`
+- 示例：
+  - `ALTER TABLE student ADD COLUMN email VARCHAR(50) NOT NULL DEFAULT 'unknown';`
+
+### 0.23 当时边界
+
+- 0.23 版本只支持 `ADD [COLUMN] column_def`。
+- 暂不支持：
+  - `ALTER TABLE ... DROP COLUMN ...`
+  - `ALTER TABLE ... RENAME TO ...`
+  - `ALTER TABLE ... RENAME COLUMN ... TO ...`
+  - `ALTER TABLE ... ALTER COLUMN ...`
+  - `ALTER TABLE ... ADD CONSTRAINT ...`
+- A 不检查新增列是否与已有列重名。
+- A 不检查 DEFAULT 类型是否匹配。
+- A 不检查新增 NOT NULL 列对已有数据的影响。
+- 这些都属于 B/Catalog/执行层后续语义。
+
+### 公共接口影响
+
+- `TokenKind` 新增：
+  - `Alter`
+  - `Add`
+  - `Column`
+- `ast.hpp` 在 0.23 新增：
+  - `struct AlterAddColumn`
+  - `using AlterTableAction = std::variant<AlterAddColumn>`
+  - `struct AlterTableStmt`
+- `Statement::node` 新增 `AlterTableStmt` 分支。
+- `AlterAddColumn` 字段：
+  - `ColumnDefinition column`
+  - `bool column_keyword`
+- `column_keyword` 只记录原 SQL 是否显式写了 `COLUMN`，B 通常只需要读取 `column`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的 `bindStatement(const AlterTableStmt&)`。
+- 当前 B 遇到 ALTER TABLE 会返回 `UnsupportedFeature`。
+- 这是为了保证新增公共 AST 后工程可以编译，同时避免调用方误以为 Catalog 已经被修改。
+
+### B 侧后续适配建议
+
+- 语义分析：
+  - 先查找目标表是否存在。
+  - 检查新增列名是否与已有列重名。
+  - 检查新增列类型是否合法。
+  - 如果新增列带 DEFAULT，检查默认值类型兼容。
+  - 如果新增列带 NOT NULL 且没有 DEFAULT，需要定义已有数据如何补值；建议先拒绝。
+- Bound 层：
+  - 可新增 `BoundAlterTable` 和 `BoundAlterAddColumn`。
+  - 保存目标表名或 TableId，以及规范化后的 ColumnSpec/约束信息。
+- Catalog：
+  - 增加安全的 schema 版本变更接口，例如 `addColumn(table, column_spec)`。
+  - 旧快照应继续保持只读有效，新快照包含新增列。
+- 执行层：
+  - 如果存储已有行，需要为新增列补默认值或 NULL。
+  - 如果列声明 NOT NULL，则必须保证所有旧行都有合法值。
+
+### 验证
+
+- 新增 Lexer 测试覆盖 `ALTER`、`ADD`、`COLUMN`。
+- 新增 Parser 测试覆盖：
+  - `ADD COLUMN`
+  - 省略 `COLUMN` 的 `ADD`
+  - `VARCHAR(n)`
+  - 列级约束和 DEFAULT。
+- 新增 Parser 错误测试覆盖：
+  - 缺少 `TABLE`
+  - 缺少 `ADD`
+  - `ADD COLUMN` 后缺少列定义。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：ALTER TABLE DROP / RENAME
+
+### 新增内容
+
+- 在已有 `ALTER TABLE ADD [COLUMN]` 基础上，继续支持常见 ALTER 动作：
+  - `ALTER TABLE student DROP COLUMN email;`
+  - `ALTER TABLE student DROP score;`
+  - `ALTER TABLE student RENAME TO pupil;`
+  - `ALTER TABLE student RENAME COLUMN name TO full_name;`
+- `DROP COLUMN` 中的 `COLUMN` 关键字可选。
+- `RENAME TO` 表示重命名表。
+- `RENAME COLUMN old TO new` 表示重命名列。
+
+### 当前边界
+
+- 暂不支持：
+  - `ALTER TABLE ... ALTER COLUMN ...`
+  - `ALTER TABLE ... MODIFY COLUMN ...`
+  - `ALTER TABLE ... CHANGE COLUMN ...`
+  - `ALTER TABLE ... ADD CONSTRAINT ...`
+  - `ALTER TABLE ... DROP CONSTRAINT ...`
+- A 不检查目标表、目标列是否存在。
+- A 不检查重命名后的表名或列名是否与已有对象冲突。
+- A 不检查删除列后是否破坏主键、唯一约束或后续索引。
+
+### 公共接口影响
+
+- `TokenKind` 新增：
+  - `Rename`
+  - `To`
+- `AlterTableAction` 从：
+  - `std::variant<AlterAddColumn>`
+  扩展为：
+  - `std::variant<AlterAddColumn, AlterDropColumn, AlterRenameTable, AlterRenameColumn>`
+- `ast.hpp` 新增：
+  - `struct AlterDropColumn`
+  - `struct AlterRenameTable`
+  - `struct AlterRenameColumn`
+- `AlterDropColumn` 字段：
+  - `Identifier column`
+  - `bool column_keyword`
+- `AlterRenameTable` 字段：
+  - `Identifier new_name`
+- `AlterRenameColumn` 字段：
+  - `Identifier old_name`
+  - `Identifier new_name`
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 仍统一用 `bindStatement(const AlterTableStmt&)` 返回 `UnsupportedFeature`。
+- 注释已更新为 `ALTER TABLE ADD/DROP/RENAME`。
+- 当前不会真正修改 Catalog，也不会进入计划生成。
+
+### B 侧后续适配建议
+
+- DROP COLUMN：
+  - 检查表存在。
+  - 检查列存在。
+  - 检查删除后表是否仍至少保留一列。
+  - 检查该列是否参与 PRIMARY KEY、UNIQUE、索引或未来外键。
+- RENAME TO：
+  - 检查旧表存在。
+  - 检查新表名不存在。
+  - 生成新的 Catalog 版本，并保持旧快照只读有效。
+- RENAME COLUMN：
+  - 检查表和旧列存在。
+  - 检查新列名不与同表其他列重名。
+  - 保持 ColumnId 是否不变需要 B 决定；建议重命名列时保留 ColumnId，只修改显示名称。
+
+### 验证
+
+- 新增 Lexer 测试覆盖 `RENAME` 和 `TO`。
+- 新增 Parser 测试覆盖：
+  - `DROP COLUMN`
+  - 省略 `COLUMN` 的 `DROP`
+  - `RENAME TO`
+  - `RENAME COLUMN ... TO ...`
+- 新增 Parser 错误测试覆盖：
+  - `DROP COLUMN` 后缺列名。
+  - `RENAME` 后缺少 `TO` 或 `COLUMN`。
+  - `RENAME COLUMN old` 后缺少 `TO`。
+
+## 2026-09-14：IN / NOT IN 子查询
+
+### 新增内容
+
+- 在已有字面量列表版 `IN/NOT IN` 基础上，新增子查询右侧：
+  - `SELECT name FROM student WHERE id IN (SELECT student_id FROM score);`
+  - `SELECT name FROM student WHERE id NOT IN (SELECT student_id FROM score);`
+- 子查询复用现有 SELECT 文法，因此子查询内部可以包含：
+  - WHERE
+  - JOIN
+  - GROUP BY
+  - HAVING
+  - ORDER BY
+  - LIMIT/OFFSET
+- A 会把 `IN (SELECT ...)` 保存为专门的表达式节点，而不是展开成 OR。
+
+### 公共接口影响
+
+- `ast.hpp` 新增：
+  - `using SelectStmtPtr = std::shared_ptr<const SelectStmt>`
+  - `struct InSubqueryExpr`
+- `Expr::node` 新增 `InSubqueryExpr` 分支。
+- `InSubqueryExpr` 字段：
+  - `ExprPtr value`：IN 左侧表达式。
+  - `SelectStmtPtr query`：括号里的 SELECT 子查询。
+  - `bool negated`：是否为 `NOT IN`。
+  - `SourceLocation operator_span`：IN 或 NOT IN 的位置。
+- 没有新增 TokenKind。
+- 原有字面量列表版 `IN/NOT IN` 行为不变，仍展开为已有比较、OR 和 NOT 表达式。
+
+### 当前边界
+
+- A 只负责语法结构，不判断子查询是否相关。
+- A 不检查子查询是否只输出一列。
+- A 不检查左侧表达式类型和子查询输出列类型是否兼容。
+- A 不定义空结果集、NULL、重复值等 SQL 语义。
+- B 完整适配前，IN 子查询在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的 `InSubqueryExpr` 分支。
+- 当前 B 遇到 IN 子查询会返回：
+  - `UnsupportedFeature`
+  - `IN subqueries are not supported by semantic analysis yet`
+- 这样可以避免 B 把子查询误当作字面量列表展开结果处理。
+
+### B 侧后续适配建议
+
+- 非相关 IN 子查询：
+  - 先绑定左侧表达式。
+  - 在独立作用域中绑定子查询。
+  - 检查子查询输出列必须恰好一列。
+  - 检查左侧类型和子查询输出列类型兼容。
+  - 计划层可生成 Semi Join / Anti Semi Join，或先执行子查询构造临时集合。
+- 相关 IN 子查询：
+  - 需要子查询绑定时能引用外层作用域。
+  - 需要明确外层列引用如何在 BoundExpr 中表示。
+  - 计划层通常需要 Apply / Correlated Nested Loop 一类结构。
+- NULL 语义：
+  - 标准 SQL 的 `IN` / `NOT IN` 和 NULL 有三值逻辑，当前 MiniSQL 还没有完整三值逻辑。
+  - B 可先限制子查询输出和左侧表达式非 NULL，或后续统一扩展 NULL 规则。
+
+### 验证
+
+- 新增 Parser 测试覆盖：
+  - `IN (SELECT ...)`
+  - `NOT IN (SELECT ...)`
+  - 子查询内部 WHERE 表达式。
+- 新增 Parser 错误测试覆盖：
+  - 子查询缺少右括号。
+  - 子查询 SELECT 列表不完整。
+- 新增 AST optimizer 测试确认会递归优化子查询内部 WHERE。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：EXISTS / NOT EXISTS 子查询
+
+### 新增内容
+
+- 新增谓词子查询：
+  - `SELECT name FROM student WHERE EXISTS (SELECT * FROM score WHERE score.student_id = student.id);`
+  - `SELECT name FROM student WHERE NOT EXISTS (SELECT student_id FROM score);`
+- `EXISTS` 子查询复用现有 SELECT 文法，因此子查询内部可以继续包含：
+  - WHERE
+  - JOIN
+  - GROUP BY
+  - HAVING
+  - ORDER BY
+  - LIMIT/OFFSET
+- `NOT EXISTS` 被保存为同一个 AST 节点上的 `negated=true`，不会额外包一层普通 `UnaryExpr`。
+
+### 公共接口影响
+
+- `ast.hpp` 新增：
+  - `struct ExistsSubqueryExpr`
+- `Expr::node` 新增 `ExistsSubqueryExpr` 分支。
+- `ExistsSubqueryExpr` 字段：
+  - `SelectStmtPtr query`：括号中的 SELECT 子查询。
+  - `bool negated`：是否为 `NOT EXISTS`。
+  - `SourceLocation operator_span`：`EXISTS` 或 `NOT EXISTS` 的位置，方便 B 后续诊断。
+- 没有新增 TokenKind，因为 `EXISTS` 已在 DROP/CREATE 扩展中加入。
+
+### 当前边界
+
+- A 只负责语法结构，不判断子查询是否相关。
+- A 不检查子查询 SELECT 列表内容。SQL 语义上 EXISTS 只关心是否返回行，输出列数量和类型不参与布尔结果。
+- A 不建立外层查询和内层查询之间的名称作用域关系。
+- B 完整适配前，EXISTS 子查询在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的 `ExistsSubqueryExpr` 分支。
+- 当前 B 遇到 EXISTS 子查询会返回：
+  - `UnsupportedFeature`
+  - `EXISTS subqueries are not supported by semantic analysis yet`
+- 这样可以避免 B 把 EXISTS 子查询误当作普通布尔字面量或普通一元表达式处理。
+
+### B 侧后续适配建议
+
+- 非相关 EXISTS：
+  - 在独立作用域中绑定子查询。
+  - 子查询输出列不需要参与类型检查，只需要确认子查询本身合法。
+  - 计划层可把 EXISTS 转成只需判断是否存在至少一行的子计划，必要时可加早停。
+- 相关 EXISTS：
+  - 子查询绑定时需要能引用外层作用域，例如 `score.student_id = student.id`。
+  - Bound 层需要表达外层列引用，避免把它误判为内层未定义列。
+  - 计划层通常需要 Semi Join / Anti Semi Join，或 Apply / Correlated Nested Loop 一类结构。
+- `NOT EXISTS`：
+  - 语义上对应 Anti Semi Join。
+  - 与 `NOT IN` 不同，`NOT EXISTS` 通常不受子查询输出 NULL 值影响；这一点后续实现时应和三值逻辑规则区分开。
+
+### 验证
+
+- 新增 Parser 测试覆盖：
+  - `EXISTS (SELECT ...)`
+  - `NOT EXISTS (SELECT ...)`
+  - 子查询内部引用外层限定列名的语法结构。
+- 新增 Parser 错误测试覆盖：
+  - `EXISTS` 后缺少左括号。
+  - 子查询缺少右括号。
+  - `NOT EXISTS` 后缺少完整子查询。
+- 新增 AST optimizer 测试确认会递归优化 EXISTS 子查询内部 WHERE。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：FROM / JOIN 派生表
+
+### 新增内容
+
+- 新增 FROM 子查询作为表来源：
+  - `SELECT d.name FROM (SELECT name, age FROM student WHERE age > 18) AS d WHERE d.age > 20;`
+- 新增 JOIN 子查询作为表来源：
+  - `SELECT s.name FROM student s JOIN (SELECT student_id FROM score WHERE value > 60) x ON s.id = x.student_id;`
+- 派生表必须声明别名，支持：
+  - `AS alias`
+  - 省略 AS 的 `alias`
+- 派生表内部复用现有 SELECT 文法，可以继续包含 WHERE、JOIN、GROUP BY、HAVING、ORDER BY、LIMIT/OFFSET。
+
+### 公共接口影响
+
+- `ast.hpp` 新增：
+  - `struct TableRef`
+- `TableRef` 字段：
+  - `Identifier table`：普通表名；派生表时为空。
+  - `SelectStmtPtr subquery`：非空表示派生表。
+  - `std::optional<Identifier> alias`：表别名；派生表必须有。
+  - `SourceLocation span`：整个 table_ref 范围，用于诊断。
+- `SelectStmt` 末尾新增：
+  - `TableRef from`
+- `JoinClause` 末尾新增：
+  - `TableRef source`
+- 兼容旧接口：
+  - 普通表查询仍同步填充旧的 `SelectStmt::table` 和 `SelectStmt::table_alias`。
+  - 普通 JOIN 仍同步填充旧的 `JoinClause::table` 和 `JoinClause::alias`。
+  - 派生表场景下，旧的 table 字段为空，B 应读取新的 `from/source`。
+
+### 当前边界
+
+- A 只保存派生表的语法结构。
+- A 不推导派生表输出列名和类型。
+- A 不判断外层查询是否正确引用派生表输出列。
+- A 不建立相关子查询或派生表与外层作用域之间的名称绑定关系。
+- B 完整适配前，派生表在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的保护分支：
+  - `SelectStmt::from.subquery != nullptr` 时返回 `UnsupportedFeature`。
+  - `JoinClause::source.subquery != nullptr` 时返回 `UnsupportedFeature`。
+- 普通表查询仍兼容旧 AST 构造方式：
+  - 如果 `from/source.table` 为空，则继续读取旧的 `table` 字段。
+  - 如果 `from/source.alias` 为空，则继续读取旧的 alias 字段。
+- 这样可以避免 B 把派生表场景中的空旧表名拿去查 Catalog。
+
+### B 侧后续适配建议
+
+- 绑定派生表子查询：
+  - 先在子作用域中绑定内部 SELECT。
+  - 根据子查询输出列生成临时关系模式。
+  - 输出列名优先使用 SELECT 项别名；没有别名时使用原列名或表达式生成名。
+- 外层作用域：
+  - 派生表别名作为外层可见关系名。
+  - 外层只能通过派生表输出列访问内部结果，不能直接访问内部真实表名。
+  - 需要处理重复输出列名；建议在外层未限定引用时按 AmbiguousColumn 报错。
+- JOIN 派生表：
+  - 应在 JOIN ON 绑定前把派生表输出关系加入当前作用域。
+  - ON 中可引用左侧已加入关系和当前派生表别名。
+- 计划层：
+  - 可新增 DerivedTable/SubqueryScan 逻辑节点。
+  - 非相关派生表可先生成子计划，再作为 JOIN/SELECT 的输入。
+  - 如果后续允许相关派生表，需要 Apply/Correlated Nested Loop 一类计划；当前 A 不区分相关性。
+
+### 验证
+
+- 新增 Parser 测试覆盖：
+  - FROM 派生表。
+  - JOIN 派生表。
+  - `AS alias` 和省略 AS 的 alias。
+- 新增 Parser 错误测试覆盖：
+  - 派生表缺少别名。
+  - 派生表缺少右括号。
+  - 括号内不是 SELECT。
+- 新增 AST optimizer 测试确认会递归优化派生表子查询内部 WHERE。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：标量子查询
+
+### 新增内容
+
+- 新增表达式位置的标量子查询：
+  - `SELECT name FROM student WHERE age > (SELECT AVG(age) FROM student);`
+  - `SELECT (SELECT COUNT(*) FROM score) AS score_count FROM student;`
+- 标量子查询复用现有 SELECT 文法，因此内部可以继续包含 WHERE、JOIN、GROUP BY、HAVING、ORDER BY、LIMIT/OFFSET。
+- 标量子查询是普通表达式节点，可以出现在：
+  - SELECT 表达式项。
+  - WHERE 比较表达式。
+  - ORDER BY 表达式。
+  - UPDATE 赋值右侧表达式。
+
+### 公共接口影响
+
+- `ast.hpp` 新增：
+  - `struct ScalarSubqueryExpr`
+- `Expr::node` 新增 `ScalarSubqueryExpr` 分支。
+- `ScalarSubqueryExpr` 字段：
+  - `SelectStmtPtr query`：括号中的 SELECT 子查询。
+  - `SourceLocation span`：整个 `(SELECT ...)` 范围，方便 B 后续诊断。
+- 没有新增 TokenKind。
+
+### 当前边界
+
+- A 只保存语法结构。
+- A 不检查子查询是否只输出一列。
+- A 不检查子查询运行时是否最多返回一行。
+- A 不推导标量子查询的返回类型。
+- A 不判断子查询是否相关，也不建立内外层作用域绑定。
+- B 完整适配前，标量子查询在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的 `ScalarSubqueryExpr` 分支。
+- 当前 B 遇到标量子查询会返回：
+  - `UnsupportedFeature`
+  - `scalar subqueries are not supported by semantic analysis yet`
+- 这样可以避免 B 把标量子查询误当成普通括号表达式或普通列引用继续绑定。
+
+### B 侧后续适配建议
+
+- 绑定阶段：
+  - 在子作用域中绑定内部 SELECT。
+  - 检查子查询输出列必须恰好一列。
+  - 将该输出列类型作为 `ScalarSubqueryExpr` 的表达式类型。
+  - 如果是比较表达式右侧，需要继续按现有类型规则检查左右类型兼容。
+- 运行时单行规则：
+  - 子查询返回 0 行时，结果可定义为 NULL。
+  - 子查询返回 1 行时，结果为该行该列的值。
+  - 子查询返回多行时，应产生运行时错误，或在 B 的简化语义中先限制为不支持。
+- 非相关标量子查询：
+  - 可作为独立子计划执行一次，并把结果当作常量输入外层表达式。
+  - 如果 B 能证明它只返回一行，例如无 GROUP BY 的聚合查询，可以更容易落地。
+- 相关标量子查询：
+  - 子查询绑定时需要能引用外层作用域。
+  - 计划层通常需要 Apply / Correlated Nested Loop。
+  - 必须保留“每个外层行执行后最多一行”的检查。
+- 与 JOIN 改写的关系：
+  - 某些非相关或可证明唯一的标量子查询可以由优化器改写。
+  - A 不做 JOIN 改写，因为改写需要语义信息、唯一性信息、NULL 规则和多行错误规则。
+
+### 验证
+
+- 新增 Parser 测试覆盖：
+  - WHERE 比较右侧标量子查询。
+  - SELECT 表达式项中的标量子查询。
+  - 标量子查询输出别名。
+- 新增 Parser 错误测试覆盖：
+  - 标量子查询缺少右括号。
+  - 标量子查询内部 SELECT 列表不完整。
+- 新增 AST optimizer 测试确认会递归优化标量子查询内部 WHERE。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：UNION / UNION ALL 集合运算
+
+### 新增内容
+
+- 新增 SELECT 集合运算：
+  - `SELECT id FROM student UNION SELECT student_id FROM score;`
+  - `SELECT id FROM student UNION ALL SELECT student_id FROM score;`
+- 支持连续集合运算链：
+  - `SELECT id FROM student UNION ALL SELECT student_id FROM score UNION SELECT id FROM archive;`
+- `UNION` 默认表示去重集合并。
+- `UNION ALL` 表示保留重复行的集合并。
+
+### 公共接口影响
+
+- `token.hpp` 新增：
+  - `TokenKind::Union`
+  - `TokenKind::All`
+- `ast.hpp` 新增：
+  - `enum class SetOperator { Union }`
+  - `struct SetOperation`
+- `SetOperation` 字段：
+  - `SetOperator op`：当前只有 `Union`。
+  - `bool all`：`true` 表示 `UNION ALL`，`false` 表示普通 `UNION`。
+  - `SelectStmtPtr query`：右侧 SELECT 分支。
+  - `SourceLocation operator_span`：`UNION` 或 `UNION ALL` 的位置。
+- `SelectStmt` 末尾新增：
+  - `std::vector<SetOperation> set_operations`
+- 兼容旧接口：
+  - 普通 SELECT 的 `set_operations` 为空。
+  - 原有 `SelectStmt::table`、`columns`、`where`、`joins` 等字段仍表示左侧第一个 SELECT。
+
+### 当前边界
+
+- A 只保存语法结构。
+- A 不检查 UNION 左右 SELECT 的输出列数量是否一致。
+- A 不检查对应列类型是否兼容。
+- A 不定义去重时 NULL、字符串大小写、排序稳定性等细节。
+- 当前不新增 `INTERSECT` / `EXCEPT`。
+- B 完整适配前，集合运算在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的保护分支。
+- `SelectStmt::set_operations` 非空时，当前 B 返回：
+  - `UnsupportedFeature`
+  - `set operations are not supported by semantic analysis yet`
+- 这样可以避免 B 只绑定 UNION 左侧 SELECT，静默丢掉右侧分支。
+
+### B 侧后续适配建议
+
+- 绑定阶段：
+  - 分别绑定左侧 SELECT 和每个右侧 SELECT。
+  - 检查每个分支输出列数量一致。
+  - 检查对应列类型兼容；当前 MiniSQL 没有 INT/FLOAT 隐式转换，建议先要求类型完全一致。
+  - 输出列名通常沿用第一个 SELECT 分支。
+- 计划层：
+  - `UNION ALL` 可生成 Append/Concatenate 计划。
+  - 普通 `UNION` 可在 Append 后加 Distinct/HashDistinct/SortDistinct。
+  - 后续如果支持最终 ORDER BY，应明确它作用于整个集合结果，而不是最后一个 SELECT 分支。
+- 与 SELECT 子句的关系：
+  - 当前 Parser 把每个 UNION 分支保存为一个完整 SELECT core。
+  - 每个分支可以带自己的 WHERE/JOIN/GROUP/HAVING/ORDER/LIMIT 语法结构。
+  - B 后续可以先限制复杂分支，只支持简单 SELECT UNION，再逐步放开。
+
+### 验证
+
+- 新增 Lexer 测试覆盖 `UNION` 和 `ALL` 关键字。
+- 新增 Parser 测试覆盖：
+  - 普通 `UNION`。
+  - `UNION ALL`。
+  - 连续 UNION 链。
+- 新增 Parser 错误测试覆盖：
+  - `UNION` 后缺少 SELECT。
+  - `UNION ALL` 后缺少 SELECT。
+  - `UNION` 后接非 SELECT 语句。
+- 新增 AST optimizer 测试确认会递归优化 UNION 右侧 SELECT 分支。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：INTERSECT / EXCEPT 集合运算
+
+### 新增内容
+
+- 在已有 `UNION / UNION ALL` 基础上，补充另外两类常见集合运算：
+  - `SELECT id FROM student INTERSECT SELECT student_id FROM score;`
+  - `SELECT id FROM student EXCEPT SELECT student_id FROM score;`
+- 同时支持可选 `ALL`：
+  - `INTERSECT ALL`
+  - `EXCEPT ALL`
+- 集合运算仍保存为 SELECT 末尾的 `set_operations` 列表，按 SQL 书写顺序保留。
+
+### 公共接口影响
+
+- `token.hpp` 新增：
+  - `TokenKind::Intersect`
+  - `TokenKind::Except`
+- `ast.hpp` 中 `SetOperator` 从：
+  - `enum class SetOperator { Union }`
+  扩展为：
+  - `enum class SetOperator { Union, Intersect, Except }`
+- `SetOperation::all` 现在表示通用的“保留重复行”标记：
+  - `UNION ALL`
+  - `INTERSECT ALL`
+  - `EXCEPT ALL`
+- `SetOperation::operator_span` 注释已泛化为指向 `UNION/INTERSECT/EXCEPT` 操作符位置。
+
+### 当前边界
+
+- A 只保存语法结构和操作符顺序。
+- A 不检查左右 SELECT 输出列数是否一致。
+- A 不检查对应列类型是否兼容。
+- A 不定义 `INTERSECT ALL` / `EXCEPT ALL` 的重复行计数规则。
+- A 不处理集合运算优先级重排；当前 AST 按书写顺序保留，B 后续可根据 MiniSQL 语义决定是否引入优先级或括号化集合表达式。
+- B 完整适配前，所有集合运算仍在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 的集合运算保护注释已从 `UNION/UNION ALL` 扩展为 `UNION/INTERSECT/EXCEPT`。
+- 当前 B 仍在 `SelectStmt::set_operations` 非空时返回：
+  - `UnsupportedFeature`
+  - `set operations are not supported by semantic analysis yet`
+- 普通 SELECT 不受影响。
+
+### B 侧后续适配建议
+
+- 绑定阶段：
+  - 分别绑定每个 SELECT 分支。
+  - 检查所有分支输出列数量一致。
+  - 检查对应列类型兼容；建议第一版要求类型完全一致。
+  - 输出列名沿用第一个 SELECT 分支。
+- 计划层：
+  - `UNION ALL`：Append/Concatenate。
+  - `UNION`：Append 后去重。
+  - `INTERSECT`：可用 HashIntersect 或左右去重后求交。
+  - `EXCEPT`：可用 HashExcept 或左侧去重后排除右侧。
+  - `INTERSECT ALL` / `EXCEPT ALL`：需要保留重复计数，不能简单使用集合去重。
+
+### 验证
+
+- 新增 Lexer 测试覆盖 `INTERSECT` 和 `EXCEPT` 关键字。
+- 新增 Parser 测试覆盖：
+  - `INTERSECT`。
+  - `EXCEPT ALL`。
+  - 与已有 `UNION` 链共存。
+- 新增 Parser 错误测试覆盖：
+  - `INTERSECT` 后缺少 SELECT。
+  - `EXCEPT ALL` 后缺少 SELECT。
+- 更新 AST optimizer 测试，确认非 UNION 集合分支也会递归优化。
+- 更新 semantic 测试，确认新增集合操作符同样明确返回 `UnsupportedFeature`。
+
+## 2026-09-14：CASE WHEN 表达式
+
+### 新增内容
+
+- 新增搜索型 CASE 表达式：
+  - `CASE WHEN age >= 18 THEN 'adult' ELSE 'minor' END`
+- 新增简单型 CASE 表达式：
+  - `CASE active WHEN TRUE THEN 'yes' WHEN FALSE THEN 'no' ELSE 'unknown' END`
+- CASE 是普通表达式节点，因此可以出现在：
+  - SELECT 表达式项。
+  - WHERE 条件。
+  - ORDER BY 表达式。
+  - UPDATE 赋值右侧。
+  - 其他已经支持表达式的位置。
+- ELSE 可省略；A 只保存是否出现 ELSE，不补隐式 NULL 节点。
+
+### 公共接口影响
+
+- `token.hpp` 新增：
+  - `TokenKind::Case`
+  - `TokenKind::When`
+  - `TokenKind::Then`
+  - `TokenKind::Else`
+  - `TokenKind::End`
+- `ast.hpp` 新增：
+  - `struct CaseWhenClause`
+  - `struct CaseExpr`
+- `Expr::node` 新增 `CaseExpr` 分支。
+- `CaseWhenClause` 字段：
+  - `ExprPtr condition`：搜索型 CASE 中表示 WHEN 条件；简单型 CASE 中表示 WHEN 匹配值。
+  - `ExprPtr result`：THEN 后的结果表达式。
+  - `SourceLocation span`：WHEN 分支范围。
+- `CaseExpr` 字段：
+  - `ExprPtr operand`：非空表示简单型 CASE；空表示搜索型 CASE。
+  - `std::vector<CaseWhenClause> branches`：至少一个 WHEN 分支。
+  - `ExprPtr else_result`：ELSE 结果；空表示未写 ELSE。
+  - `SourceLocation span`：整个 CASE 表达式范围。
+
+### 当前边界
+
+- A 只保存语法结构。
+- A 不检查搜索型 CASE 的 WHEN 条件是否为 BOOL。
+- A 不检查简单型 CASE 的 operand 与 WHEN 值类型是否兼容。
+- A 不检查 THEN 和 ELSE 结果类型是否能合并。
+- A 不定义省略 ELSE 时的隐式 NULL 类型。
+- B 完整适配前，CASE 表达式在语义阶段显式返回 `UnsupportedFeature`。
+
+### B 侧当前处理
+
+- `src/semantic/analyzer.cpp` 新增带注释的 `CaseExpr` 分支。
+- 当前 B 遇到 CASE 表达式会返回：
+  - `UnsupportedFeature`
+  - `CASE expressions are not supported by semantic analysis yet`
+- 这样可以避免 B 把 CASE 误当作普通 BinaryExpr 或其他表达式继续访问。
+
+### B 侧后续适配建议
+
+- 搜索型 CASE：
+  - 每个 WHEN 条件必须绑定为 BOOL。
+  - THEN/ELSE 结果表达式逐个绑定。
+- 简单型 CASE：
+  - 先绑定 operand。
+  - 每个 WHEN 匹配值需要和 operand 类型兼容。
+  - 可以等价理解为 `operand = when_value`，但 Bound 层不一定要真的展开。
+- 结果类型：
+  - 所有 THEN 和 ELSE 的结果类型需要能合并为一个输出类型。
+  - 当前 MiniSQL 没有 INT/FLOAT 隐式转换，第一版建议要求完全同类型。
+  - 如果 ELSE 省略，可以定义为隐式 NULL；需要和现有 NULL 类型规则统一。
+- 执行层：
+  - CASE 应按 WHEN 顺序短路求值。
+  - 命中第一个 WHEN 后只计算对应 THEN。
+  - 没有命中且没有 ELSE 时返回 NULL。
+
+### 验证
+
+- 新增 Lexer 测试覆盖 `CASE / WHEN / THEN / ELSE / END` 关键字。
+- 新增 Parser 测试覆盖：
+  - 搜索型 CASE。
+  - 简单型 CASE。
+  - 多个 WHEN 分支。
+  - SELECT 项别名。
+  - CASE 出现在 WHERE。
+- 新增 Parser 错误测试覆盖：
+  - 缺少 WHEN。
+  - 缺少 THEN。
+  - 缺少 END。
+- 新增 AST optimizer 测试确认会递归优化 CASE 的 WHEN、THEN 和 ELSE 子表达式。
+- 新增 semantic 测试确认 B 当前明确返回 `UnsupportedFeature`。

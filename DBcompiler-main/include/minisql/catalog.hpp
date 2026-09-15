@@ -28,6 +28,7 @@ struct TableSchema {
     TableId id;
     std::string name; // 已归一化。
     std::vector<ColumnSchema> columns; // 建表顺序，也是扫描记录的列顺序。
+    std::vector<TableConstraintSpec> table_constraints = {};
 };
 
 // 返回共享只读模式，保证 BoundStatement/Plan 可以持有安全的生命周期。

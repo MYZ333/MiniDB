@@ -85,7 +85,11 @@ void testExtendedTokens() {
         "SELECT DISTINCT value FROM metrics;"
         "SELECT * FROM metrics WHERE value BETWEEN 10 AND 20;"
         "SELECT * FROM metrics WHERE value IN (1,2,3);"
+        "ALTER TABLE student ADD COLUMN email VARCHAR(50);"
+        "ALTER TABLE student RENAME COLUMN name TO full_name;"
         "DROP TABLE IF EXISTS old_student;"
+        "SELECT id FROM a UNION ALL SELECT id FROM b INTERSECT SELECT id FROM c EXCEPT SELECT id FROM d;"
+        "SELECT CASE WHEN active THEN 1 ELSE 0 END FROM metrics;"
         "SELECT * FROM a INNER JOIN b ON a.id=b.id LEFT OUTER JOIN c ON a.id=c.id "
         "RIGHT JOIN d ON a.id=d.id FULL OUTER JOIN e ON a.id=e.id;");
     const std::vector<TokenKind> required{TokenKind::Dot, TokenKind::Join, TokenKind::On,
@@ -94,9 +98,12 @@ void testExtendedTokens() {
         TokenKind::Is, TokenKind::Limit, TokenKind::Offset, TokenKind::Like,
         TokenKind::Between, TokenKind::In, TokenKind::Count, TokenKind::Sum, TokenKind::Avg, TokenKind::Min, TokenKind::Max,
         TokenKind::Primary, TokenKind::Key, TokenKind::Unique, TokenKind::Default,
+        TokenKind::Alter, TokenKind::Add, TokenKind::Column, TokenKind::Rename, TokenKind::To,
         TokenKind::Drop, TokenKind::If, TokenKind::Exists,
         TokenKind::Having, TokenKind::Distinct, TokenKind::Inner, TokenKind::Left,
-        TokenKind::Right, TokenKind::Full, TokenKind::Outer};
+        TokenKind::Right, TokenKind::Full, TokenKind::Outer, TokenKind::Union,
+        TokenKind::Intersect, TokenKind::Except, TokenKind::All,
+        TokenKind::Case, TokenKind::When, TokenKind::Then, TokenKind::Else, TokenKind::End};
     for (const auto kind : required) {
         bool found = false;
         for (const auto& token : tokens) found = found || token.kind == kind;

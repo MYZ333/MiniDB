@@ -99,20 +99,29 @@ void printOutline(const PlanNode& plan) {
     std::visit([](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan>) std::cout << "CreateTable";
+        else if constexpr (std::is_same_v<T, AlterTablePlan>) std::cout << "AlterTable";
         else if constexpr (std::is_same_v<T, DropTablePlan>) std::cout << "DropTable";
         else if constexpr (std::is_same_v<T, InsertPlan>) std::cout << "Insert";
         else if constexpr (std::is_same_v<T, SeqScanPlan>) std::cout << "SeqScan";
         else if constexpr (std::is_same_v<T, EmptyResultPlan>) std::cout << "EmptyResult";
-        else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
-            std::cout << "NestedLoopJoin -> (";
+        else if constexpr (std::is_same_v<T, NestedLoopJoinPlan> ||
+                           std::is_same_v<T, SetOperationPlan>) {
+            if constexpr (std::is_same_v<T, NestedLoopJoinPlan>)
+                std::cout << "NestedLoopJoin -> (";
+            else std::cout << "SetOperation -> (";
             printOutline(*op.left);
             std::cout << ", ";
             printOutline(*op.right);
             std::cout << ")";
         }
+        else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            std::cout << "DerivedTable -> ";
+            printOutline(*op.input);
+        }
         else {
             if constexpr (std::is_same_v<T, FilterPlan>) std::cout << "Filter";
             else if constexpr (std::is_same_v<T, GroupByPlan>) std::cout << "GroupBy";
+            else if constexpr (std::is_same_v<T, AggregatePlan>) std::cout << "Aggregate";
             else if constexpr (std::is_same_v<T, SortPlan>) std::cout << "Sort";
             else if constexpr (std::is_same_v<T, ProjectPlan>) std::cout << "Project";
             else if constexpr (std::is_same_v<T, UpdatePlan>) std::cout << "Update";

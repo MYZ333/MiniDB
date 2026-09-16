@@ -8,7 +8,10 @@ target_include_directories(minisql_contracts INTERFACE
 target_compile_features(minisql_contracts INTERFACE cxx_std_17)
 
 # A 的实现库：由团队版本合入 Lexer/Parser，保持原公共签名。
-add_library(minisql_frontend STATIC src/lexer/lexer.cpp src/parser/parser.cpp)
+add_library(minisql_frontend STATIC
+    src/lexer/lexer.cpp
+    src/parser/parser.cpp
+    src/parser/ast_optimizer.cpp)
 target_link_libraries(minisql_frontend PUBLIC minisql_contracts)
 
 # B 的实现库：内存元数据、语义分析、计划生成和规则优化。
@@ -19,6 +22,10 @@ add_library(minisql_backend STATIC
     src/planner/plan_builder.cpp
     src/planner/plan_printer.cpp
     src/optimizer/constant_fold.cpp
+    src/optimizer/predicate_pushdown.cpp
+    src/optimizer/index_scan.cpp
+    src/optimizer/empty_result.cpp
+    src/optimizer/column_pruning.cpp
     src/optimizer/optimizer.cpp)
 target_link_libraries(minisql_backend PUBLIC minisql_contracts)
 
@@ -26,7 +33,7 @@ target_link_libraries(minisql_backend PUBLIC minisql_contracts)
 add_executable(minisql app/main.cpp)
 target_link_libraries(minisql PRIVATE minisql_frontend minisql_backend)
 
-# 跨语言边界：导出稳定 JSON 执行计划，Java 引擎不链接 C++ 内存对象。
+# 跨语言边界：导出稳定 JSON 计划，供仓库中的 Java 执行引擎读取。
 add_executable(minisql_plan_json app/plan_json.cpp)
 target_link_libraries(minisql_plan_json PRIVATE minisql_frontend minisql_backend)
 
@@ -51,6 +58,11 @@ function(minisql_warnings target)
     set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /utf-8)
+        get_target_property(target_type ${target} TYPE)
+        if(NOT target_type STREQUAL "STATIC_LIBRARY" AND
+           NOT target_type STREQUAL "INTERFACE_LIBRARY")
+            target_link_options(${target} PRIVATE /STACK:8388608)
+        endif()
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
@@ -64,7 +76,8 @@ if(BUILD_TESTING)
     # 合入 A 的模块测试，和本地 B 测试同时回归。
     add_executable(lexer_tests tests/lexer/lexer_tests.cpp)
     add_executable(parser_tests tests/parser/parser_tests.cpp)
-    foreach(target lexer_tests parser_tests)
+    add_executable(ast_optimizer_tests tests/parser/ast_optimizer_tests.cpp)
+    foreach(target lexer_tests parser_tests ast_optimizer_tests)
         target_link_libraries(${target} PRIVATE minisql_frontend)
         minisql_warnings(${target})
         add_test(NAME ${target} COMMAND ${target})

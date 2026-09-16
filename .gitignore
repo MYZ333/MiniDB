@@ -1,5 +1,7 @@
 # C++ / CMake / Visual Studio build products
 DBcompiler-main/build/
+DBcompiler-main/build-index/
+DBcompiler-main/cmake-build-*/
 *.obj
 *.pdb
 *.ilk
@@ -10,6 +12,9 @@ DBcompiler-main/build/
 # Java / Maven build products
 minidb-engine/target/
 *.class
+*.tlog
+*.lastbuildstate
+*.exe.recipe
 
 # Local IDE and operating-system files
 .idea/
@@ -21,4 +26,15 @@ Thumbs.db
 # Local render and scratch directories
 qa_render/
 tmp/
+data/
 *.log
+.vscode/
+
+# Local document deliverables and Word lock files
+*.docx
+docx_render_*/
+
+# One-off local document authoring helpers
+create_bplus_index_assessment.py
+create_module_task_docs.py
+create_index_interface_spec.py

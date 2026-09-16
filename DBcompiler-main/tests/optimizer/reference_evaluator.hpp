@@ -68,6 +68,7 @@ inline ScalarValue evaluate(const BoundExprPtr& expression, const Row& row) {
 struct IndexedRow { std::size_t row_id; Row values; };
 
 inline std::vector<IndexedRow> read(const PlanPtr& plan, const Rows& table) {
+    if (std::holds_alternative<EmptyResultPlan>(plan->node)) return {};
     if (std::holds_alternative<SeqScanPlan>(plan->node)) {
         std::vector<IndexedRow> result;
         for (std::size_t i = 0; i < table.size(); ++i) result.push_back({i, table[i]});

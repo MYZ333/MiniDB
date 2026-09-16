@@ -10,8 +10,8 @@
 
 namespace minisql {
 
-// BOOL 只用于表达式结果，不能声明为第一阶段的表列类型。
-enum class DataType { Int, Varchar, Bool };
+// Null 仅表示 NULL 字面量的内部类型，不能声明为表列类型。
+enum class DataType { Int, Varchar, Bool, Float, Null };
 
 struct SourcePosition {
     std::size_t offset = 0; // 从 0 开始的 UTF-8 字节偏移。
@@ -42,15 +42,24 @@ inline std::string normalizeName(std::string name) {
     return name;
 }
 
-// SQL 输入字面量没有 BOOL；绑定后计算出的值可以包含 BOOL。
-using LiteralValue = std::variant<std::int64_t, std::string>;
-using ScalarValue = std::variant<std::int64_t, std::string, bool>;
+// NULL 用于存储、聚合和空值判定；普通运算的三值逻辑留给后续执行契约。
+struct NullValue {};
+inline bool operator==(NullValue, NullValue) noexcept { return true; }
+inline bool operator!=(NullValue, NullValue) noexcept { return false; }
+using LiteralValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
+using ScalarValue = std::variant<std::int64_t, double, std::string, bool, NullValue>;
 
-enum class UnaryOp { Negate, Not };
+// IsNull/IsNotNull 接受任意类型，返回非空 BOOL，贯通 A/B 与执行层。
+enum class UnaryOp { Negate, Not, IsNull, IsNotNull };
+enum class SortDirection { Asc, Desc };
+enum class JoinType { Inner, Left, Right, Full };
+enum class SetOperator { Union, Intersect, Except };
+enum class AggregateKind { Count, Sum, Avg, Min, Max };
 enum class BinaryOp {
     Add, Subtract, Multiply, Divide,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
-    And, Or
+    And, Or,
+    Like // VARCHAR LIKE VARCHAR；执行层以 %/_ 实现 Unicode 码点匹配。
 };
 
 enum class DiagnosticStage { Lexical, Syntax, Semantic, Plan, Execution };
@@ -65,7 +74,10 @@ enum class ErrorCode {
     InvalidBoundStatement, CatalogVersionMismatch, DivisionByZero, IntegerOverflow,
     NotImplemented, // 骨架入口专用：模块未实现，不表示用户的 SQL 有错。
     InvalidAst, ExpressionTooDeep, // 防御手工/外部 AST 的空子节点和过深嵌套。
-    InvalidPlan // 优化入口发现缺失子节点或不满足基本结构约定的计划。
+    InvalidPlan, // 优化入口发现缺失子节点或不满足基本结构约定的计划。
+    UnsupportedFeature, // 已识别但当前阶段尚未定义行为的语法。
+    AmbiguousColumn, DuplicateTable, DuplicateIndex, IndexNotFound,
+    UnsupportedIndex, InvalidGrouping, JoinConditionNotBoolean
 };
 
 struct Diagnostic {
@@ -83,6 +95,17 @@ using Result = std::variant<T, Diagnostic>;
 struct ColumnSpec {
     std::string name; // 已归一化。
     DataType type;
+    std::optional<std::int64_t> varchar_length = {}; // 仅 VARCHAR(n) 使用；nullopt 表示未声明长度。
+    bool primary_key = false;
+    bool not_null = false;
+    bool unique = false;
+    std::optional<ScalarValue> default_value = {};
+};
+
+// 表级主键/唯一约束按列序号保存；复合约束不能降级成多个单列 UNIQUE。
+struct TableConstraintSpec {
+    bool primary_key = false;
+    std::vector<std::size_t> columns;
 };
 
 } // namespace minisql

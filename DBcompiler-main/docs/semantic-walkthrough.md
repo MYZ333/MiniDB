@@ -69,13 +69,13 @@ age 不必出现在输出列表中。WHERE 缺省是空指针，存在时必须�
 bindExpr 按 AST 的结构递归，不重新计算优先级；优先级结构应由 A 的 Parser 保证。
 
 1. 名称节点调用 resolveColumn，产生带 ID 和类型的 BoundColumnRef。
-2. 字面量节点保留原值，根据 int64_t/string 确定 INT/VARCHAR。
+2. 字面量节点保留原值，根据 int64_t/double/string/bool/NullValue 确定类型。
 3. 一元节点先绑定操作数，再用 unaryResult 检查 NOT 或负号。
 4. 二元节点先绑定左侧、再绑定右侧，最后用 binaryResult 检查两个类型。
 
 例如 `age + 1 > 18`：age 与 1 均为 INT，加法结果为 INT；与 18 比较得到 BOOL，
 因此能够作为 WHERE。`age + 'abc'` 则在加号处报告 InvalidOperandType，
-消息说明 INT 和 VARCHAR 不支持相加。
+消息会列出实际左右类型，例如 INT 和 VARCHAR 不支持相加。
 
 这里仅推导类型，不做常量折叠，也不执行运算。`1 / 0 = 0` 类型合法，除零由
 执行层负责；OR 左侧即使是恒真，右侧不存在的列也必须在静态检查时报告。
@@ -100,7 +100,8 @@ SELECT bound: output ordinal 1; WHERE column ID 3; predicate BOOL=1
 ```
 
 4 个 Catalog 用例检查模式规范化、快照隔离、失败注册原子性和生命周期。
-语义测试现扩展至 33 个用例，检查五类语句的成功/失败、类型规则、准确范围、深度边界和无副作用。
+语义测试现扩展至 39 个用例，检查五类语句、别名/自连接、JOIN/GROUP/ORDER、类型规则、
+准确范围、深度边界和无副作用。
 test_support.hpp 只是测试辅助；实际算法位于 src 中，测试通过公共 analyze 调用它。
 
 当前环境没有 CMake，已用直接构建脚本通过严格警告编译及全部用例；CMake 配置

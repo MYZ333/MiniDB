@@ -50,7 +50,7 @@ buildPlan 先做基本绑定结构检查，再用 std::visit 根据语句种类�
 |---|---|
 | BoundCreateTable | CreateTable |
 | BoundInsert | Insert |
-| BoundSelect | Project → 可选 Filter → SeqScan |
+| BoundSelect | Project → 可选 Sort → 可选 GroupBy → 可选 Filter → Join/SeqScan |
 | BoundUpdate | Update → 可选 Filter → SeqScan |
 | BoundDelete | Delete → 可选 Filter → SeqScan |
 
@@ -64,6 +64,7 @@ INSERT 直接保存语义阶段已重排的值。CREATE 保存名称和列定义
 
 buildPlan 不自动优化：SELECT * 仍有 Project，恒真条件仍有 Filter。每条生成规则
 直接对应语义结构；现可显式调用 optimizePlan 对照前后变化，见 [优化代码讲解](optimizer-walkthrough.md)。
+JOIN/GROUP/ORDER 的多表布局和约束另见 [高级查询代码讲解](advanced-query-walkthrough.md)。
 
 ## 4. 行标识怎样传递
 
@@ -110,7 +111,7 @@ Update[student#1; student.age = (student.age + 1); values=old-row] output=[] row
     SeqScan[student#1] output=[id:INT, name:VARCHAR, age:INT] row_id=yes
 ```
 
-当前通过 53 个行为用例：Catalog 4 个、语义 33 个、计划/打印 16 个。
+当前通过 65 个行为用例：Catalog 5 个、语义 39 个、计划/打印 21 个。
 另有接口联调、手工结构示例、语义示例和五类计划演示。
 直接构建使用 C++17 严格警告，并逐个检查 11 个公共头文件；环境无可运行的 CMake，
 因此尚未在本机验证 CMake/CTest 路径。A 合并后另增加词法/语法测试和 12 个

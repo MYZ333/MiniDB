@@ -1,6 +1,7 @@
 // 用可移植 C++17 的边界判断实现安全常量计算，先判断再运算，避免有符号整数 UB。
 #include "constant_fold.hpp"
 
+#include <cmath>
 #include <limits>
 
 namespace minisql::optimizer_detail {
@@ -39,9 +40,17 @@ std::optional<ScalarValue> integers(BinaryOp op, std::int64_t a, std::int64_t b)
 } // namespace
 
 std::optional<ScalarValue> foldUnary(UnaryOp op, const ScalarValue& operand) {
+    if (op == UnaryOp::IsNull || op == UnaryOp::IsNotNull) {
+        const bool is_null = std::holds_alternative<NullValue>(operand);
+        return ScalarValue{op == UnaryOp::IsNull ? is_null : !is_null};
+    }
     if (op == UnaryOp::Negate) {
         if (const auto* value = std::get_if<std::int64_t>(&operand)) {
             if (*value != minimum) return ScalarValue{-*value};
+        }
+        if (const auto* value = std::get_if<double>(&operand)) {
+            const double result = -*value;
+            if (std::isfinite(result)) return ScalarValue{result};
         }
     } else if (op == UnaryOp::Not) {
         if (const auto* value = std::get_if<bool>(&operand)) return ScalarValue{!*value};
@@ -52,6 +61,27 @@ std::optional<ScalarValue> foldUnary(UnaryOp op, const ScalarValue& operand) {
 std::optional<ScalarValue> foldBinary(BinaryOp op, const ScalarValue& left, const ScalarValue& right) {
     if (const auto* a = std::get_if<std::int64_t>(&left)) {
         if (const auto* b = std::get_if<std::int64_t>(&right)) return integers(op, *a, *b);
+    } else if (const auto* a = std::get_if<double>(&left)) {
+        if (const auto* b = std::get_if<double>(&right)) {
+            double result = 0.0;
+            switch (op) {
+            case BinaryOp::Add: result = *a + *b; break;
+            case BinaryOp::Subtract: result = *a - *b; break;
+            case BinaryOp::Multiply: result = *a * *b; break;
+            case BinaryOp::Divide:
+                if (*b == 0.0) return std::nullopt;
+                result = *a / *b;
+                break;
+            case BinaryOp::Equal: return ScalarValue{*a == *b};
+            case BinaryOp::NotEqual: return ScalarValue{*a != *b};
+            case BinaryOp::Less: return ScalarValue{*a < *b};
+            case BinaryOp::LessEqual: return ScalarValue{*a <= *b};
+            case BinaryOp::Greater: return ScalarValue{*a > *b};
+            case BinaryOp::GreaterEqual: return ScalarValue{*a >= *b};
+            default: return std::nullopt;
+            }
+            if (std::isfinite(result)) return ScalarValue{result};
+        }
     } else if (const auto* a = std::get_if<std::string>(&left)) {
         if (const auto* b = std::get_if<std::string>(&right)) {
             if (op == BinaryOp::Equal) return ScalarValue{*a == *b};
@@ -59,6 +89,8 @@ std::optional<ScalarValue> foldBinary(BinaryOp op, const ScalarValue& left, cons
         }
     } else if (const auto* a = std::get_if<bool>(&left)) {
         if (const auto* b = std::get_if<bool>(&right)) {
+            if (op == BinaryOp::Equal) return ScalarValue{*a == *b};
+            if (op == BinaryOp::NotEqual) return ScalarValue{*a != *b};
             if (op == BinaryOp::And) return ScalarValue{*a && *b};
             if (op == BinaryOp::Or) return ScalarValue{*a || *b};
         }

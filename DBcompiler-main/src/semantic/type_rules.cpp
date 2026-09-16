@@ -4,7 +4,9 @@
 namespace minisql::semantic_detail {
 
 std::optional<DataType> unaryResult(UnaryOp op, DataType operand) {
-    if (op == UnaryOp::Negate && operand == DataType::Int) return DataType::Int;
+    // 空值判定接受任意已绑定类型，包括 NULL 字面量，始终返回 BOOL。
+    if (op == UnaryOp::IsNull || op == UnaryOp::IsNotNull) return DataType::Bool;
+    if (op == UnaryOp::Negate && (operand == DataType::Int || operand == DataType::Float)) return operand;
     if (op == UnaryOp::Not && operand == DataType::Bool) return DataType::Bool;
     return std::nullopt;
 }
@@ -14,17 +16,21 @@ std::optional<DataType> binaryResult(BinaryOp op, DataType left, DataType right)
     switch (op) {
     case BinaryOp::Add: case BinaryOp::Subtract:
     case BinaryOp::Multiply: case BinaryOp::Divide:
-        if (left == DataType::Int) return DataType::Int;
+        if (left == DataType::Int || left == DataType::Float) return left;
         break;
     case BinaryOp::Equal: case BinaryOp::NotEqual:
-        if (left == DataType::Int || left == DataType::Varchar) return DataType::Bool;
+        if (left == DataType::Int || left == DataType::Float ||
+            left == DataType::Varchar || left == DataType::Bool) return DataType::Bool;
         break;
     case BinaryOp::Less: case BinaryOp::LessEqual:
     case BinaryOp::Greater: case BinaryOp::GreaterEqual:
-        if (left == DataType::Int) return DataType::Bool;
+        if (left == DataType::Int || left == DataType::Float) return DataType::Bool;
         break;
     case BinaryOp::And: case BinaryOp::Or:
         if (left == DataType::Bool) return DataType::Bool;
+        break;
+    case BinaryOp::Like:
+        if (left == DataType::Varchar) return DataType::Bool;
         break;
     }
     return std::nullopt;
@@ -35,11 +41,21 @@ const char* typeName(DataType type) {
     case DataType::Int: return "INT";
     case DataType::Varchar: return "VARCHAR";
     case DataType::Bool: return "BOOL";
+    case DataType::Float: return "FLOAT";
+    case DataType::Null: return "NULL";
     }
     return "UNKNOWN";
 }
 
-const char* operatorName(UnaryOp op) { return op == UnaryOp::Not ? "NOT" : "-"; }
+const char* operatorName(UnaryOp op) {
+    switch (op) {
+    case UnaryOp::Not: return "NOT";
+    case UnaryOp::Negate: return "-";
+    case UnaryOp::IsNull: return "IS NULL";
+    case UnaryOp::IsNotNull: return "IS NOT NULL";
+    }
+    return "UNKNOWN";
+}
 
 const char* operatorName(BinaryOp op) {
     switch (op) {
@@ -55,6 +71,7 @@ const char* operatorName(BinaryOp op) {
     case BinaryOp::GreaterEqual: return ">=";
     case BinaryOp::And: return "AND";
     case BinaryOp::Or: return "OR";
+    case BinaryOp::Like: return "LIKE";
     }
     return "UNKNOWN";
 }

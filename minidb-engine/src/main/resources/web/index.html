@@ -3,48 +3,41 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MiniDB · SQL 演示台</title>
+  <title>MiniDB · SQL 工作台</title>
   <link rel="stylesheet" href="/app.css" />
 </head>
-<body>
-  <main class="shell">
-    <header class="masthead">
-      <div class="brand"><span class="brand-mark">M</span><div><p class="eyebrow">LARGE PLATFORM SOFTWARE PRACTICUM</p><h1>MiniDB <em>Control Deck</em></h1></div></div>
-      <div class="system-state"><span id="status-dot" class="dot"></span><span id="system-status">正在检查本地引擎…</span></div>
+<body class="console-page">
+  <main class="console-shell">
+    <header class="console-header">
+      <a class="wordmark" href="/" aria-label="MiniDB SQL 工作台"><span class="wordmark-mark">M</span><span><small>MINIDB / LOCAL DATABASE</small><strong>SQL Workbench</strong></span></a>
+      <div class="live-state"><span id="status-dot" class="status-dot"></span><span id="system-status">正在检查本地引擎</span></div>
     </header>
 
-    <section class="notice"><span class="notice-label">MEMORY MODE</span><span>每次运行都会从空内存数据库回放当前完整脚本，不会写入磁盘。</span></section>
+    <div class="console-layout">
+      <section class="console-column">
+        <article class="command-station">
+          <div class="station-topline"><span>01</span><span>QUERY CONSOLE</span><span>UTF-8 / SQL</span></div>
+          <div class="station-heading"><div><p>SQL SCRIPT</p><h1>让引擎执行一段完整指令。</h1></div><div class="station-actions"><button id="restore" class="text-button" type="button">恢复默认脚本</button><button id="execute" class="execute-button" type="button">运行全部 <span>↵</span></button></div></div>
+          <div class="editor-wrap"><div id="line-numbers" aria-hidden="true">1</div><textarea id="sql" spellcheck="false" aria-label="SQL 脚本编辑器"></textarea></div>
+          <footer class="editor-footer"><span id="cursor-info">Ln 1, Col 1</span><span>DDL · DML · 查询 · EXPLAIN ANALYZE</span></footer>
+        </article>
 
-    <section class="workspace">
-      <article class="editor-card panel">
-        <div class="panel-head"><div><p class="kicker">01 / SQL SCRIPT</p><h2>指令工作区</h2></div><div class="editor-actions"><button id="restore" class="quiet">恢复示例</button><button id="execute" class="primary"><span>▶</span> 运行全部</button></div></div>
-        <div class="editor-wrap"><div id="line-numbers" aria-hidden="true">1</div><textarea id="sql" spellcheck="false" aria-label="SQL 脚本编辑器"></textarea></div>
-        <footer class="editor-foot"><span id="cursor-info">Ln 1, Col 1</span><span>支持 CREATE · INSERT · SELECT · UPDATE · DELETE</span></footer>
-      </article>
+        <section class="output-zone" aria-label="执行输出">
+          <div class="zone-heading"><div><p>RESULT SET</p><h2>执行结果</h2></div><button id="clear-output" class="text-button" type="button">清空</button></div>
+          <div id="result" class="result-empty">运行 SQL 后，结果将在这里出现。</div>
+        </section>
 
-      <aside class="side-stack">
-        <article class="panel architecture"><p class="kicker">PIPELINE</p><div class="pipe"><span>SQL</span><i>→</i><span>C++ 编译器</span><i>→</i><span>JSON 计划</span><i>→</i><span>Java 引擎</span></div></article>
-        <article class="panel quick-guide"><p class="kicker">RUNBOOK</p><ol><li>编辑或粘贴完整 SQL 脚本</li><li>点击“运行全部”</li><li>查看结果与执行计划</li></ol></article>
+        <details class="plan-zone" id="plan-panel"><summary><span>编译器产物</span><strong>JSON 执行计划</strong><em>展开</em></summary><pre id="plan">等待一次成功执行</pre></details>
+      </section>
+
+      <aside class="side-rail">
+        <section class="rail-block object-block" aria-labelledby="object-title"><div class="rail-heading"><div><p>DATABASE OBJECTS</p><h2 id="object-title">表目录</h2></div><button id="refresh-catalog" class="round-button" type="button" aria-label="刷新表目录">↻</button></div><p class="rail-copy">点击任意表，在独立的表浏览器中查看字段、约束、索引与分页数据。</p><div class="table-heading"><span>TABLES</span><span id="table-count">0</span></div><div id="table-tree" class="table-tree" aria-live="polite"><p class="tree-message">正在读取目录</p></div></section>
+        <section class="rail-block storage-block"><p class="storage-label">PERSISTENT STORAGE</p><p id="storage-notice">正在读取页式存储状态</p><pre id="storage-detail">存储信息加载中</pre></section>
       </aside>
-    </section>
+    </div>
 
-    <section class="results-grid">
-      <article class="panel result-panel">
-        <div class="panel-head compact"><div><p class="kicker">02 / EXECUTION OUTPUT</p><h2>执行结果</h2></div><button id="clear-output" class="quiet">清空输出</button></div>
-        <div id="result" class="result-empty"><span class="empty-glyph">↳</span><p>运行脚本后，结果将在这里出现。</p></div>
-      </article>
-      <article class="panel history-panel">
-        <div class="panel-head compact"><div><p class="kicker">SESSION / BROWSER ONLY</p><h2>执行历史</h2></div><span id="history-count" class="count">0</span></div>
-        <div id="history" class="history-empty">当前页面尚无执行记录。</div>
-      </article>
-    </section>
-
-    <details class="panel plan-panel" id="plan-panel">
-      <summary><span><b>03 / COMPILER ARTIFACT</b> JSON 执行计划</span><span class="summary-hint">展开查看</span></summary>
-      <pre id="plan">等待一次成功执行…</pre>
-    </details>
+    <section class="demo-library" aria-labelledby="demo-title"><div class="demo-intro"><p>DEMO LIBRARY</p><h2 id="demo-title">系统边界演示用例</h2><span>点击用例会填入 SQL，但不会立即执行。</span></div><div id="demo-cases" class="demo-cases"></div></section>
   </main>
-  <template id="command-template"><section class="command-result"><div class="command-title"></div><p></p></section></template>
   <script src="/app.js"></script>
 </body>
 </html>

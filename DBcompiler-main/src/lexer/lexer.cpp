@@ -29,13 +29,42 @@ std::string asciiLower(std::string text) {
 TokenKind keywordOrIdentifier(const std::string& lexeme) {
     static const std::unordered_map<std::string, TokenKind> keywords{
         {"create", TokenKind::Create}, {"table", TokenKind::Table},
+        {"index", TokenKind::Index},
+        {"alter", TokenKind::Alter}, {"add", TokenKind::Add}, {"column", TokenKind::Column},
+        {"rename", TokenKind::Rename}, {"to", TokenKind::To},
+        {"drop", TokenKind::Drop}, {"if", TokenKind::If}, {"exists", TokenKind::Exists},
         {"insert", TokenKind::Insert}, {"into", TokenKind::Into},
         {"values", TokenKind::Values}, {"select", TokenKind::Select},
+        {"distinct", TokenKind::Distinct}, {"union", TokenKind::Union},
+        {"intersect", TokenKind::Intersect}, {"except", TokenKind::Except},
+        {"all", TokenKind::All},
         {"from", TokenKind::From}, {"where", TokenKind::Where},
+        {"having", TokenKind::Having},
+        {"explain", TokenKind::Explain}, {"analyze", TokenKind::Analyze},
         {"update", TokenKind::Update}, {"set", TokenKind::Set},
-        {"delete", TokenKind::Delete}, {"int", TokenKind::Int},
-        {"varchar", TokenKind::Varchar}, {"and", TokenKind::And},
+        {"delete", TokenKind::Delete}, {"join", TokenKind::Join},
+        {"inner", TokenKind::Inner}, {"left", TokenKind::Left},
+        {"right", TokenKind::Right}, {"full", TokenKind::Full}, {"outer", TokenKind::Outer},
+        {"on", TokenKind::On}, {"group", TokenKind::Group},
+        {"order", TokenKind::Order}, {"by", TokenKind::By},
+        {"asc", TokenKind::Asc}, {"desc", TokenKind::Desc}, {"as", TokenKind::As},
+        {"is", TokenKind::Is},
+        {"primary", TokenKind::Primary}, {"key", TokenKind::Key},
+        {"unique", TokenKind::Unique}, {"default", TokenKind::Default},
+        {"int", TokenKind::Int}, {"varchar", TokenKind::Varchar},
+        {"bool", TokenKind::Bool}, {"float", TokenKind::Float},
+        {"null", TokenKind::Null}, {"true", TokenKind::True},
+        {"false", TokenKind::False}, {"and", TokenKind::And},
         {"or", TokenKind::Or}, {"not", TokenKind::Not},
+        {"like", TokenKind::Like},
+        {"between", TokenKind::Between},
+        {"in", TokenKind::In},
+        {"case", TokenKind::Case}, {"when", TokenKind::When},
+        {"then", TokenKind::Then}, {"else", TokenKind::Else},
+        {"end", TokenKind::End},
+        {"count", TokenKind::Count}, {"sum", TokenKind::Sum},
+        {"avg", TokenKind::Avg}, {"min", TokenKind::Min}, {"max", TokenKind::Max},
+        {"limit", TokenKind::Limit}, {"offset", TokenKind::Offset},
     };
     const auto found = keywords.find(asciiLower(lexeme));
     return found == keywords.end() ? TokenKind::Identifier : found->second;
@@ -59,7 +88,7 @@ public:
             if (isIdentifierStart(ch)) {
                 tokens_.push_back(identifier(start));
             } else if (std::isdigit(static_cast<unsigned char>(ch)) != 0) {
-                tokens_.push_back(integer(start));
+                tokens_.push_back(number(start));
             } else if (ch == '\'') {
                 auto token = string(start);
                 if (const auto* diagnostic = std::get_if<Diagnostic>(&token)) {
@@ -176,10 +205,16 @@ private:
         return Token{keywordOrIdentifier(lexeme), std::move(lexeme), spanFrom(start)};
     }
 
-    Token integer(SourcePosition start) {
+    Token number(SourcePosition start) {
         const std::size_t begin = index_;
         while (!atEnd() && std::isdigit(static_cast<unsigned char>(peek())) != 0) {
             advance();
+        }
+        // 小数点两侧都必须有数字；否则把点留给限定列名或后续语法诊断。
+        if (peek() == '.' && std::isdigit(static_cast<unsigned char>(peek(1))) != 0) {
+            advance();
+            while (!atEnd() && std::isdigit(static_cast<unsigned char>(peek())) != 0) advance();
+            return Token{TokenKind::FloatLiteral, textFrom(begin), spanFrom(start)};
         }
         return Token{TokenKind::Integer, textFrom(begin), spanFrom(start)};
     }
@@ -224,7 +259,7 @@ private:
                 return Token{TokenKind::LessEqual, textFrom(begin), spanFrom(start)};
             }
             if (match('>')) {
-                return diagnostic(ErrorCode::InvalidCharacter, "'<>' is not supported", start);
+                return Token{TokenKind::NotEqual, textFrom(begin), spanFrom(start)};
             }
             return Token{TokenKind::Less, textFrom(begin), spanFrom(start)};
         case '>':
@@ -239,6 +274,7 @@ private:
         case '(': return Token{TokenKind::LeftParen, textFrom(begin), spanFrom(start)};
         case ')': return Token{TokenKind::RightParen, textFrom(begin), spanFrom(start)};
         case ',': return Token{TokenKind::Comma, textFrom(begin), spanFrom(start)};
+        case '.': return Token{TokenKind::Dot, textFrom(begin), spanFrom(start)};
         case ';': return Token{TokenKind::Semicolon, textFrom(begin), spanFrom(start)};
         default:
             return diagnostic(ErrorCode::InvalidCharacter,

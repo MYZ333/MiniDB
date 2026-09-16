@@ -59,6 +59,12 @@ public:
         return key == table_->name ? table_ : nullptr;
     }
 
+    std::shared_ptr<const IndexSchema> findIndex(std::string_view) const override {
+        return nullptr;
+    }
+
+    IndexId nextIndexId() const noexcept override { return IndexId{1}; }
+
 private:
     const std::shared_ptr<const TableSchema> table_ =
         std::make_shared<const TableSchema>(TableSchema{
@@ -99,13 +105,37 @@ void printOutline(const PlanNode& plan) {
     std::visit([](const auto& op) {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan>) std::cout << "CreateTable";
+        else if constexpr (std::is_same_v<T, CreateIndexPlan>) std::cout << "CreateIndex";
+        else if constexpr (std::is_same_v<T, AlterTablePlan>) std::cout << "AlterTable";
+        else if constexpr (std::is_same_v<T, DropTablePlan>) std::cout << "DropTable";
+        else if constexpr (std::is_same_v<T, DropIndexPlan>) std::cout << "DropIndex";
         else if constexpr (std::is_same_v<T, InsertPlan>) std::cout << "Insert";
         else if constexpr (std::is_same_v<T, SeqScanPlan>) std::cout << "SeqScan";
+        else if constexpr (std::is_same_v<T, IndexScanPlan>) std::cout << "IndexScan";
+        else if constexpr (std::is_same_v<T, EmptyResultPlan>) std::cout << "EmptyResult";
+        else if constexpr (std::is_same_v<T, NestedLoopJoinPlan> ||
+                           std::is_same_v<T, SetOperationPlan>) {
+            if constexpr (std::is_same_v<T, NestedLoopJoinPlan>)
+                std::cout << "NestedLoopJoin -> (";
+            else std::cout << "SetOperation -> (";
+            printOutline(*op.left);
+            std::cout << ", ";
+            printOutline(*op.right);
+            std::cout << ")";
+        }
+        else if constexpr (std::is_same_v<T, DerivedTablePlan>) {
+            std::cout << "DerivedTable -> ";
+            printOutline(*op.input);
+        }
         else {
             if constexpr (std::is_same_v<T, FilterPlan>) std::cout << "Filter";
+            else if constexpr (std::is_same_v<T, GroupByPlan>) std::cout << "GroupBy";
+            else if constexpr (std::is_same_v<T, AggregatePlan>) std::cout << "Aggregate";
+            else if constexpr (std::is_same_v<T, SortPlan>) std::cout << "Sort";
             else if constexpr (std::is_same_v<T, ProjectPlan>) std::cout << "Project";
             else if constexpr (std::is_same_v<T, UpdatePlan>) std::cout << "Update";
             else if constexpr (std::is_same_v<T, DeletePlan>) std::cout << "Delete";
+            else if constexpr (std::is_same_v<T, ExplainPlan>) std::cout << "Explain";
             std::cout << " -> ";
             printOutline(*op.input);
         }

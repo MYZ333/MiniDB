@@ -129,6 +129,9 @@ std::string errorName(ErrorCode code) {
     case ErrorCode::ExpressionTooDeep: return "ExpressionTooDeep";
     case ErrorCode::NotImplemented: return "NotImplemented";
     case ErrorCode::UnsupportedFeature: return "UnsupportedFeature";
+    case ErrorCode::DuplicateIndex: return "DuplicateIndex";
+    case ErrorCode::IndexNotFound: return "IndexNotFound";
+    case ErrorCode::UnsupportedIndex: return "UnsupportedIndex";
     default: return "Error";
     }
 }
@@ -445,6 +448,10 @@ void printStatement(const Statement& statement, int index, bool print_header = t
                 }
                 std::cout << ")\n";
             }
+        } else if constexpr (std::is_same_v<T, CreateIndexStmt>) {
+            printIndent(1);
+            std::cout << "CreateIndex " << stmt.index.text << " ON "
+                      << stmt.table.text << "(" << stmt.column.text << ")\n";
         } else if constexpr (std::is_same_v<T, AlterTableStmt>) {
             printIndent(1);
             std::cout << "AlterTable " << stmt.table.text << '\n';
@@ -479,6 +486,11 @@ void printStatement(const Statement& statement, int index, bool print_header = t
                 std::cout << " " << table.text;
             }
             std::cout << '\n';
+        } else if constexpr (std::is_same_v<T, DropIndexStmt>) {
+            printIndent(1);
+            std::cout << "DropIndex";
+            if (stmt.if_exists) std::cout << " IF EXISTS";
+            std::cout << " " << stmt.index.text << '\n';
         } else if constexpr (std::is_same_v<T, InsertStmt>) {
             printIndent(1);
             std::cout << "Insert " << stmt.table.text << '\n';

@@ -67,6 +67,9 @@ bool relationOccurs(const PlanPtr& plan, const BoundColumnRef& ref,
         if constexpr (std::is_same_v<T, SeqScanPlan>) {
             return op.table && op.table->id.value == ref.table_id.value &&
                    op.relation_id == ref.relation_id;
+        } else if constexpr (std::is_same_v<T, IndexScanPlan>) {
+            return op.table && op.table->id.value == ref.table_id.value &&
+                   op.relation_id == ref.relation_id;
         } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
             for (const auto& column : op.columns)
                 if (sameRef(column, ref)) return true;
@@ -143,15 +146,20 @@ Result<PlanPtr> pruneNode(const PlanPtr& plan, RequiredColumns required,
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan> ||
+                      std::is_same_v<T, CreateIndexPlan> ||
                       std::is_same_v<T, AlterTablePlan> ||
                       std::is_same_v<T, DropTablePlan> ||
+                      std::is_same_v<T, DropIndexPlan> ||
                       std::is_same_v<T, InsertPlan>) return plan;
-        else if constexpr (std::is_same_v<T, SeqScanPlan>) {
-            if (!op.table) return invalid("SeqScan table is missing during column pruning");
+        else if constexpr (std::is_same_v<T, SeqScanPlan> ||
+                           std::is_same_v<T, IndexScanPlan>) {
+            if (!op.table) return invalid("scan table is missing during column pruning");
             RequiredColumns selected;
             std::vector<OutputColumn> output;
             for (std::size_t ordinal = 0; ordinal < op.table->columns.size(); ++ordinal) {
-                const auto ref = tableColumn(op, ordinal);
+                const auto& column = op.table->columns[ordinal];
+                const auto ref = BoundColumnRef{
+                    op.table->id, column.id, ordinal, column.type, op.relation_id};
                 if (!contains(required, ref)) continue;
                 selected.push_back(ref);
                 output.push_back({op.table->columns[ordinal].name,
@@ -160,16 +168,23 @@ Result<PlanPtr> pruneNode(const PlanPtr& plan, RequiredColumns required,
             for (const auto& ref : required) {
                 if (ref.table_id.value == op.table->id.value &&
                     ref.relation_id == op.relation_id && !contains(selected, ref))
-                    return invalid("SeqScan required column does not match its table schema");
+                    return invalid("scan required column does not match its table schema");
             }
             // 全列仍用 nullopt，保持老协议和未裁剪计划的紧凑表示。
             std::optional<RequiredColumns> selection = selected.size() == op.table->columns.size()
                 ? std::nullopt : std::optional<RequiredColumns>{selected};
             if (sameSelection(op.columns, selection) && sameOutput(plan->output, output))
                 return plan;
-            return rebuild(plan, SeqScanPlan{op.table, op.relation_id, op.relation_name,
-                                             std::move(selection)},
-                           std::move(output), plan->carries_row_id);
+            if constexpr (std::is_same_v<T, SeqScanPlan>) {
+                return rebuild(plan, SeqScanPlan{op.table, op.relation_id, op.relation_name,
+                                                 std::move(selection)},
+                               std::move(output), plan->carries_row_id);
+            } else {
+                return rebuild(plan, IndexScanPlan{op.table, op.index, op.relation_id,
+                                                   op.relation_name, op.lower, op.upper,
+                                                   std::move(selection)},
+                               std::move(output), plan->carries_row_id);
+            }
         } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
             if (op.columns.size() != plan->output.size())
                 return invalid("EmptyResult columns do not match output metadata");

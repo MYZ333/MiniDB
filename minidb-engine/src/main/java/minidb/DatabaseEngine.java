@@ -32,6 +32,15 @@ public final class DatabaseEngine {
             this(id, name, columns, List.of());
         }
     }
+    /** Durable definition of a first-version unique single-column INT index. */
+    public record IndexSchema(long id, String name, long tableId, long columnId,
+                              String keyType, boolean unique, long metadataPageId) { }
+    /** Compact metadata for the database-object explorer. */
+    public record TableSummary(long id, String name, int columnCount, int indexCount, long rowCount) { }
+    /** Read-only schema and page of rows for the Web table browser. */
+    public record TableBrowserSnapshot(TableSchema table, List<IndexSchema> indexes,
+                                       List<List<Object>> rows, long totalRows,
+                                       int offset, int limit) { }
     public record StoredRow(long id, List<Object> values) { }
     public record CommandResult(String operation, long affectedRows) implements ExecutionResult { }
     public record QueryResult(List<String> columns, List<List<Object>> rows) implements ExecutionResult { }
@@ -69,8 +78,11 @@ public final class DatabaseEngine {
     private final RecordStore records;
     private final Map<Long, TableSchema> tablesById = new LinkedHashMap<>();
     private final Map<String, TableSchema> tablesByName = new LinkedHashMap<>();
+    private final Map<Long, IndexSchema> indexesById = new LinkedHashMap<>();
+    private final Map<String, IndexSchema> indexesByName = new LinkedHashMap<>();
     private long catalogVersion;
     private long nextTableId = 1;
+    private long nextIndexId = 1;
     private Profiler activeProfiler;
     // 关联子查询执行期间保存外层行；列解析找不到本层槽位时从这里读取。
     private PlanRow correlationRow;
@@ -81,9 +93,14 @@ public final class DatabaseEngine {
         records.loadCatalog().ifPresent(catalog -> {
             catalogVersion = catalog.version();
             nextTableId = catalog.nextTableId();
+            nextIndexId = catalog.nextIndexId();
             for (TableSchema table : catalog.tables()) {
                 tablesById.put(table.id(), table);
                 tablesByName.put(normalize(table.name()), table);
+            }
+            for (IndexSchema index : catalog.indexes()) {
+                indexesById.put(index.id(), index);
+                indexesByName.put(normalize(index.name()), index);
             }
         });
     }
@@ -93,6 +110,7 @@ public final class DatabaseEngine {
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("catalogVersion", catalogVersion);
         root.put("nextTableId", nextTableId);
+        root.put("nextIndexId", nextIndexId);
         List<Object> tables = new ArrayList<>();
         for (TableSchema table : tablesById.values()) {
             Map<String, Object> encoded = new LinkedHashMap<>();
@@ -112,6 +130,9 @@ public final class DatabaseEngine {
             encoded.put("columns", columns); encoded.put("constraints", constraints); tables.add(encoded);
         }
         root.put("tables", tables);
+        List<Object> indexes = new ArrayList<>();
+        for (IndexSchema index : indexesById.values()) indexes.add(Map.of("id", index.id(), "name", index.name(), "tableId", index.tableId(), "columnId", index.columnId(), "keyType", index.keyType(), "unique", index.unique(), "metadataPageId", index.metadataPageId()));
+        root.put("indexes", indexes);
         return Json.stringify(root);
     }
 
@@ -138,15 +159,50 @@ public final class DatabaseEngine {
                 for (int ordinal : constraint.columns()) text.append(' ').append(ordinal);
                 text.append('\n');
             }
+            for (IndexSchema index : indexesById.values()) if (index.tableId() == table.id())
+                text.append("I ").append(index.id()).append(' ').append(hex(index.name())).append(' ')
+                    .append(index.tableId()).append(' ').append(index.columnId()).append(' ')
+                    .append(index.keyType()).append(' ').append(index.unique() ? 1 : 0).append(' ')
+                    .append(index.metadataPageId()).append('\n');
         }
         return text.toString();
+    }
+
+    /** Current catalog version exposed to read-only Web clients. */
+    public long catalogVersion() { return catalogVersion; }
+
+    /** Returns explorer-friendly table summaries in durable catalog order. */
+    public List<TableSummary> catalogSummaries() {
+        List<TableSummary> summaries = new ArrayList<>();
+        for (TableSchema table : tablesById.values()) {
+            long rowCount = records.scan(table.id()).size();
+            int indexCount = (int) indexesById.values().stream()
+                .filter(index -> index.tableId() == table.id()).count();
+            summaries.add(new TableSummary(table.id(), table.name(), table.columns().size(), indexCount, rowCount));
+        }
+        return List.copyOf(summaries);
+    }
+
+    /** Returns a bounded data page plus all durable metadata for one physical table. */
+    public TableBrowserSnapshot tableBrowserSnapshot(String tableName, int offset, int limit) {
+        TableSchema table = tablesByName.get(normalize(tableName));
+        if (table == null) throw new EngineException("TableNotFound", "table does not exist in engine catalog: " + tableName);
+        List<StoredRow> storedRows = records.scan(table.id());
+        int start = Math.min(offset, storedRows.size());
+        int end = Math.min(start + limit, storedRows.size());
+        List<List<Object>> rows = new ArrayList<>();
+        for (StoredRow row : storedRows.subList(start, end))
+            rows.add(java.util.Collections.unmodifiableList(new ArrayList<>(row.values())));
+        List<IndexSchema> indexes = indexesById.values().stream()
+            .filter(index -> index.tableId() == table.id()).toList();
+        return new TableBrowserSnapshot(table, indexes, List.copyOf(rows), storedRows.size(), offset, limit);
     }
 
     private static String hex(String value) { return value.isEmpty() ? "-" : java.util.HexFormat.of().formatHex(value.getBytes(StandardCharsets.UTF_8)); }
 
     private void persistCatalog() {
-        records.persistCatalog(new RecordStore.CatalogState(catalogVersion, nextTableId,
-            List.copyOf(tablesById.values())));
+        records.persistCatalog(new RecordStore.CatalogState(catalogVersion, nextTableId, nextIndexId,
+            List.copyOf(tablesById.values()), List.copyOf(indexesById.values())));
     }
 
     public List<ExecutionResult> executeProgramJson(String json) {
@@ -180,15 +236,17 @@ public final class DatabaseEngine {
     private ExecutionResult executeNodeRaw(Map<String, Object> node, String type) {
         return switch (type) {
             case "CreateTable" -> createTable(node);
+            case "CreateIndex" -> createIndex(node);
             case "AlterTable" -> alterTable(node);
             case "DropTable" -> dropTable(node);
+            case "DropIndex" -> dropIndex(node);
             case "Insert" -> insert(node);
             case "Project" -> project(node);
             case "Aggregate" -> aggregate(node);
             case "SetOperation" -> setOperation(node);
             case "Update" -> update(node);
             case "Delete" -> delete(node);
-            case "SeqScan", "EmptyResult", "DerivedTable", "NestedLoopJoin", "Filter",
+            case "SeqScan", "IndexScan", "EmptyResult", "DerivedTable", "NestedLoopJoin", "Filter",
                  "GroupBy", "Sort" ->
                 throw new EngineException("InvalidPlan", type + " cannot be an execution root");
             default -> throw new EngineException("InvalidPlan", "unknown plan node: " + type);
@@ -252,7 +310,7 @@ public final class DatabaseEngine {
             case "Filter", "GroupBy", "Aggregate", "Sort", "Project", "DerivedTable",
                  "Update", "Delete" ->
                 validateExplainTree(map(node.get("input"), type + " input"), depth + 1);
-            case "CreateTable", "AlterTable", "DropTable", "Insert", "SeqScan",
+            case "CreateTable", "CreateIndex", "AlterTable", "DropTable", "DropIndex", "Insert", "SeqScan", "IndexScan",
                  "EmptyResult" -> { }
             default -> throw new EngineException("InvalidPlan",
                 "unknown EXPLAIN plan node: " + type);
@@ -289,10 +347,12 @@ public final class DatabaseEngine {
         return switch (type) {
             case "CreateTable" -> "CreateTable [" +
                 string(node.get("tableName"), "tableName") + "]";
+            case "CreateIndex" -> "CreateIndex [" + string(node.get("indexName"), "index name") + "]";
             case "AlterTable" -> "AlterTable [" + string(
                 map(node.get("table"), "alter table").get("name"), "table name") + "]";
             case "DropTable" -> "DropTable [" + joinStrings(
                 list(node.get("tableNames"), "tableNames"), "table name") + "]";
+            case "DropIndex" -> "DropIndex [" + string(node.get("indexName"), "index name") + "]";
             case "Insert" -> {
                 Map<String, Object> table = map(node.get("table"), "insert table");
                 List<Object> rows = node.get("rows") instanceof List<?>
@@ -308,6 +368,10 @@ public final class DatabaseEngine {
                 yield "SeqScan [" + tableName +
                     (relation.isEmpty() || relation.equals(tableName) ? "" : " AS " + relation) +
                     "; columns=" + describeScanColumns(node) + "]";
+            }
+            case "IndexScan" -> {
+                Map<String, Object> index = map(node.get("index"), "index scan index");
+                yield "IndexScan [" + string(index.get("name"), "index name") + "]";
             }
             case "EmptyResult" -> {
                 emptyLayout(node);
@@ -619,6 +683,8 @@ public final class DatabaseEngine {
                 throw new EngineException("InvalidPlan", "column ordinal is out of range");
             if (columns.size() == 1)
                 throw new EngineException("EmptyColumnList", "cannot drop the last table column");
+            if (indexesFor(table.id()).stream().anyMatch(index -> index.columnId() == columns.get(ordinal).id()))
+                throw new EngineException("ConstraintViolation", "cannot drop a column used by an index");
             for (TableConstraint constraint : constraints)
                 if (constraint.columns().contains(ordinal))
                     throw new EngineException("ConstraintViolation",
@@ -663,6 +729,7 @@ public final class DatabaseEngine {
         }
         tablesById.put(changed.id(), changed);
         tablesByName.put(changed.name(), changed);
+        if (actionType.equals("AddColumn") || actionType.equals("DropColumn")) rebuildIndexes(changed);
         catalogVersion++;
         persistCatalog();
         return new CommandResult("ALTER", 0);
@@ -686,6 +753,10 @@ public final class DatabaseEngine {
         for (String name : names) {
             TableSchema table = tablesByName.remove(name);
             if (table == null) continue;
+            for (IndexSchema index : indexesFor(table.id())) {
+                records.dropIndex(index.metadataPageId());
+                indexesById.remove(index.id()); indexesByName.remove(index.name());
+            }
             records.dropTable(table.id());
             tablesById.remove(table.id());
             removed++;
@@ -695,6 +766,83 @@ public final class DatabaseEngine {
             persistCatalog();
         }
         return new CommandResult("DROP", removed);
+    }
+
+    private CommandResult createIndex(Map<String, Object> node) {
+        String name = normalize(string(node.get("indexName"), "index name"));
+        if (indexesByName.containsKey(name)) throw new EngineException("ConstraintViolation", "index already exists: " + name);
+        long requestedId = longValue(node.get("indexId"), "index id");
+        if (requestedId != nextIndexId) throw new EngineException("InvalidPlan", "unexpected index id");
+        TableSchema table = resolveTable(map(node.get("table"), "index table"));
+        Map<String, Object> column = map(node.get("column"), "index column");
+        long columnId = longValue(column.get("columnId"), "index column id");
+        ColumnSchema target = table.columns().stream().filter(c -> c.id() == columnId).findFirst()
+            .orElseThrow(() -> new EngineException("InvalidPlan", "index column does not belong to table"));
+        if (!"INT".equals(string(node.get("keyType"), "index key type")) || !optionalBoolean(node.get("unique"), false) ||
+            !"INT".equals(target.type()) || !target.notNull())
+            throw new EngineException("UnsupportedIndex", "only unique NOT NULL INT indexes are supported");
+        RecordStore.IndexState state = records.createIndex(requestedId);
+        IndexSchema index = new IndexSchema(requestedId, name, table.id(), columnId, "INT", true, state.metadataPageId());
+        try {
+            RecordStore.Index handle = records.openIndex(state.metadataPageId());
+            for (StoredRow row : records.scan(table.id())) handle.insert(indexKey(index, table, row.values()), row.id());
+        } catch (RuntimeException failure) {
+            records.dropIndex(state.metadataPageId());
+            throw failure;
+        }
+        indexesById.put(index.id(), index); indexesByName.put(index.name(), index); nextIndexId++;
+        catalogVersion++; persistCatalog();
+        return new CommandResult("CREATE INDEX", 0);
+    }
+
+    private CommandResult dropIndex(Map<String, Object> node) {
+        boolean ifExists = optionalBoolean(node.get("ifExists"), false);
+        String name = normalize(string(node.get("indexName"), "index name"));
+        IndexSchema index = indexesByName.get(name);
+        if (index == null) {
+            if (ifExists) return new CommandResult("DROP INDEX", 0);
+            throw new EngineException("IndexNotFound", "index does not exist: " + name);
+        }
+        Map<String, Object> expected = map(node.get("index"), "index");
+        if (longValue(expected.get("id"), "index id") != index.id() ||
+            longValue(expected.get("tableId"), "index table id") != index.tableId())
+            throw new EngineException("InvalidPlan", "index identity does not match catalog");
+        records.dropIndex(index.metadataPageId());
+        indexesById.remove(index.id()); indexesByName.remove(index.name()); catalogVersion++; persistCatalog();
+        return new CommandResult("DROP INDEX", 0);
+    }
+
+    private List<IndexSchema> indexesFor(long tableId) {
+        return indexesById.values().stream().filter(index -> index.tableId() == tableId).toList();
+    }
+
+    private long indexKey(IndexSchema index, TableSchema table, List<Object> values) {
+        int ordinal = -1;
+        for (int i = 0; i < table.columns().size(); i++) if (table.columns().get(i).id() == index.columnId()) { ordinal = i; break; }
+        if (ordinal < 0 || !(values.get(ordinal) instanceof Long key))
+            throw new EngineException("UnsupportedIndex", "index key must be a non-NULL INT");
+        return key;
+    }
+
+    private void validateIndexKeys(TableSchema table, List<List<Object>> rows) {
+        for (IndexSchema index : indexesFor(table.id())) {
+            Set<Long> keys = new HashSet<>();
+            for (List<Object> row : rows) if (!keys.add(indexKey(index, table, row)))
+                throw new EngineException("ConstraintViolation", "duplicate index key: " + index.name());
+        }
+    }
+
+    /** Rebuild after row relocation so every persisted key points at the final record location. */
+    private void rebuildIndexes(TableSchema table) {
+        for (IndexSchema old : indexesFor(table.id())) {
+            RecordStore.IndexState state = records.createIndex(old.id());
+            IndexSchema replacement = new IndexSchema(old.id(), old.name(), old.tableId(), old.columnId(), old.keyType(), old.unique(), state.metadataPageId());
+            try {
+                RecordStore.Index handle = records.openIndex(state.metadataPageId());
+                for (StoredRow row : records.scan(table.id())) handle.insert(indexKey(replacement, table, row.values()), row.id());
+            } catch (RuntimeException error) { records.dropIndex(state.metadataPageId()); throw error; }
+            records.dropIndex(old.metadataPageId()); indexesById.put(replacement.id(), replacement); indexesByName.put(replacement.name(), replacement);
+        }
     }
 
     private CommandResult insert(Map<String, Object> node) {
@@ -710,7 +858,9 @@ public final class DatabaseEngine {
             finalRows.add(new ArrayList<>(present.values()));
         finalRows.addAll(rows);
         validateFinalRows(table, finalRows);
+        validateIndexKeys(table, finalRows);
         for (List<Object> row : rows) records.insert(table.id(), row);
+        rebuildIndexes(table); persistCatalog();
         return new CommandResult("INSERT", rows.size());
     }
 
@@ -1060,8 +1210,10 @@ public final class DatabaseEngine {
         for (StoredRow present : records.scan(table.id()))
             finalRows.add(replacements.getOrDefault(present.id(), present.values()));
         validateFinalRows(table, finalRows);
+        validateIndexKeys(table, finalRows);
         for (Map.Entry<Long, List<Object>> replacement : replacements.entrySet())
             records.replace(table.id(), replacement.getKey(), replacement.getValue());
+        rebuildIndexes(table); persistCatalog();
         return new CommandResult("UPDATE", replacements.size());
     }
 
@@ -1075,6 +1227,7 @@ public final class DatabaseEngine {
             records.erase(table.id(), rowIdFor(table, row));
             affected++;
         }
+        rebuildIndexes(table); persistCatalog();
         return new CommandResult("DELETE", affected);
     }
 
@@ -1091,6 +1244,7 @@ public final class DatabaseEngine {
     private List<PlanRow> readInputRaw(Map<String, Object> node, String type) {
         return switch (type) {
             case "SeqScan" -> scan(node);
+            case "IndexScan" -> indexScan(node);
             case "EmptyResult" -> emptyResult(node);
             case "DerivedTable" -> derivedTable(node);
             case "Filter" -> filter(node);
@@ -1132,6 +1286,31 @@ public final class DatabaseEngine {
             if (row.values().size() != table.columns().size())
                 throw new EngineException("StorageFailure", "stored row does not match table schema");
             // 存储层仍保存完整记录；执行层只物化优化器请求的列。
+            List<Object> values = new ArrayList<>();
+            for (ColumnSlot slot : layout) values.add(row.values().get(slot.ordinal()));
+            result.add(new PlanRow(Map.of(relationId, row.id()), layout, values));
+        }
+        return result;
+    }
+
+    /** Resolves B+ tree RowIds, then leaves the original Filter above this node for SQL semantics. */
+    private List<PlanRow> indexScan(Map<String, Object> node) {
+        TableSchema table = resolveTable(map(node.get("table"), "index scan table"));
+        Map<String, Object> encoded = map(node.get("index"), "index scan index");
+        IndexSchema index = indexesById.get(longValue(encoded.get("id"), "index id"));
+        if (index == null || index.tableId() != table.id() || !index.name().equals(string(encoded.get("name"), "index name")) ||
+            !index.keyType().equals(string(encoded.get("keyType"), "index key type")) || index.unique() != optionalBoolean(encoded.get("unique"), false))
+            throw new EngineException("InvalidPlan", "index scan does not match catalog");
+        long relationId = optionalLong(node.get("relationId"), table.id());
+        List<ColumnSlot> layout = scanLayout(node, table, relationId);
+        Map<String, Object> range = map(node.get("keyRange"), "key range");
+        Long lower = nodeLong(range.get("lower")), upper = nodeLong(range.get("upper"));
+        boolean lowerInclusive = lower == null || optionalBoolean(range.get("lowerInclusive"), false);
+        boolean upperInclusive = upper == null || optionalBoolean(range.get("upperInclusive"), false);
+        List<PlanRow> result = new ArrayList<>();
+        for (RecordStore.IndexRow hit : records.openIndex(index.metadataPageId()).range(lower, lowerInclusive, upper, upperInclusive)) {
+            StoredRow row = records.read(table.id(), hit.rowId()).orElse(null);
+            if (row == null || row.values().size() != table.columns().size()) continue;
             List<Object> values = new ArrayList<>();
             for (ColumnSlot slot : layout) values.add(row.values().get(slot.ordinal()));
             result.add(new PlanRow(Map.of(relationId, row.id()), layout, values));

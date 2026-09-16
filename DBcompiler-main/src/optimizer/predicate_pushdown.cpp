@@ -164,10 +164,13 @@ Result<PlanPtr> pushNode(const PlanPtr& plan, std::size_t depth) {
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, CreateTablePlan> ||
+                      std::is_same_v<T, CreateIndexPlan> ||
                       std::is_same_v<T, AlterTablePlan> ||
                       std::is_same_v<T, DropTablePlan> ||
+                      std::is_same_v<T, DropIndexPlan> ||
                       std::is_same_v<T, InsertPlan> ||
                       std::is_same_v<T, SeqScanPlan> ||
+                      std::is_same_v<T, IndexScanPlan> ||
                       std::is_same_v<T, EmptyResultPlan>) return plan;
         else if constexpr (std::is_same_v<T, NestedLoopJoinPlan>) {
             auto left_result = pushNode(op.left, depth + 1);

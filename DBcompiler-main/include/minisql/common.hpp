@@ -76,7 +76,8 @@ enum class ErrorCode {
     InvalidAst, ExpressionTooDeep, // 防御手工/外部 AST 的空子节点和过深嵌套。
     InvalidPlan, // 优化入口发现缺失子节点或不满足基本结构约定的计划。
     UnsupportedFeature, // 已识别但当前阶段尚未定义行为的语法。
-    AmbiguousColumn, DuplicateTable, InvalidGrouping, JoinConditionNotBoolean
+    AmbiguousColumn, DuplicateTable, DuplicateIndex, IndexNotFound,
+    UnsupportedIndex, InvalidGrouping, JoinConditionNotBoolean
 };
 
 struct Diagnostic {

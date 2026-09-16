@@ -23,6 +23,7 @@ add_library(minisql_backend STATIC
     src/planner/plan_printer.cpp
     src/optimizer/constant_fold.cpp
     src/optimizer/predicate_pushdown.cpp
+    src/optimizer/index_scan.cpp
     src/optimizer/empty_result.cpp
     src/optimizer/column_pruning.cpp
     src/optimizer/optimizer.cpp)
@@ -57,6 +58,11 @@ function(minisql_warnings target)
     set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /utf-8)
+        get_target_property(target_type ${target} TYPE)
+        if(NOT target_type STREQUAL "STATIC_LIBRARY" AND
+           NOT target_type STREQUAL "INTERFACE_LIBRARY")
+            target_link_options(${target} PRIVATE /STACK:8388608)
+        endif()
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()

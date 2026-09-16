@@ -28,8 +28,21 @@ if errorlevel 1 (
     popd
     exit /b 1
 )
+rem Maven can retain stale nested-record class files after an interface shape change.
+rem Compile all production sources explicitly before recreating the runnable jar.
+dir /s /b "src\main\java\*.java" > "target\minidb-sources.txt"
+javac --release 17 --add-modules jdk.httpserver -d "target\classes" @"target\minidb-sources.txt"
+if errorlevel 1 (
+    popd
+    exit /b 1
+)
+call mvn "-Dmaven.repo.local=target\maven-repo" jar:jar
+if errorlevel 1 (
+    popd
+    exit /b 1
+)
 popd
 
 echo [3/3] Starting MiniDB Web at http://localhost:8080
 echo [INFO] The Web service remains running until you press Ctrl+C in this window.
-java --add-modules jdk.httpserver "-Dminidb.compiler.path=%PLAN_EXPORTER%" -Dminidb.web.openBrowser=true -jar "%JAR%" web
+java --add-modules jdk.httpserver "-Dminidb.compiler.path=%PLAN_EXPORTER%" "-Dminidb.data.path=%ROOT%data\minidb-index.db" -Dminidb.web.openBrowser=true -jar "%JAR%" web

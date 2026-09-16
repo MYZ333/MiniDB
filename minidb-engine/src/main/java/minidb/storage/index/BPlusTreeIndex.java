@@ -11,7 +11,7 @@ import minidb.storage.PageGuard;
 import minidb.storage.StorageException;
 
 /**
- * Persistent unique B+ tree from a signed 32-bit integer key to a {@link RowId}.
+ * Persistent unique B+ tree from a signed 64-bit integer key to a {@link RowId}.
  *
  * <p>The metadata page id is stable. Root changes caused by splits are stored in
  * that page, so callers only need to persist {@link #metadataPageId()}.</p>
@@ -19,16 +19,16 @@ import minidb.storage.StorageException;
 public final class BPlusTreeIndex implements IntIndex {
     private static final int META_MAGIC = 0x4250544D; // BPTM
     private static final int NODE_MAGIC = 0x4250544E; // BPTN
-    private static final int FORMAT_VERSION = 1;
+    private static final int FORMAT_VERSION = 2;
     private static final int TYPE_LEAF = 1;
     private static final int TYPE_INTERNAL = 2;
 
     private static final int NODE_HEADER_SIZE = 20;
-    private static final int LEAF_ENTRY_SIZE = 12;
+    private static final int LEAF_ENTRY_SIZE = Long.BYTES + 2 * Integer.BYTES;
     private static final int LEAF_MAX_KEYS =
             (Page.PAGE_SIZE - NODE_HEADER_SIZE) / LEAF_ENTRY_SIZE;
     private static final int INTERNAL_MAX_KEYS =
-            (Page.PAGE_SIZE - NODE_HEADER_SIZE - Integer.BYTES) / (2 * Integer.BYTES);
+            (Page.PAGE_SIZE - NODE_HEADER_SIZE - Integer.BYTES) / (Long.BYTES + Integer.BYTES);
 
     private final BufferPool bufferPool;
     private final int metadataPageId;
@@ -90,7 +90,7 @@ public final class BPlusTreeIndex implements IntIndex {
     }
 
     @Override
-    public synchronized void insert(int key, RowId rowId)
+    public synchronized void insert(long key, RowId rowId)
             throws StorageException, IndexException {
         Objects.requireNonNull(rowId, "rowId");
         Split split = insertRecursive(rootPageId, key, rowId);
@@ -106,7 +106,7 @@ public final class BPlusTreeIndex implements IntIndex {
     }
 
     @Override
-    public synchronized Optional<RowId> search(int key)
+    public synchronized Optional<RowId> search(long key)
             throws StorageException, IndexException {
         Node leaf = findLeaf(key);
         int position = lowerBound(leaf.keys, key);
@@ -117,7 +117,7 @@ public final class BPlusTreeIndex implements IntIndex {
     }
 
     @Override
-    public synchronized List<IndexEntry> range(int fromInclusive, int toInclusive)
+    public synchronized List<IndexEntry> range(long fromInclusive, long toInclusive)
             throws StorageException, IndexException {
         if (fromInclusive > toInclusive) {
             return List.of();
@@ -129,7 +129,7 @@ public final class BPlusTreeIndex implements IntIndex {
 
         while (true) {
             for (int i = position; i < leaf.keys.size(); i++) {
-                int key = leaf.keys.get(i);
+                long key = leaf.keys.get(i);
                 if (key > toInclusive) {
                     return List.copyOf(result);
                 }
@@ -145,17 +145,16 @@ public final class BPlusTreeIndex implements IntIndex {
     }
 
     @Override
-    public synchronized boolean delete(int key) throws StorageException, IndexException {
-        Node leaf = findLeaf(key);
-        int position = lowerBound(leaf.keys, key);
-        if (position >= leaf.keys.size() || leaf.keys.get(position) != key) {
-            return false;
-        }
-
-        leaf.keys.remove(position);
-        leaf.rowIds.remove(position);
-        writeNode(leaf);
-        size--;
+    public synchronized boolean delete(long key) throws StorageException, IndexException {
+        if (search(key).isEmpty()) return false;
+        // Rebuild the reachable tree after removal.  This deliberately trades deletion
+        // throughput for a compact, fully balanced tree without leaving underfull nodes.
+        List<IndexEntry> entries = range(Long.MIN_VALUE, Long.MAX_VALUE);
+        freeSubtree(rootPageId);
+        rootPageId = allocateNode(bufferPool, Node.leaf(-1));
+        size = 0;
+        for (IndexEntry entry : entries)
+            if (entry.key() != key) insert(entry.key(), entry.rowId());
         persistMetadata();
         return true;
     }
@@ -170,7 +169,19 @@ public final class BPlusTreeIndex implements IntIndex {
         return size;
     }
 
-    private Split insertRecursive(int pageId, int key, RowId rowId)
+    /** Releases every reachable node and the metadata page.  The caller must remove its catalog entry. */
+    public synchronized void destroy() throws StorageException, IndexException {
+        freeSubtree(rootPageId);
+        bufferPool.freePage(metadataPageId);
+    }
+
+    private void freeSubtree(int pageId) throws StorageException, IndexException {
+        Node node = readNode(pageId);
+        if (!node.leaf) for (int child : node.children) freeSubtree(child);
+        bufferPool.freePage(pageId);
+    }
+
+    private Split insertRecursive(int pageId, long key, RowId rowId)
             throws StorageException, IndexException {
         Node node = readNode(pageId);
         if (node.leaf) {
@@ -222,7 +233,7 @@ public final class BPlusTreeIndex implements IntIndex {
 
     private Split splitInternal(Node left) throws StorageException, IndexException {
         int middle = left.keys.size() / 2;
-        int separator = left.keys.get(middle);
+        long separator = left.keys.get(middle);
 
         Node right = Node.internal(-1);
         right.keys.addAll(left.keys.subList(middle + 1, left.keys.size()));
@@ -236,7 +247,7 @@ public final class BPlusTreeIndex implements IntIndex {
         return new Split(separator, rightPageId);
     }
 
-    private Node findLeaf(int key) throws StorageException, IndexException {
+    private Node findLeaf(long key) throws StorageException, IndexException {
         Node node = readNode(rootPageId);
         while (!node.leaf) {
             int childPosition = upperBound(node.keys, key);
@@ -304,9 +315,9 @@ public final class BPlusTreeIndex implements IntIndex {
         int offset = NODE_HEADER_SIZE;
         if (leaf) {
             for (int i = 0; i < keyCount; i++) {
-                int key = data.getInt(offset);
-                int dataPageId = data.getInt(offset + 4);
-                int slotId = data.getInt(offset + 8);
+                long key = data.getLong(offset);
+                int dataPageId = data.getInt(offset + Long.BYTES);
+                int slotId = data.getInt(offset + Long.BYTES + Integer.BYTES);
                 require(dataPageId >= 0 && slotId >= 0,
                         "invalid row id at page " + pageId);
                 node.keys.add(key);
@@ -319,12 +330,12 @@ public final class BPlusTreeIndex implements IntIndex {
             node.children.add(firstChild);
             offset += Integer.BYTES;
             for (int i = 0; i < keyCount; i++) {
-                int key = data.getInt(offset);
-                int child = data.getInt(offset + 4);
+                long key = data.getLong(offset);
+                int child = data.getInt(offset + Long.BYTES);
                 require(child >= 0, "invalid child page at page " + pageId);
                 node.keys.add(key);
                 node.children.add(child);
-                offset += 2 * Integer.BYTES;
+                offset += Long.BYTES + Integer.BYTES;
             }
         }
         validateSorted(node.keys, pageId);
@@ -353,30 +364,30 @@ public final class BPlusTreeIndex implements IntIndex {
         if (node.leaf) {
             for (int i = 0; i < node.keys.size(); i++) {
                 RowId rowId = node.rowIds.get(i);
-                data.putInt(offset, node.keys.get(i));
-                data.putInt(offset + 4, rowId.pageId());
-                data.putInt(offset + 8, rowId.slotId());
+                data.putLong(offset, node.keys.get(i));
+                data.putInt(offset + Long.BYTES, rowId.pageId());
+                data.putInt(offset + Long.BYTES + Integer.BYTES, rowId.slotId());
                 offset += LEAF_ENTRY_SIZE;
             }
         } else {
             data.putInt(offset, node.children.get(0));
             offset += Integer.BYTES;
             for (int i = 0; i < node.keys.size(); i++) {
-                data.putInt(offset, node.keys.get(i));
-                data.putInt(offset + 4, node.children.get(i + 1));
-                offset += 2 * Integer.BYTES;
+                data.putLong(offset, node.keys.get(i));
+                data.putInt(offset + Long.BYTES, node.children.get(i + 1));
+                offset += Long.BYTES + Integer.BYTES;
             }
         }
     }
 
-    private static void validateSorted(List<Integer> keys, int pageId) throws IndexException {
+    private static void validateSorted(List<Long> keys, int pageId) throws IndexException {
         for (int i = 1; i < keys.size(); i++) {
             require(keys.get(i - 1) < keys.get(i),
                     "keys are not strictly sorted at page " + pageId);
         }
     }
 
-    private static int lowerBound(List<Integer> keys, int target) {
+    private static int lowerBound(List<Long> keys, long target) {
         int low = 0;
         int high = keys.size();
         while (low < high) {
@@ -390,7 +401,7 @@ public final class BPlusTreeIndex implements IntIndex {
         return low;
     }
 
-    private static int upperBound(List<Integer> keys, int target) {
+    private static int upperBound(List<Long> keys, long target) {
         int low = 0;
         int high = keys.size();
         while (low < high) {
@@ -416,13 +427,13 @@ public final class BPlusTreeIndex implements IntIndex {
         }
     }
 
-    private record Split(int separatorKey, int rightPageId) {
+    private record Split(long separatorKey, int rightPageId) {
     }
 
     private static final class Node {
         private int pageId;
         private final boolean leaf;
-        private final List<Integer> keys = new ArrayList<>();
+        private final List<Long> keys = new ArrayList<>();
         private final List<RowId> rowIds = new ArrayList<>();
         private final List<Integer> children = new ArrayList<>();
         private int nextLeafPageId = -1;

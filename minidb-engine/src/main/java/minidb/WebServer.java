@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -99,10 +100,14 @@ public final class WebServer implements AutoCloseable {
             URI request = exchange.getRequestURI();
             String path = request.getPath();
             if (path.equals("/api/health")) { health(exchange); return; }
+            if (path.equals("/api/catalog")) { catalog(exchange); return; }
+            if (path.startsWith("/api/tables/")) { tableBrowser(exchange, request, path.substring("/api/tables/".length())); return; }
             if (path.equals("/api/execute")) { execute(exchange); return; }
             if (path.equals("/") || path.equals("/index.html")) { resource(exchange, "/web/index.html", "text/html; charset=utf-8"); return; }
+            if (path.equals("/table-browser.html")) { resource(exchange, "/web/table-browser.html", "text/html; charset=utf-8"); return; }
             if (path.equals("/app.css")) { resource(exchange, "/web/app.css", "text/css; charset=utf-8"); return; }
             if (path.equals("/app.js")) { resource(exchange, "/web/app.js", "application/javascript; charset=utf-8"); return; }
+            if (path.equals("/table-browser.js")) { resource(exchange, "/web/table-browser.js", "application/javascript; charset=utf-8"); return; }
             reply(exchange, 404, error("http", "NotFound", "resource not found", null, null));
         } catch (Exception error) {
             reply(exchange, 500, error("server", "InternalError", error.getMessage() == null ? "unexpected server error" : error.getMessage(), null, null));
@@ -116,6 +121,52 @@ public final class WebServer implements AutoCloseable {
         response.put("compilerAvailable", Files.isRegularFile(Path.of(compilerPath)));
         response.put("storage", storageState());
         reply(exchange, 200, response);
+    }
+
+    private void catalog(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) { methodNotAllowed(exchange); return; }
+        synchronized (engine) {
+            List<Object> tables = new ArrayList<>();
+            for (DatabaseEngine.TableSummary table : engine.catalogSummaries()) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("id", table.id()); item.put("name", table.name()); item.put("columnCount", (long) table.columnCount());
+                item.put("indexCount", (long) table.indexCount()); item.put("rowCount", table.rowCount()); tables.add(item);
+            }
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("ok", true); response.put("catalogVersion", engine.catalogVersion()); response.put("tables", tables);
+            reply(exchange, 200, response);
+        }
+    }
+
+    private void tableBrowser(HttpExchange exchange, URI request, String encodedName) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) { methodNotAllowed(exchange); return; }
+        String tableName = URLDecoder.decode(encodedName, StandardCharsets.UTF_8);
+        if (tableName.isBlank() || tableName.contains("/")) { reply(exchange, 400, error("request", "InvalidTableName", "table name is invalid", null, null)); return; }
+        Map<String, String> query = queryParameters(request.getRawQuery());
+        int offset;
+        int limit;
+        try {
+            offset = pageParameter(query, "offset", 0, 0, Integer.MAX_VALUE);
+            limit = pageParameter(query, "limit", 100, 1, 100);
+        } catch (IllegalArgumentException problem) {
+            reply(exchange, 400, error("request", "InvalidPagination", problem.getMessage(), null, null)); return;
+        }
+        synchronized (engine) {
+            try {
+                DatabaseEngine.TableBrowserSnapshot snapshot = engine.tableBrowserSnapshot(tableName, offset, limit);
+                Map<String, Object> table = tableMap(snapshot.table(), snapshot.indexes());
+                List<String> columns = snapshot.table().columns().stream().map(DatabaseEngine.ColumnSchema::name).toList();
+                Map<String, Object> preview = new LinkedHashMap<>();
+                preview.put("columns", columns); preview.put("rows", snapshot.rows()); preview.put("totalRows", snapshot.totalRows());
+                preview.put("offset", (long) snapshot.offset()); preview.put("limit", (long) snapshot.limit());
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("ok", true); response.put("catalogVersion", engine.catalogVersion()); response.put("table", table); response.put("preview", preview);
+                reply(exchange, 200, response);
+            } catch (EngineException problem) {
+                int status = problem.code().equals("TableNotFound") ? 404 : 422;
+                reply(exchange, status, error("engine", problem.code(), problem.getMessage(), problem.line(), problem.column()));
+            }
+        }
     }
 
     private void execute(HttpExchange exchange) throws IOException {
@@ -164,6 +215,54 @@ public final class WebServer implements AutoCloseable {
             mapped.add(item);
         }
         return mapped;
+    }
+
+    private static Map<String, Object> tableMap(DatabaseEngine.TableSchema schema, List<DatabaseEngine.IndexSchema> indexes) {
+        Map<String, Object> table = new LinkedHashMap<>();
+        table.put("id", schema.id()); table.put("name", schema.name());
+        List<Object> columns = new ArrayList<>();
+        for (DatabaseEngine.ColumnSchema column : schema.columns()) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", column.id()); item.put("name", column.name()); item.put("type", column.type());
+            item.put("varcharLength", column.varcharLength()); item.put("primaryKey", column.primaryKey());
+            item.put("notNull", column.notNull()); item.put("unique", column.unique());
+            item.put("hasDefault", column.hasDefault()); item.put("defaultValue", column.defaultValue()); columns.add(item);
+        }
+        List<Object> constraints = new ArrayList<>();
+        for (DatabaseEngine.TableConstraint constraint : schema.constraints())
+            constraints.add(Map.of("kind", constraint.kind(), "columns", constraint.columns()));
+        List<Object> indexMaps = new ArrayList<>();
+        for (DatabaseEngine.IndexSchema index : indexes) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", index.id()); item.put("name", index.name()); item.put("columnId", index.columnId());
+            item.put("keyType", index.keyType()); item.put("unique", index.unique()); indexMaps.add(item);
+        }
+        table.put("columns", columns); table.put("constraints", constraints); table.put("indexes", indexMaps);
+        return table;
+    }
+
+    private static Map<String, String> queryParameters(String rawQuery) {
+        Map<String, String> values = new LinkedHashMap<>();
+        if (rawQuery == null || rawQuery.isBlank()) return values;
+        for (String part : rawQuery.split("&")) {
+            String[] keyValue = part.split("=", 2);
+            String key = URLDecoder.decode(keyValue[0], StandardCharsets.UTF_8);
+            String value = keyValue.length == 2 ? URLDecoder.decode(keyValue[1], StandardCharsets.UTF_8) : "";
+            values.put(key, value);
+        }
+        return values;
+    }
+
+    private static int pageParameter(Map<String, String> query, String key, int fallback, int min, int max) {
+        String raw = query.get(key);
+        if (raw == null) return fallback;
+        try {
+            int value = Integer.parseInt(raw);
+            if (value < min || value > max) throw new NumberFormatException();
+            return value;
+        } catch (NumberFormatException problem) {
+            throw new IllegalArgumentException(key + " must be an integer from " + min + " to " + max);
+        }
     }
 
     private Map<String, Object> storageState() {

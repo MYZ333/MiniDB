@@ -213,6 +213,39 @@ void testDropTable() {
     expectSyntaxError("DROP TABLE t,;");
 }
 
+void testIndexStatements() {
+    const auto statements = parseOk(
+        "CREATE INDEX idx_student_id ON student(id);"
+        "DROP INDEX idx_student_id;"
+        "DROP INDEX IF EXISTS idx_missing;"
+        "EXPLAIN CREATE INDEX idx_age ON student(age);");
+    require(statements.size() == 4, "expected four index statements");
+
+    const auto& create = std::get<CreateIndexStmt>(statements[0].node);
+    require(create.index.text == "idx_student_id" &&
+                create.table.text == "student" &&
+                create.column.text == "id",
+            "CREATE INDEX AST payload mismatch");
+
+    const auto& drop = std::get<DropIndexStmt>(statements[1].node);
+    require(!drop.if_exists && drop.index.text == "idx_student_id",
+            "DROP INDEX AST payload mismatch");
+
+    const auto& guarded = std::get<DropIndexStmt>(statements[2].node);
+    require(guarded.if_exists && guarded.index.text == "idx_missing",
+            "DROP INDEX IF EXISTS AST payload mismatch");
+
+    const auto& explain = std::get<ExplainStmt>(statements[3].node);
+    require(std::holds_alternative<CreateIndexStmt>(explain.target),
+            "EXPLAIN should accept CREATE INDEX");
+
+    expectSyntaxError("CREATE INDEX idx student(id);");
+    expectSyntaxError("CREATE INDEX idx ON student();");
+    expectSyntaxError("CREATE INDEX idx ON student(id, age);");
+    expectSyntaxError("DROP INDEX;");
+    expectSyntaxError("DROP INDEX IF idx;");
+}
+
 void testSelectStarAndEmptyInput() {
     const auto empty = parseOk("   -- only comment\n");
     require(empty.empty(), "empty input should parse as zero statements");
@@ -958,6 +991,7 @@ int main() {
         testStatements();
         testMultiRowInsert();
         testDropTable();
+        testIndexStatements();
         testSelectStarAndEmptyInput();
         testDistinctSelect();
         testSelectExpressionItems();

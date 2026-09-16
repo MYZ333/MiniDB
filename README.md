@@ -27,7 +27,7 @@ C++ SQL 编译器 ── JSON 逻辑执行计划 ──► Java 数据库引擎
 - Java 执行引擎负责 AlterTable、DerivedTable、SetOperation 等全部计划节点的实际执行、
   表模式和记录迁移、关联表达式求值、运行期错误和结果集生成。
 - `RecordStore` 是执行层与存储层的边界；后续页式存储只需实现该接口，不需改动执行器。
-- Web 演示台负责 SQL 编辑、结果表格、错误定位、执行历史和 JSON 计划展示。
+- Web 工作台负责 SQL 编辑、结果表格、错误定位、JSON 计划和持久化状态展示；表目录可打开独立的只读表浏览器，查看字段、约束、索引与分页数据。
 
 ## 快速启动
 
@@ -41,6 +41,22 @@ E:\MiniDB\run_minidb_web.bat
 
 脚本会构建 C++ 与 Java 项目，然后启动本地服务并打开：<http://localhost:8080>。
 保持脚本窗口运行；关闭窗口即停止服务。
+
+## Web 工作台与表浏览器
+
+浏览器根路径 `<http://localhost:8080>` 提供 SQL Workbench，可编辑并运行完整 SQL 脚本，
+查看命令影响行数、查询结果、错误位置与 JSON 执行计划。页面底部保留全部演示用例的用途、
+预期结果和影响说明，点击用例只会填入 SQL，不会立即执行。
+
+右侧表目录来自持久化 Catalog。点击表会打开独立页面
+`<http://localhost:8080/table-browser.html?table=表名>`，该页面以只读方式显示：
+
+- 分页数据预览，每页最多 100 行；
+- 字段类型、VARCHAR 长度、主键、NOT NULL、UNIQUE 和 DEFAULT；
+- 表级约束及索引定义。
+
+Web API 同时提供 `GET /api/catalog` 与 `GET /api/tables/{name}?offset&limit`，供页面读取目录和表快照；
+既有 `POST /api/execute` 保持不变。
 
 也可使用命令行脚本运行根目录 `demo.sql`：
 

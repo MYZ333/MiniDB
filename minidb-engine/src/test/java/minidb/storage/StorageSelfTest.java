@@ -318,8 +318,8 @@ public final class StorageSelfTest {
                 equal(false, index.delete(9999), "delete missing key");
 
                 List<IndexEntry> range = index.range(95, 105);
-                List<Integer> actualKeys = range.stream().map(IndexEntry::key).toList();
-                equal(List.of(95, 97, 98, 100, 101, 103, 104), actualKeys,
+                List<Long> actualKeys = range.stream().map(IndexEntry::key).toList();
+                equal(List.of(95L, 97L, 98L, 100L, 101L, 103L, 104L), actualKeys,
                         "ordered range after deletes");
                 pool.flushAll();
             }

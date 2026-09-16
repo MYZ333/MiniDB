@@ -60,6 +60,12 @@ EXPLAIN 的运行时采样与副作用边界见
 页面复用一个持久化引擎。每次执行前，Java 会把持久化 Catalog 提供给 C++ 计划导出器，
 因此重启后可直接执行 SELECT、INSERT 或高级查询，不必重复 CREATE TABLE。
 
+SQL Workbench 的表目录会调用 `GET /api/catalog`，并在 SQL 成功执行后刷新。选择表会进入独立的
+`/table-browser.html?table=表名` 页面；浏览器通过 `GET /api/tables/{name}?offset&limit` 读取只读快照，
+展示分页记录、列定义、表级约束和索引。单次预览最大 100 行，不支持网页内修改记录。
+
+页面中的演示用例完整保留验证目的、预期结果和可能影响，点击仅将对应 SQL 放入编辑器，不会自动执行。
+
 手工启动时需提供 C++ 导出器路径：
 
 ```powershell

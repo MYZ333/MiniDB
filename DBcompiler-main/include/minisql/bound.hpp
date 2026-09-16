@@ -87,6 +87,16 @@ struct BoundCreateTable {
     bool if_not_exists = false;
 };
 
+struct BoundCreateIndex {
+    std::string index_name;
+    std::shared_ptr<const TableSchema> table;
+    BoundColumnRef column;
+    IndexId predicted_index_id;
+    DataType key_type = DataType::Int;
+    bool unique = true;
+    std::int64_t metadata_page_id = -1;
+};
+
 struct BoundAlterAddColumn { ColumnSpec column; };
 struct BoundAlterDropColumn { std::size_t ordinal; std::string column_name; };
 struct BoundAlterRenameTable { std::string new_name; };
@@ -101,6 +111,12 @@ struct BoundAlterTable {
 
 struct BoundDropTable {
     std::vector<std::string> table_names;
+    bool if_exists = false;
+};
+
+struct BoundDropIndex {
+    std::string index_name;
+    std::shared_ptr<const IndexSchema> index;
     bool if_exists = false;
 };
 
@@ -194,8 +210,9 @@ struct BoundExplain {
 
 struct BoundStatement {
     CatalogVersion catalog_version;
-    std::variant<BoundCreateTable, BoundAlterTable, BoundDropTable, BoundInsert, BoundSelect,
-                 BoundUpdate, BoundDelete, BoundExplain> node;
+    std::variant<BoundCreateTable, BoundCreateIndex, BoundAlterTable, BoundDropTable,
+                 BoundDropIndex, BoundInsert, BoundSelect, BoundUpdate, BoundDelete,
+                 BoundExplain> node;
 };
 
 } // namespace minisql

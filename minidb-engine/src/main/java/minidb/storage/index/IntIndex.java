@@ -6,14 +6,14 @@ import minidb.storage.StorageException;
 
 /** Unique, single-column integer index consumed by the database engine. */
 public interface IntIndex {
-    void insert(int key, RowId rowId) throws StorageException, IndexException;
+    void insert(long key, RowId rowId) throws StorageException, IndexException;
 
-    Optional<RowId> search(int key) throws StorageException, IndexException;
+    Optional<RowId> search(long key) throws StorageException, IndexException;
 
-    List<IndexEntry> range(int fromInclusive, int toInclusive)
+    List<IndexEntry> range(long fromInclusive, long toInclusive)
             throws StorageException, IndexException;
 
-    boolean delete(int key) throws StorageException, IndexException;
+    boolean delete(long key) throws StorageException, IndexException;
 
     int metadataPageId();
 

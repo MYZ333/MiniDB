@@ -169,9 +169,11 @@ Result<PlanPtr> optimizeNode(const PlanPtr& plan, std::size_t depth = 0) {
     if (depth >= 256) return invalid("plan exceeds 256 levels");
     return std::visit([&](const auto& op) -> Result<PlanPtr> {
         using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, AlterTablePlan> ||
-                      std::is_same_v<T, DropTablePlan> ||
+        if constexpr (std::is_same_v<T, CreateTablePlan> || std::is_same_v<T, CreateIndexPlan> ||
+                      std::is_same_v<T, AlterTablePlan> ||
+                      std::is_same_v<T, DropTablePlan> || std::is_same_v<T, DropIndexPlan> ||
                       std::is_same_v<T, InsertPlan> || std::is_same_v<T, SeqScanPlan> ||
+                      std::is_same_v<T, IndexScanPlan> ||
                       std::is_same_v<T, EmptyResultPlan>) {
             return plan; // DDL、字面量 INSERT 和扫描没有可折叠的子表达式。
         } else if constexpr (std::is_same_v<T, ExplainPlan>) {
@@ -346,7 +348,10 @@ Result<LogicalPlan> optimizePlan(const LogicalPlan& plan) {
     auto emptied = optimizer_detail::eliminateEmptyInputs(
         std::get<PlanPtr>(std::move(pushed)));
     if (const auto* error = std::get_if<Diagnostic>(&emptied)) return *error;
-    auto pruned = optimizer_detail::pruneColumns(std::get<PlanPtr>(std::move(emptied)));
+    auto indexed = optimizer_detail::chooseIndexScans(
+        std::get<PlanPtr>(std::move(emptied)));
+    if (const auto* error = std::get_if<Diagnostic>(&indexed)) return *error;
+    auto pruned = optimizer_detail::pruneColumns(std::get<PlanPtr>(std::move(indexed)));
     if (const auto* error = std::get_if<Diagnostic>(&pruned)) return *error;
     return LogicalPlan{plan.catalog_version, std::get<PlanPtr>(std::move(pruned))};
 }

@@ -52,7 +52,7 @@ CREATE TABLE demo_plan(id INT PRIMARY KEY, name VARCHAR(20), age INT);
 INSERT INTO demo_plan VALUES (1, 'Alice', 20), (2, 'Bob', 17), (3, 'Cara', 25);
 EXPLAIN SELECT name FROM demo_plan WHERE age >= 18 ORDER BY id;
 EXPLAIN ANALYZE SELECT name FROM demo_plan WHERE age >= 18 ORDER BY id;` },
-  { group: '持久化与缓存', title: '重启后验证与缓存观测', summary: '先运行“写入”创建数据；重启服务后再运行“验证”，观察状态栏缓存计数。', expected: '写入后表和数据保存在 data/minidb.db；验证脚本无需重建表。', risk: '写入会重建 demo_persist；验证不会修改数据。', sql: `-- 第一次：运行本脚本写入演示数据。重启 Web 服务后，将下方 SQL 单独运行以验证。
+  { group: '持久化与缓存', title: '重启后验证与缓存观测', summary: '先运行“写入”创建数据；重启服务后再运行“验证”，观察状态栏缓存计数。', expected: '写入后表和数据保存在 data/minidb.db；验证脚本无需重建表。', risk: '写入会重建 demo_persist；验证脚本不会修改数据。', sql: `-- 第一次：运行本脚本写入演示数据。重启 Web 服务后，将下方 SQL 单独运行以验证。
 DROP TABLE IF EXISTS demo_persist;
 CREATE TABLE demo_persist(id INT PRIMARY KEY, message VARCHAR(30));
 INSERT INTO demo_persist VALUES (1, 'survives a normal restart'), (2, 'page-backed row');
@@ -66,143 +66,62 @@ const sql = document.querySelector('#sql');
 const execute = document.querySelector('#execute');
 const result = document.querySelector('#result');
 const plan = document.querySelector('#plan');
-const historyBox = document.querySelector('#history');
-const historyCount = document.querySelector('#history-count');
 const lineNumbers = document.querySelector('#line-numbers');
 const cursorInfo = document.querySelector('#cursor-info');
 const statusText = document.querySelector('#system-status');
 const statusDot = document.querySelector('#status-dot');
 const storageNotice = document.querySelector('#storage-notice');
 const storageDetail = document.querySelector('#storage-detail');
-let history = [];
+const tableTree = document.querySelector('#table-tree');
+const tableCount = document.querySelector('#table-count');
 
 sql.value = example;
-renderDemoCases();
-refreshEditor();
-sql.addEventListener('input', refreshEditor);
-sql.addEventListener('keyup', refreshEditor);
-sql.addEventListener('click', refreshEditor);
+renderDemoCases(); refreshEditor(); health(); refreshCatalog();
+sql.addEventListener('input', refreshEditor); sql.addEventListener('keyup', refreshEditor); sql.addEventListener('click', refreshEditor);
 sql.addEventListener('scroll', () => { lineNumbers.scrollTop = sql.scrollTop; });
 document.querySelector('#restore').addEventListener('click', () => { sql.value = example; refreshEditor(); sql.focus(); });
-document.querySelector('#clear-output').addEventListener('click', () => { result.className = 'result-empty'; result.innerHTML = '<span class="empty-glyph">↳</span><p>执行输出已清空。</p>'; plan.textContent = '等待下一次成功执行…'; });
-execute.addEventListener('click', run);
+document.querySelector('#execute').addEventListener('click', run);
+document.querySelector('#clear-output').addEventListener('click', clearOutput);
+document.querySelector('#refresh-catalog').addEventListener('click', refreshCatalog);
 
 function renderDemoCases() {
   const host = document.querySelector('#demo-cases');
   DEMO_CASES.forEach((demo, index) => {
     const button = document.createElement('button'); button.type = 'button'; button.className = 'demo-case';
-    const top = document.createElement('span'); top.className = 'demo-case-top';
-    const indexLabel = document.createElement('small'); indexLabel.textContent = String(index + 1).padStart(2, '0') + ' / ' + demo.group;
-    const title = document.createElement('strong'); title.textContent = demo.title; top.append(indexLabel, title);
-    const description = document.createElement('span'); description.className = 'demo-description'; description.textContent = demo.summary;
-    const expected = document.createElement('span'); expected.className = 'demo-expected'; expected.textContent = '预期：' + demo.expected;
-    const risk = document.createElement('span'); risk.className = 'demo-risk'; risk.textContent = demo.risk;
-    button.append(top, description, expected, risk);
-    button.addEventListener('click', () => { sql.value = demo.sql; refreshEditor(); sql.focus(); button.animate([{ transform: 'translateY(0)' }, { transform: 'translateY(-3px)' }, { transform: 'translateY(0)' }], { duration: 240 }); });
-    host.append(button);
+    const top = document.createElement('div'); top.className = 'demo-case-top';
+    const label = document.createElement('small'); label.textContent = `${String(index + 1).padStart(2, '0')} / ${demo.group}`;
+    const title = document.createElement('strong'); title.textContent = demo.title; top.append(label, title);
+    const summary = document.createElement('p'); summary.textContent = demo.summary;
+    const expected = document.createElement('p'); expected.className = 'demo-expected'; expected.textContent = `预期：${demo.expected}`;
+    const risk = document.createElement('p'); risk.className = 'demo-risk'; risk.textContent = demo.risk;
+    button.append(top, summary, expected, risk);
+    button.addEventListener('click', () => { sql.value = demo.sql; refreshEditor(); sql.focus(); window.scrollTo({ top: 0, behavior: 'smooth' }); }); host.append(button);
   });
 }
 
 async function health() {
-  try {
-    const response = await fetch('/api/health'); const data = await response.json();
-    if (!data.compilerAvailable) throw new Error('未找到 C++ 计划导出器');
-    applyStorageState(data); statusDot.className = 'dot online';
-  } catch (error) {
-    statusText.textContent = '引擎不可用 · ' + error.message; statusDot.className = 'dot offline';
-    storageNotice.textContent = '无法读取本地持久化存储状态。'; storageDetail.textContent = '请检查 Java Web 服务与 C++ 计划导出器。';
-  }
+  try { const data = await fetchJson('/api/health'); if (!data.compilerAvailable) throw new Error('未找到 C++ 计划导出器'); applyStorageState(data); statusDot.className = 'status-dot online'; }
+  catch (error) { statusText.textContent = '引擎不可用'; statusDot.className = 'status-dot offline'; storageNotice.textContent = '无法读取本地持久化存储状态。'; storageDetail.textContent = error.message; }
 }
-
+async function refreshCatalog() {
+  tableTree.replaceChildren(message('正在刷新表目录', 'tree-message'));
+  try { const data = await fetchJson('/api/catalog'); tableCount.textContent = data.tables.length; tableTree.replaceChildren(); if (!data.tables.length) tableTree.append(message('还没有表。运行 CREATE TABLE 后会在这里出现。', 'tree-message')); data.tables.forEach(renderTableLink); }
+  catch (error) { tableCount.textContent = '0'; tableTree.replaceChildren(message(`目录读取失败：${error.message}`, 'tree-message')); }
+}
+function renderTableLink(table) { const link = document.createElement('a'); link.className = 'table-link'; link.href = `/table-browser.html?table=${encodeURIComponent(table.name)}`; const mark = document.createElement('span'); mark.textContent = '▦'; const name = document.createElement('strong'); name.textContent = table.name; const meta = document.createElement('small'); meta.textContent = `${table.rowCount} 行 / ${table.columnCount} 列`; link.append(mark, name, meta); tableTree.append(link); }
 async function run() {
-  execute.disabled = true; execute.innerHTML = '<span>◌</span> 编译并执行中'; const started = new Date();
-  try {
-    const response = await fetch('/api/execute', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sql:sql.value}) });
-    const data = await response.json();
-    if (!response.ok || !data.ok) { showError(data); addHistory(started, false, data.code || 'Failed', ''); highlight(data.line, data.column); return; }
-    applyStorageState(data); showResults(data.results); plan.textContent = JSON.stringify(data.plan, null, 2);
-    addHistory(started, true, `${data.results.length} statements`, extractExplainText(data.results));
-  } catch (error) { showError({stage:'network', code:'ConnectionFailed', message:error.message}); addHistory(started, false, 'ConnectionFailed', ''); }
-  finally { execute.disabled = false; execute.innerHTML = '<span>▶</span> 运行全部'; }
+  execute.disabled = true; execute.textContent = '正在执行';
+  try { const response = await fetch('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql: sql.value }) }); const data = await response.json(); if (!response.ok || !data.ok) { showError(data); highlight(data.line, data.column); return; } applyStorageState(data); showResults(data.results); plan.textContent = JSON.stringify(data.plan, null, 2); await refreshCatalog(); }
+  catch (error) { showError({ stage: 'network', code: 'ConnectionFailed', message: error.message }); }
+  finally { execute.disabled = false; execute.innerHTML = '运行全部 <span>↵</span>'; }
 }
-
-function applyStorageState(data) {
-  const storage = data.storage;
-  if (!storage || !storage.persistent) {
-    statusText.textContent = '测试内存引擎已就绪'; storageNotice.textContent = '当前为测试内存引擎，不代表正式持久化 Web 服务。'; storageDetail.textContent = '无页文件或缓冲池统计。'; return;
-  }
-  const path = storage.databasePath || 'data/minidb.db';
-  statusText.textContent = `持久化引擎已就绪 · ${storage.bufferPolicy} / ${storage.bufferFrames} 帧`;
-  storageNotice.textContent = `数据将写入 ${path}；正常关闭并重启服务后仍可读取。`;
-  storageDetail.textContent = `数据库：${path}\n缓存：${storage.bufferPolicy} · ${storage.bufferFrames} 帧\n命中 ${storage.hits} · 缺页 ${storage.misses} · 淘汰 ${storage.evictions} · 刷盘 ${storage.flushes}`;
-}
-
-function showResults(items) {
-  result.className = 'results'; result.replaceChildren();
-  items.forEach((item, index) => {
-    if (item.kind === 'command') { showCommand(item, index); return; }
-    if (isExplainResult(item)) { showExplainResult(item, index); return; }
-    showQueryResult(item, index);
-  });
-}
-
-function showCommand(item, index) {
-  const section = document.createElement('section'); section.className = 'command-result';
-  section.innerHTML = `<div class="command-title">#${index + 1} · ${escapeHtml(item.operation)}</div><p>影响 <b>${item.affectedRows}</b> 行</p>`; result.append(section);
-}
-
-function showQueryResult(item, index) {
-  const section = document.createElement('section'); section.className = 'query-result';
-  const label = document.createElement('div'); label.className = 'query-label'; label.innerHTML = `<span>#${index + 1} · SELECT RESULT</span><span>${item.rowCount} row(s)</span>`; section.append(label);
-  const table = document.createElement('table'); const header = document.createElement('tr');
-  item.columns.forEach(column => { const cell = document.createElement('th'); cell.textContent = column; header.append(cell); }); table.append(header);
-  item.rows.forEach(row => { const tr = document.createElement('tr'); row.forEach(value => { const cell = document.createElement('td'); cell.textContent = value === null ? 'NULL' : String(value); if (value === null) cell.className = 'null'; tr.append(cell); }); table.append(tr); });
-  section.append(table); result.append(section);
-}
-
-function isExplainResult(item) { return item.kind === 'query' && item.columns.length === 1 && item.columns[0] === 'QUERY PLAN'; }
-
-function showExplainResult(item, index) {
-  const lines = item.rows.map(row => row[0] === null ? 'NULL' : String(row[0])); const analyzed = lines.some(line => /actual rows=\d+/.test(line));
-  const section = document.createElement('section'); section.className = `explain-result ${analyzed ? 'analyzed' : 'plain'}`;
-  const label = document.createElement('div'); label.className = 'explain-label'; label.innerHTML = `<span>#${index + 1} · ${analyzed ? 'EXPLAIN ANALYZE' : 'EXPLAIN'}</span><span>${analyzed ? '已执行 · 含运行指标' : '仅规划 · 未执行'}</span>`;
-  const output = document.createElement('pre'); output.className = 'explain-output'; lines.forEach(line => appendExplainLine(output, line)); section.append(label, output); result.append(section);
-}
-
-function appendExplainLine(output, line) {
-  const row = document.createElement('span'); row.className = 'explain-line'; const metricAt = line.indexOf('actual rows=');
-  if (metricAt < 0) { row.textContent = line; output.append(row); return; }
-  const prefix = document.createElement('span'); prefix.textContent = line.slice(0, metricAt);
-  const metrics = document.createElement('span'); metrics.className = 'plan-metrics'; metrics.textContent = line.slice(metricAt); row.append(prefix, metrics); output.append(row);
-}
-
-function extractExplainText(items) { return items.filter(isExplainResult).flatMap(item => item.rows.map(row => String(row[0]))).join('\n'); }
-
-function showError(data) {
-  result.className = ''; result.replaceChildren(); const card = document.createElement('section'); card.className = 'error-card';
-  const location = data.line ? ` · line ${data.line}, column ${data.column}` : ''; card.innerHTML = `<b>${escapeHtml((data.stage || 'error').toUpperCase())} / ${escapeHtml(data.code || 'Unknown')}${location}</b><p>${escapeHtml(data.message || '执行失败')}</p>`; result.append(card);
-}
-
-function addHistory(time, ok, summary, explainText) {
-  history.unshift({time, ok, summary, text:sql.value, explainText}); history = history.slice(0, 8); historyCount.textContent = history.length;
-  historyBox.className = 'history-list'; historyBox.replaceChildren();
-  history.forEach((entry) => {
-    const button = document.createElement('button'); button.className = `history-item ${entry.ok ? 'ok' : 'fail'}`; const marker = entry.explainText ? ' · PLAN' : '';
-    button.innerHTML = `<span>${entry.ok ? '✓' : '×'} ${escapeHtml(entry.summary)}${marker}</span><small>${entry.time.toLocaleTimeString()}</small>`;
-    button.title = entry.explainText ? '点击恢复此 SQL；该次运行包含文本执行计划。' : '点击恢复此 SQL。';
-    button.addEventListener('click', () => { sql.value = entry.text; refreshEditor(); sql.focus(); }); historyBox.append(button);
-  });
-}
-
-function highlight(line, column) {
-  if (!line || !column) return; const lines = sql.value.split('\n'); let offset = 0;
-  for (let i = 0; i < line - 1 && i < lines.length; i++) offset += lines[i].length + 1;
-  offset += Math.max(0, column - 1); sql.focus(); sql.setSelectionRange(offset, Math.min(offset + 1, sql.value.length));
-}
-
-function refreshEditor() {
-  const lines = sql.value.split('\n'); lineNumbers.textContent = lines.map((_, index) => index + 1).join('\n');
-  const before = sql.value.slice(0, sql.selectionStart); const line = before.split('\n').length; const column = before.length - before.lastIndexOf('\n'); cursorInfo.textContent = `Ln ${line}, Col ${column}`;
-}
-function escapeHtml(value) { const box = document.createElement('div'); box.textContent = String(value); return box.innerHTML; }
-health();
+function clearOutput() { result.className = 'result-empty'; result.textContent = '执行输出已清空。'; plan.textContent = '等待一次成功执行'; }
+function showResults(items) { result.className = 'results'; result.replaceChildren(); items.forEach((item, index) => { if (item.kind === 'command') { const command = document.createElement('section'); command.className = 'command-result'; command.append(text(`#${index + 1}  ${item.operation}`, 'command-title'), text(`影响 ${item.affectedRows} 行`, '')); result.append(command); } else { const output = document.createElement('section'); output.className = 'query-result'; output.append(text(`#${index + 1}  SELECT RESULT  /  ${item.rowCount} 行`, 'query-label'), dataGrid(item.columns, item.rows)); result.append(output); } }); }
+function dataGrid(columns, rows) { const table = document.createElement('table'); table.className = 'data-grid'; const header = document.createElement('thead'); const headerRow = document.createElement('tr'); columns.forEach((column) => { const cell = document.createElement('th'); cell.scope = 'col'; cell.textContent = column; headerRow.append(cell); }); header.append(headerRow); const body = document.createElement('tbody'); rows.forEach((row) => { const rowElement = document.createElement('tr'); row.forEach((value) => { const cell = document.createElement('td'); cell.textContent = value === null ? 'NULL' : String(value); if (value === null) cell.className = 'null'; rowElement.append(cell); }); body.append(rowElement); }); table.append(header, body); return table; }
+function showError(data) { result.className = ''; result.replaceChildren(); const card = document.createElement('section'); card.className = 'error-card'; card.append(text(`${(data.stage || 'error').toUpperCase()} / ${data.code || 'Unknown'}`, 'error-title'), text(data.message || '执行失败', '')); result.append(card); }
+function applyStorageState(data) { const storage = data.storage; if (!storage || !storage.persistent) { statusText.textContent = '测试内存引擎已就绪'; storageNotice.textContent = '当前是测试内存引擎，不代表正式持久化 Web 服务。'; storageDetail.textContent = '无页文件或缓冲池统计。'; return; } const path = storage.databasePath || 'data/minidb.db'; statusText.textContent = `持久化引擎已就绪 / ${storage.bufferPolicy} / ${storage.bufferFrames} 帧`; storageNotice.textContent = `数据写入 ${path}，正常重启后仍可读取。`; storageDetail.textContent = `数据库：${path}\n缓存：${storage.bufferPolicy} / ${storage.bufferFrames} 帧\n命中 ${storage.hits} / 缺页 ${storage.misses}\n淘汰 ${storage.evictions} / 刷盘 ${storage.flushes}`; }
+async function fetchJson(url) { const response = await fetch(url); const data = await response.json(); if (!response.ok || !data.ok) throw new Error(data.message || '请求失败'); return data; }
+function refreshEditor() { const lines = sql.value.split('\n'); lineNumbers.textContent = lines.map((_, index) => index + 1).join('\n'); const before = sql.value.slice(0, sql.selectionStart); const line = before.split('\n').length; const column = before.length - before.lastIndexOf('\n'); cursorInfo.textContent = `Ln ${line}, Col ${column}`; }
+function highlight(line, column) { if (!line || !column) return; const lines = sql.value.split('\n'); let offset = 0; for (let index = 0; index < line - 1 && index < lines.length; index++) offset += lines[index].length + 1; offset += Math.max(0, column - 1); sql.focus(); sql.setSelectionRange(offset, Math.min(offset + 1, sql.value.length)); }
+function message(value, className) { return text(value, className); }
+function text(value, className) { const element = document.createElement('p'); element.className = className; element.textContent = value; return element; }

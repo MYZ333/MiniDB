@@ -140,12 +140,16 @@ void collectRelations(const PlanPtr& plan, Relations& relations, std::size_t dep
             collectRelations(op.input, relations, depth + 1);
         } else if constexpr (std::is_same_v<T, SeqScanPlan>) {
             addRelation(relations, op.table, op.relation_id, op.relation_name);
+        } else if constexpr (std::is_same_v<T, IndexScanPlan>) {
+            addRelation(relations, op.table, op.relation_id, op.relation_name);
         } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
             for (const auto& relation : op.relations)
                 addRelation(relations, relation.table, relation.relation_id,
                             relation.relation_name);
         } else if constexpr (!std::is_same_v<T, CreateTablePlan> &&
+                             !std::is_same_v<T, CreateIndexPlan> &&
                              !std::is_same_v<T, DropTablePlan> &&
+                             !std::is_same_v<T, DropIndexPlan> &&
                              !std::is_same_v<T, AlterTablePlan> &&
                              !std::is_same_v<T, EmptyResultPlan>) {
             addRelation(relations, op.table, 0, op.table ? op.table->name : std::string{});
@@ -241,6 +245,11 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 }
                 out << ')';
             }
+        } else if constexpr (std::is_same_v<T, CreateIndexPlan>) {
+            out << "CreateIndex[" << op.index_name << " ON " << tableName(op.table)
+                << "." << columnName(op.column, relations) << "; "
+                << typeName(op.key_type);
+            if (op.unique) out << " UNIQUE";
         } else if constexpr (std::is_same_v<T, AlterTablePlan>) {
             out << "AlterTable[" << tableName(op.table) << "; ";
             std::visit([&](const auto& action) {
@@ -260,6 +269,11 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 if (i) out << ", ";
                 out << op.table_names[i];
             }
+        } else if constexpr (std::is_same_v<T, DropIndexPlan>) {
+            out << "DropIndex[";
+            if (op.if_exists) out << "IF EXISTS ";
+            out << op.index_name;
+            if (op.index) out << "#" << op.index->id.value;
         } else if constexpr (std::is_same_v<T, InsertPlan>) {
             const auto rows = op.rows.empty()
                 ? std::vector<std::vector<ScalarValue>>{op.values} : op.rows;
@@ -277,6 +291,25 @@ void printNode(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
             out << "SeqScan[" << tableName(op.table);
             if (op.table && !op.relation_name.empty() && op.relation_name != op.table->name)
                 out << " AS " << op.relation_name;
+            if (op.columns) {
+                out << "; columns=";
+                if (op.columns->empty()) out << "<none>";
+                for (std::size_t i = 0; i < op.columns->size(); ++i) {
+                    if (i) out << ", ";
+                    out << columnName((*op.columns)[i], relations);
+                }
+            }
+        } else if constexpr (std::is_same_v<T, IndexScanPlan>) {
+            out << "IndexScan[" << (op.index ? op.index->name : std::string{"<missing-index>"})
+                << " ON " << tableName(op.table);
+            if (op.table && !op.relation_name.empty() && op.relation_name != op.table->name)
+                out << " AS " << op.relation_name;
+            out << "; range=";
+            if (op.lower) out << (op.lower->inclusive ? "[" : "(") << op.lower->value;
+            else out << "(-inf";
+            out << ", ";
+            if (op.upper) out << op.upper->value << (op.upper->inclusive ? "]" : ")");
+            else out << "+inf)";
             if (op.columns) {
                 out << "; columns=";
                 if (op.columns->empty()) out << "<none>";

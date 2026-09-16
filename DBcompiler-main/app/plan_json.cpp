@@ -127,31 +127,42 @@ void loadCatalogFile(const std::string& path, MemoryCatalog& catalog) {
     std::string tag; CatalogVersion version; std::uint64_t next;
     if (!(input >> tag >> version >> next) || tag != "M") throw std::runtime_error("invalid catalog header");
     std::vector<TableSchema> tables;
+    std::vector<IndexSchema> indexes;
     while (input >> tag) {
-        if (tag != "T") throw std::runtime_error("invalid catalog table record");
-        std::uint64_t id; std::string name; std::size_t column_count, constraint_count;
-        if (!(input >> id >> name >> column_count >> constraint_count)) throw std::runtime_error("invalid catalog table");
-        TableSchema table{TableId{id}, hexDecode(name), {}, {}};
-        for (std::size_t i = 0; i < column_count; ++i) {
-            std::uint64_t column_id; std::string column_name, type, default_kind, default_text; long long length; int primary, not_null, unique;
-            if (!(input >> tag >> column_id >> column_name >> type >> length >> primary >> not_null >> unique >> default_kind >> default_text) || tag != "C") throw std::runtime_error("invalid catalog column");
-            ColumnSchema column{ColumnId{column_id}, hexDecode(column_name), catalogType(type)};
-            if (length >= 0) column.varchar_length = length; column.primary_key = primary != 0; column.not_null = not_null != 0; column.unique = unique != 0;
-            const auto decoded = hexDecode(default_text);
-            if (default_kind == "L") column.default_value = static_cast<std::int64_t>(std::stoll(decoded));
-            else if (default_kind == "F") column.default_value = std::stod(decoded);
-            else if (default_kind == "B") column.default_value = decoded == "1";
-            else if (default_kind == "S") column.default_value = decoded;
-            else if (default_kind != "N") throw std::runtime_error("invalid catalog default");
-            table.columns.push_back(std::move(column));
+        if (tag == "T") {
+            std::uint64_t id; std::string name; std::size_t column_count, constraint_count;
+            if (!(input >> id >> name >> column_count >> constraint_count)) throw std::runtime_error("invalid catalog table");
+            TableSchema table{TableId{id}, hexDecode(name), {}, {}};
+            for (std::size_t i = 0; i < column_count; ++i) {
+                std::uint64_t column_id; std::string column_name, type, default_kind, default_text; long long length; int primary, not_null, unique;
+                if (!(input >> tag >> column_id >> column_name >> type >> length >> primary >> not_null >> unique >> default_kind >> default_text) || tag != "C") throw std::runtime_error("invalid catalog column");
+                ColumnSchema column{ColumnId{column_id}, hexDecode(column_name), catalogType(type)};
+                if (length >= 0) column.varchar_length = length; column.primary_key = primary != 0; column.not_null = not_null != 0; column.unique = unique != 0;
+                const auto decoded = hexDecode(default_text);
+                if (default_kind == "L") column.default_value = static_cast<std::int64_t>(std::stoll(decoded));
+                else if (default_kind == "F") column.default_value = std::stod(decoded);
+                else if (default_kind == "B") column.default_value = decoded == "1";
+                else if (default_kind == "S") column.default_value = decoded;
+                else if (default_kind != "N") throw std::runtime_error("invalid catalog default");
+                table.columns.push_back(std::move(column));
+            }
+            for (std::size_t i = 0; i < constraint_count; ++i) {
+                int primary; std::size_t count; if (!(input >> tag >> primary >> count) || tag != "K") throw std::runtime_error("invalid catalog constraint");
+                TableConstraintSpec constraint{primary != 0, {}}; for (std::size_t j = 0; j < count; ++j) { std::size_t ordinal; if (!(input >> ordinal)) throw std::runtime_error("invalid catalog constraint member"); constraint.columns.push_back(ordinal); } table.table_constraints.push_back(std::move(constraint));
+            }
+            tables.push_back(std::move(table));
+        } else if (tag == "I") {
+            std::uint64_t index_id, table_id, column_id; std::string name, key_type; int unique; long long metadata_page_id;
+            if (!(input >> index_id >> name >> table_id >> column_id >> key_type >> unique >> metadata_page_id))
+                throw std::runtime_error("invalid catalog index");
+            indexes.push_back(IndexSchema{IndexId{index_id}, hexDecode(name), TableId{table_id},
+                                          ColumnId{column_id}, catalogType(key_type),
+                                          unique != 0, metadata_page_id});
+        } else {
+            throw std::runtime_error("invalid catalog record");
         }
-        for (std::size_t i = 0; i < constraint_count; ++i) {
-            int primary; std::size_t count; if (!(input >> tag >> primary >> count) || tag != "K") throw std::runtime_error("invalid catalog constraint");
-            TableConstraintSpec constraint{primary != 0, {}}; for (std::size_t j = 0; j < count; ++j) { std::size_t ordinal; if (!(input >> ordinal)) throw std::runtime_error("invalid catalog constraint member"); constraint.columns.push_back(ordinal); } table.table_constraints.push_back(std::move(constraint));
-        }
-        tables.push_back(std::move(table));
     }
-    catalog.loadSnapshot(version, next, std::move(tables));
+    catalog.loadSnapshot(version, next, std::move(tables), std::move(indexes));
 }
 
 void scalarJson(std::ostream& out, const ScalarValue& value) {
@@ -196,6 +207,34 @@ void tableJson(std::ostream& out, const std::shared_ptr<const TableSchema>& tabl
         out << '}';
     }
     out << "]}";
+}
+
+void indexJson(std::ostream& out, const std::shared_ptr<const IndexSchema>& index) {
+    if (!index) { out << "null"; return; }
+    out << "{\"id\":" << index->id.value << ",\"name\":";
+    stringJson(out, index->name);
+    out << ",\"tableId\":" << index->table_id.value
+        << ",\"columnId\":" << index->column_id.value
+        << ",\"keyType\":";
+    stringJson(out, typeName(index->key_type));
+    out << ",\"unique\":" << (index->unique ? "true" : "false")
+        << ",\"metadataPageId\":" << index->metadata_page_id << '}';
+}
+
+void indexRangeJson(std::ostream& out, const IndexScanPlan& scan) {
+    out << '{';
+    bool wrote = false;
+    if (scan.lower) {
+        out << "\"lower\":" << scan.lower->value
+            << ",\"lowerInclusive\":" << (scan.lower->inclusive ? "true" : "false");
+        wrote = true;
+    }
+    if (scan.upper) {
+        if (wrote) out << ',';
+        out << "\"upper\":" << scan.upper->value
+            << ",\"upperInclusive\":" << (scan.upper->inclusive ? "true" : "false");
+    }
+    out << '}';
 }
 
 void refJson(std::ostream& out, const BoundColumnRef& ref) {
@@ -324,6 +363,18 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 out << "]}";
             }
             out << "],\"ifNotExists\":" << (node.if_not_exists ? "true" : "false");
+        } else if constexpr (std::is_same_v<T, CreateIndexPlan>) {
+            out << "\"type\":\"CreateIndex\",\"indexName\":";
+            stringJson(out, node.index_name);
+            out << ",\"indexId\":" << node.predicted_index_id.value
+                << ",\"table\":";
+            tableJson(out, node.table);
+            out << ",\"column\":";
+            refJson(out, node.column);
+            out << ",\"keyType\":";
+            stringJson(out, typeName(node.key_type));
+            out << ",\"unique\":" << (node.unique ? "true" : "false")
+                << ",\"metadataPageId\":" << node.metadata_page_id;
         } else if constexpr (std::is_same_v<T, AlterTablePlan>) {
             out << "\"type\":\"AlterTable\",\"table\":";
             tableJson(out, node.table);
@@ -363,6 +414,12 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 stringJson(out, node.table_names[i]);
             }
             out << "],\"ifExists\":" << (node.if_exists ? "true" : "false");
+        } else if constexpr (std::is_same_v<T, DropIndexPlan>) {
+            out << "\"type\":\"DropIndex\",\"index\":";
+            indexJson(out, node.index);
+            out << ",\"indexName\":";
+            stringJson(out, node.index_name);
+            out << ",\"ifExists\":" << (node.if_exists ? "true" : "false");
         } else if constexpr (std::is_same_v<T, InsertPlan>) {
             out << "\"type\":\"Insert\",\"table\":";
             tableJson(out, node.table);
@@ -396,6 +453,25 @@ void nodeJson(std::ostream& out, const PlanPtr& plan, std::size_t depth) {
                 }
                 out << ']';
             }
+        } else if constexpr (std::is_same_v<T, IndexScanPlan>) {
+            out << "\"type\":\"IndexScan\",\"table\":";
+            tableJson(out, node.table);
+            out << ",\"index\":";
+            indexJson(out, node.index);
+            out << ",\"relationId\":" << node.relation_id << ",\"relationName\":";
+            stringJson(out, node.relation_name);
+            out << ",\"columns\":";
+            if (!node.columns) out << "null";
+            else {
+                out << '[';
+                for (std::size_t i = 0; i < node.columns->size(); ++i) {
+                    if (i) out << ',';
+                    refJson(out, (*node.columns)[i]);
+                }
+                out << ']';
+            }
+            out << ",\"keyRange\":";
+            indexRangeJson(out, node);
         } else if constexpr (std::is_same_v<T, EmptyResultPlan>) {
             out << "\"type\":\"EmptyResult\",\"columns\":[";
             for (std::size_t i = 0; i < node.columns.size(); ++i) {
@@ -622,6 +698,14 @@ int main(int argc, char** argv) {
             auto registered = catalog.createTable(create->table_name, create->columns,
                 create->table_constraints, create->if_not_exists);
             if (const auto* error = std::get_if<Diagnostic>(&registered)) { printDiagnostic(*error); return 1; }
+        } else if (effect && std::get_if<BoundCreateIndex>(&effect->node)) {
+            const auto* create = std::get_if<BoundCreateIndex>(&effect->node);
+            auto registered = catalog.createIndex(
+                create->index_name, create->table->name,
+                create->table->columns[create->column.ordinal].name,
+                create->key_type, create->unique, create->metadata_page_id,
+                create->predicted_index_id);
+            if (const auto* error = std::get_if<Diagnostic>(&registered)) { printDiagnostic(*error); return 1; }
         } else if (effect && std::get_if<BoundAlterTable>(&effect->node)) {
             const auto* alter = std::get_if<BoundAlterTable>(&effect->node);
             auto changed = std::visit([&](const auto& action)
@@ -640,6 +724,10 @@ int main(int argc, char** argv) {
         } else if (effect && std::get_if<BoundDropTable>(&effect->node)) {
             const auto* drop = std::get_if<BoundDropTable>(&effect->node);
             auto removed = catalog.dropTables(drop->table_names, drop->if_exists);
+            if (const auto* error = std::get_if<Diagnostic>(&removed)) { printDiagnostic(*error); return 1; }
+        } else if (effect && std::get_if<BoundDropIndex>(&effect->node)) {
+            const auto* drop = std::get_if<BoundDropIndex>(&effect->node);
+            auto removed = catalog.dropIndex(drop->index_name, drop->if_exists);
             if (const auto* error = std::get_if<Diagnostic>(&removed)) { printDiagnostic(*error); return 1; }
         }
     }

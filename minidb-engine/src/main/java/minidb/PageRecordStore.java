@@ -5,6 +5,10 @@ import minidb.storage.Page;
 import minidb.storage.PageGuard;
 import minidb.storage.StorageErrorCode;
 import minidb.storage.StorageException;
+import minidb.storage.index.BPlusTreeIndex;
+import minidb.storage.index.IndexEntry;
+import minidb.storage.index.IndexException;
+import minidb.storage.index.RowId;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -50,7 +54,10 @@ public final class PageRecordStore implements RecordStore, AutoCloseable {
             }
             List<DatabaseEngine.TableSchema> tables = new ArrayList<>();
             for (Object raw : list(root.get("tables"))) tables.add(decodeTable(map(raw)));
-            return Optional.of(new CatalogState(number(root.get("catalogVersion")), number(root.get("nextTableId")), List.copyOf(tables)));
+            List<DatabaseEngine.IndexSchema> indexes = new ArrayList<>();
+            for (Object raw : listOrEmpty(root.get("indexes"))) indexes.add(decodeIndex(map(raw)));
+            return Optional.of(new CatalogState(number(root.get("catalogVersion")), number(root.get("nextTableId")),
+                root.get("nextIndexId") == null ? 1 : number(root.get("nextIndexId")), List.copyOf(tables), List.copyOf(indexes)));
         } catch (StorageException | RuntimeException error) {
             throw storage("loadCatalog", error);
         }
@@ -59,7 +66,7 @@ public final class PageRecordStore implements RecordStore, AutoCloseable {
     @Override public void persistCatalog(CatalogState state) {
         try {
             Map<String, Object> root = new LinkedHashMap<>();
-            root.put("catalogVersion", state.version()); root.put("nextTableId", state.nextTableId());
+            root.put("catalogVersion", state.version()); root.put("nextTableId", state.nextTableId()); root.put("nextIndexId", state.nextIndexId());
             List<Object> tables = new ArrayList<>();
             List<Object> tablePages = new ArrayList<>();
             for (DatabaseEngine.TableSchema table : state.tables()) {
@@ -67,6 +74,9 @@ public final class PageRecordStore implements RecordStore, AutoCloseable {
                 tablePages.add(Map.of("tableId", table.id(), "pages", pagesByTable.getOrDefault(table.id(), List.of())));
             }
             root.put("tables", tables); root.put("tablePages", tablePages);
+            List<Object> indexes = new ArrayList<>();
+            for (DatabaseEngine.IndexSchema index : state.indexes()) indexes.add(encodeIndex(index));
+            root.put("indexes", indexes);
             int oldRoot = catalogRoot;
             catalogRoot = writeCatalog(Json.stringify(root).getBytes(StandardCharsets.UTF_8));
             writeSuper(catalogRoot);
@@ -122,7 +132,7 @@ public final class PageRecordStore implements RecordStore, AutoCloseable {
         } catch (StorageException | RuntimeException error) { throw storage("scan", error); }
     }
 
-    @Override public void replace(long tableId, long rowId, List<Object> values) {
+    @Override public long replace(long tableId, long rowId, List<Object> values) {
         byte[] row = encodeRow(values); int pageId = pageId(rowId), slot = slotId(rowId);
         if (!table(tableId).contains(pageId)) throw new EngineException("StorageFailure", "row belongs to another table");
         boolean moved = false;
@@ -141,7 +151,63 @@ public final class PageRecordStore implements RecordStore, AutoCloseable {
                 page.putInt(base + 4, row.length); guard.markDirty();
             }
         } catch (StorageException | RuntimeException error) { throw storage("replace", error); }
-        if (moved) insert(tableId, values);
+        return moved ? insert(tableId, values) : rowId;
+    }
+
+    @Override public Optional<DatabaseEngine.StoredRow> read(long tableId, long rowId) {
+        int pageId = pageId(rowId), slot = slotId(rowId);
+        if (!table(tableId).contains(pageId)) return Optional.empty();
+        try (PageGuard guard = pool.getPageGuard(pageId)) {
+            ByteBuffer page = guard.data(); verifyData(page, pageId);
+            int base = slotBase(page, slot);
+            if (page.getInt(base + 8) != 1) return Optional.empty();
+            int offset = page.getInt(base), length = page.getInt(base + 4);
+            byte[] bytes = new byte[length]; ByteBuffer copy = page.duplicate(); copy.position(offset); copy.get(bytes);
+            return Optional.of(new DatabaseEngine.StoredRow(rowId, decodeRow(bytes)));
+        } catch (StorageException | RuntimeException error) { throw storage("read", error); }
+    }
+
+    @Override public IndexState createIndex(long indexId) {
+        try { BPlusTreeIndex index = BPlusTreeIndex.create(pool); return new IndexState(indexId, index.metadataPageId()); }
+        catch (StorageException | IndexException error) { throw storage("createIndex", error); }
+    }
+
+    @Override public Index openIndex(long metadataPageId) {
+        try {
+            BPlusTreeIndex tree = BPlusTreeIndex.open(pool, Math.toIntExact(metadataPageId));
+            return new Index() {
+                public void insert(long key, long rowId) {
+                    try { tree.insert(key, new RowId(pageId(rowId), slotId(rowId))); }
+                    catch (StorageException | IndexException error) { throw storage("index insert", error); }
+                }
+                public boolean delete(long key) {
+                    try { return tree.delete(key); }
+                    catch (StorageException | IndexException error) { throw storage("index delete", error); }
+                }
+                public Optional<Long> search(long key) {
+                    try { return tree.search(key).map(id -> pack(id.pageId(), id.slotId())); }
+                    catch (StorageException | IndexException error) { throw storage("index search", error); }
+                }
+                public List<IndexRow> range(Long lower, boolean lowerInclusive, Long upper, boolean upperInclusive) {
+                    long from = lower == null ? Long.MIN_VALUE : lower;
+                    long to = upper == null ? Long.MAX_VALUE : upper;
+                    try {
+                        List<IndexRow> rows = new ArrayList<>();
+                        for (IndexEntry entry : tree.range(from, to)) {
+                            if (lower != null && !lowerInclusive && entry.key() == lower) continue;
+                            if (upper != null && !upperInclusive && entry.key() == upper) continue;
+                            rows.add(new IndexRow(entry.key(), pack(entry.rowId().pageId(), entry.rowId().slotId())));
+                        }
+                        return rows;
+                    } catch (StorageException | IndexException error) { throw storage("index range", error); }
+                }
+            };
+        } catch (StorageException | IndexException error) { throw storage("openIndex", error); }
+    }
+
+    @Override public void dropIndex(long metadataPageId) {
+        try { BPlusTreeIndex.open(pool, Math.toIntExact(metadataPageId)).destroy(); }
+        catch (StorageException | IndexException error) { throw storage("dropIndex", error); }
     }
 
     @Override public void erase(long tableId, long rowId) {
@@ -227,8 +293,11 @@ public final class PageRecordStore implements RecordStore, AutoCloseable {
     private static List<Object> decodeRow(byte[] bytes) { try { java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(bytes)); int count = in.readInt(); if (count < 0 || count > 4096) throw new EngineException("StorageFailure", "invalid row column count"); List<Object> values = new ArrayList<>(); for (int i = 0; i < count; i++) values.add(switch (in.readByte()) { case 0 -> null; case 1 -> in.readLong(); case 2 -> in.readDouble(); case 3 -> { int len = in.readInt(); if (len < 0 || len > Page.PAGE_SIZE) throw new EngineException("StorageFailure", "invalid string length"); yield new String(in.readNBytes(len), StandardCharsets.UTF_8); } case 4 -> in.readBoolean(); default -> throw new EngineException("StorageFailure", "invalid row value tag"); }); return java.util.Collections.unmodifiableList(values); } catch (java.io.IOException error) { throw new EngineException("StorageFailure", "corrupt row encoding", error); } }
     private static Map<String, Object> encodeTable(DatabaseEngine.TableSchema table) { Map<String, Object> result = new LinkedHashMap<>(); result.put("id", table.id()); result.put("name", table.name()); List<Object> columns = new ArrayList<>(); for (DatabaseEngine.ColumnSchema c : table.columns()) { Map<String, Object> column = new LinkedHashMap<>(); column.put("id", c.id()); column.put("name", c.name()); column.put("type", c.type()); column.put("varcharLength", c.varcharLength() == null ? -1L : c.varcharLength()); column.put("primaryKey", c.primaryKey()); column.put("notNull", c.notNull()); column.put("unique", c.unique()); column.put("default", c.defaultValue()); column.put("hasDefault", c.hasDefault()); columns.add(column); } List<Object> constraints = new ArrayList<>(); for (DatabaseEngine.TableConstraint c : table.constraints()) constraints.add(Map.of("kind", c.kind(), "columns", c.columns())); result.put("columns", columns); result.put("constraints", constraints); return result; }
     private static DatabaseEngine.TableSchema decodeTable(Map<String, Object> value) { List<DatabaseEngine.ColumnSchema> columns = new ArrayList<>(); for (Object raw : list(value.get("columns"))) { Map<String, Object> c = map(raw); long length = number(c.get("varcharLength")); columns.add(new DatabaseEngine.ColumnSchema(number(c.get("id")), string(c.get("name")), string(c.get("type")), length < 0 ? null : length, bool(c.get("primaryKey")), bool(c.get("notNull")), bool(c.get("unique")), c.get("default"), bool(c.get("hasDefault")))); } List<DatabaseEngine.TableConstraint> constraints = new ArrayList<>(); for (Object raw : list(value.get("constraints"))) { Map<String, Object> c = map(raw); List<Integer> members = new ArrayList<>(); for (Object member : list(c.get("columns"))) members.add(Math.toIntExact(number(member))); constraints.add(new DatabaseEngine.TableConstraint(string(c.get("kind")), List.copyOf(members))); } return new DatabaseEngine.TableSchema(number(value.get("id")), string(value.get("name")), List.copyOf(columns), List.copyOf(constraints)); }
+    private static Map<String, Object> encodeIndex(DatabaseEngine.IndexSchema index) { return Map.of("id", index.id(), "name", index.name(), "tableId", index.tableId(), "columnId", index.columnId(), "keyType", index.keyType(), "unique", index.unique(), "metadataPageId", index.metadataPageId()); }
+    private static DatabaseEngine.IndexSchema decodeIndex(Map<String, Object> value) { return new DatabaseEngine.IndexSchema(number(value.get("id")), string(value.get("name")), number(value.get("tableId")), number(value.get("columnId")), string(value.get("keyType")), bool(value.get("unique")), number(value.get("metadataPageId"))); }
     @SuppressWarnings("unchecked") private static Map<String, Object> map(Object value) { if (value instanceof Map<?, ?> map) return (Map<String, Object>) map; throw new EngineException("StorageFailure", "invalid catalog object"); }
     @SuppressWarnings("unchecked") private static List<Object> list(Object value) { if (value instanceof List<?> list) return (List<Object>) list; throw new EngineException("StorageFailure", "invalid catalog list"); }
+    @SuppressWarnings("unchecked") private static List<Object> listOrEmpty(Object value) { return value == null ? List.of() : list(value); }
     private static String string(Object value) { if (value instanceof String text) return text; throw new EngineException("StorageFailure", "invalid catalog string"); }
     private static long number(Object value) { if (value instanceof Long n) return n; throw new EngineException("StorageFailure", "invalid catalog number"); }
     private static boolean bool(Object value) { return Boolean.TRUE.equals(value); }

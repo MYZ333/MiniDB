@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiniDB · 表浏览器</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body class="browser-page">
+  <main class="browser-shell">
+    <header class="browser-header"><a class="back-link" href="/">← 返回 SQL Workbench</a><span>MINIDB / TABLE BROWSER</span></header>
+    <section class="browser-layout">
+      <aside class="object-drawer"><div class="drawer-heading"><div><p>DATABASE OBJECTS</p><h1>表目录</h1></div><button id="refresh-catalog" class="round-button" type="button" aria-label="刷新表目录">↻</button></div><div id="table-tree" class="table-tree" aria-live="polite"><p class="tree-message">正在读取目录</p></div></aside>
+      <section class="browser-main"><div class="browser-hero"><div><p>READ ONLY DATA SURFACE</p><h2 id="selected-table-name">选择一张表</h2></div><div id="table-summary" class="table-summary">从左侧目录打开表浏览器。</div></div><div class="browser-tabs" role="tablist" aria-label="表浏览模式"><button id="data-tab" class="browser-tab active" type="button" role="tab" aria-selected="true">数据预览</button><button id="structure-tab" class="browser-tab" type="button" role="tab" aria-selected="false">结构定义</button></div><section id="data-pane" class="browser-pane" role="tabpanel"><div id="table-data" class="table-data"><p class="empty-table">选择左侧的表以读取数据。</p></div><footer id="table-pagination" class="pagination"></footer></section><section id="structure-pane" class="browser-pane" role="tabpanel" hidden><div id="table-structure" class="table-structure"></div></section></section>
+    </section>
+  </main>
+  <script src="/table-browser.js"></script>
+</body>
+</html>

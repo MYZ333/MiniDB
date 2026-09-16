@@ -34,7 +34,10 @@ data/
 *.docx
 docx_render_*/
 
-# One-off local document authoring helpers
+# One-off local document authoring helpers and non-product notes
+build_requirements_doc.py
 create_bplus_index_assessment.py
 create_module_task_docs.py
 create_index_interface_spec.py
+/答辩代码讲解_数据库引擎.md
+/数据库引擎执行链路源码讲解.md
